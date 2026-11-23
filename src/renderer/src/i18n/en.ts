@@ -5,6 +5,9 @@ export const en = {
     employee: 'Employee',
     loading: 'Loading...',
     refresh: 'Refresh',
+    backendUnavailable: 'Application backend is unavailable',
+    backendUnavailableDesc:
+      'The desktop application backend service is not responding. Please ensure the app is running in the official Electron shell and restart POD Video Studio.',
   },
   nav: {
     create: 'Create video',
@@ -76,6 +79,9 @@ export const en = {
       editPrompt: 'Edit prompt',
       cancelEdit: 'Cancel edit',
       resetPrompt: 'Reset to template',
+      staleOverrideWarning:
+        'The prompt override was edited for a different SKU, category, or template. Reset to update it for the current selection.',
+      qualityFailedBlocked: 'Generation blocked — quality checks failed: {checks}',
       checklistTitle: 'Quality Checklist',
       validationErrors: 'Prompt Validation Errors',
       ruleLabels: {
@@ -126,7 +132,7 @@ export const en = {
     ambiguousDialog: {
       title: 'Check Ambiguous Generation',
       message:
-        'The generation request may already be running in Muse, but acceptance could not be confirmed. Check your Muse account before deciding.',
+        'The generation request may already have been sent to Muse, but acceptance could not be confirmed. Check your Muse account before deciding.',
       checkAgain: 'Check again',
       markFailed: 'I checked Muse — nothing was generated',
       cancel: 'Close',
@@ -231,7 +237,7 @@ export const en = {
       catGroup: 'Prompt Group',
       removeCat: 'Remove',
       libraryRoot: 'Media Library Root Directory',
-      logRetention: 'Log Retention (Days)',
+      logRetentionDays: 'Log Retention (Days)',
       adminUsers: 'Admin User IDs (comma-separated)',
       saveCategories: 'Save Category & Storage Settings',
     },

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, type DragEvent, type ChangeEvent } from 'react';
+import { useState, useEffect, useRef, useCallback, type DragEvent, type ChangeEvent, type KeyboardEvent } from 'react';
 import type { Category } from '@shared/domain';
 import type { AspectRatio } from '@shared/provider';
 import type { PromptTemplateSummary, RenderedPrompt } from '@shared/prompt';
@@ -18,6 +18,10 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+export function makeTemplateKey(tpl: { id: string; version: string }): string {
+  return `${tpl.id}@@${tpl.version}`;
+}
+
 export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps): React.JSX.Element {
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
   const [rawSku, setRawSku] = useState('');
@@ -25,13 +29,18 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const [categories, setCategories] = useState<Category[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [templates, setTemplates] = useState<PromptTemplateSummary[]>([]);
-  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [selectedTemplateKey, setSelectedTemplateKey] = useState('');
   const [duration, setDuration] = useState<number | undefined>(undefined);
   const [aspectRatio, setAspectRatio] = useState<string | undefined>(undefined);
 
   // Prompt preview & override
   const [isEditingPrompt, setIsEditingPrompt] = useState(false);
   const [promptOverride, setPromptOverride] = useState('');
+  const [overrideBaseline, setOverrideBaseline] = useState<{
+    sku: string;
+    categoryId: string;
+    templateKey: string;
+  } | null>(null);
   const [renderedPrompt, setRenderedPrompt] = useState<RenderedPrompt | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
@@ -39,7 +48,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const [isDragging, setIsDragging] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
 
-  // Single-flight submission protection & stable clientRequestId across re-renders
+  // Single-flight submission protection & clientRequestId tracking
   const clientRequestIdRef = useRef<string>(crypto.randomUUID());
   const isSubmittingRef = useRef<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -62,8 +71,11 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
       }
       if (tplRes.ok && tplRes.data.length > 0) {
         setTemplates(tplRes.data);
+        // Default to the template entry with isDefault === true, or first
         const defaultTpl = tplRes.data.find((t) => t.isDefault) ?? tplRes.data[0];
-        if (defaultTpl) setSelectedTemplateId(defaultTpl.id);
+        if (defaultTpl) {
+          setSelectedTemplateKey(makeTemplateKey(defaultTpl));
+        }
       }
     });
 
@@ -77,6 +89,18 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const supportedAspectRatios = providerStatus?.capabilities?.supportedAspectRatios ?? [];
   const effectiveDuration = duration ?? (supportedDurations.length > 0 ? supportedDurations[0] : undefined);
   const effectiveAspectRatio = aspectRatio ?? (supportedAspectRatios.length > 0 ? supportedAspectRatios[0] : undefined);
+
+  // Selected template derived from key
+  const selectedTemplate = templates.find((t) => makeTemplateKey(t) === selectedTemplateKey);
+
+  // Check if current prompt override was edited against a different SKU, category, or template
+  const currentEffectiveSku = normalizedSku || rawSku.trim();
+  const isOverrideStale =
+    isEditingPrompt &&
+    overrideBaseline !== null &&
+    (overrideBaseline.sku !== currentEffectiveSku ||
+      overrideBaseline.categoryId !== selectedCategoryId ||
+      overrideBaseline.templateKey !== selectedTemplateKey);
 
   // Debounced prompt preview / validation (300ms)
   useEffect(() => {
@@ -97,12 +121,11 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
         }
       } else {
         // Render from template if template & category are selected
-        if (!selectedTemplateId || !selectedCategoryId) return;
-        const currentTpl = templates.find((t) => t.id === selectedTemplateId);
+        if (!selectedTemplate || !selectedCategoryId) return;
         try {
           const res = await api.prompts.preview({
-            templateId: selectedTemplateId,
-            templateVersion: currentTpl?.version,
+            templateId: selectedTemplate.id,
+            templateVersion: selectedTemplate.version,
             sku: normalizedSku || (rawSku.trim() || 'SKU-PREVIEW'),
             categoryId: selectedCategoryId,
             productName: productName.trim() || undefined,
@@ -127,7 +150,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   }, [
     isEditingPrompt,
     promptOverride,
-    selectedTemplateId,
+    selectedTemplate,
     selectedCategoryId,
     normalizedSku,
     rawSku,
@@ -135,7 +158,6 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     stagedImage?.fileName,
     effectiveDuration,
     effectiveAspectRatio,
-    templates,
   ]);
 
   // Image drag & drop and browse
@@ -177,18 +199,27 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     }
   };
 
-  const handleBrowse = async () => {
+  const handleBrowse = () => {
     setImageError(null);
-    try {
-      const api = getApi();
-      const res = await api.images.pick();
-      if (res.ok && res.data) {
-        setStagedImage(res.data);
-      } else if (!res.ok) {
-        setImageError(res.error.message);
-      }
-    } catch (err) {
-      setImageError(err instanceof Error ? err.message : en.errors.generic);
+    const api = getApi();
+    api.images
+      .pick()
+      .then((res) => {
+        if (res.ok && res.data) {
+          setStagedImage(res.data);
+        } else if (!res.ok) {
+          setImageError(res.error.message);
+        }
+      })
+      .catch((err) => {
+        setImageError(err instanceof Error ? err.message : en.errors.generic);
+      });
+  };
+
+  const handleDropzoneKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleBrowse();
     }
   };
 
@@ -208,22 +239,42 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   // Provider readiness
   const isProviderReady = providerStatus?.mode === 'mock' || providerStatus?.state === 'ready';
 
+  // Quality validation check
+  const isQualityPassed = renderedPrompt?.quality?.passed === true;
+  const failedQualityChecks = renderedPrompt?.quality?.checks.filter((c) => !c.passed) ?? [];
+
   // Validation rules for Generate button
   const isFormValid =
     stagedImage !== null &&
     normalizedSku !== null &&
     selectedCategoryId !== '' &&
-    selectedTemplateId !== '' &&
+    selectedTemplateKey !== '' &&
     renderedPrompt !== null &&
     renderedPrompt.errors.length === 0 &&
+    isQualityPassed &&
     isProviderReady;
+
+  const handleStartEditing = () => {
+    setIsEditingPrompt(true);
+    setOverrideBaseline({
+      sku: currentEffectiveSku,
+      categoryId: selectedCategoryId,
+      templateKey: selectedTemplateKey,
+    });
+  };
+
+  const handleResetToTemplate = () => {
+    setIsEditingPrompt(false);
+    setPromptOverride('');
+    setOverrideBaseline(null);
+  };
 
   const handleGenerate = useCallback(async () => {
     // Single-flight check: ref checked immediately before state update
     if (isSubmittingRef.current) {
       return;
     }
-    if (!isFormValid || !stagedImage || !normalizedSku) {
+    if (!isFormValid || !stagedImage || !normalizedSku || !selectedTemplate) {
       return;
     }
 
@@ -232,8 +283,6 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     setSubmitError(null);
 
     const clientRequestId = clientRequestIdRef.current;
-    const currentTpl = templates.find((t) => t.id === selectedTemplateId);
-    const templateVersion = currentTpl?.version ?? 'v1';
 
     try {
       const api = getApi();
@@ -242,8 +291,8 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
         sourceToken: stagedImage.token,
         sku: normalizedSku,
         categoryId: selectedCategoryId,
-        templateId: selectedTemplateId,
-        templateVersion,
+        templateId: selectedTemplate.id,
+        templateVersion: selectedTemplate.version,
         productName: productName.trim() || undefined,
         fileName: stagedImage.fileName,
         promptOverride: isEditingPrompt ? promptOverride : undefined,
@@ -252,13 +301,19 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
       });
 
       if (res.ok) {
+        // RESET clientRequestIdRef to a new UUID ONLY after a successful create!
+        clientRequestIdRef.current = crypto.randomUUID();
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
         onJobCreated(res.data.job.id);
       } else {
+        // KEEP the same id after a failed create for safe idempotent retry
         setSubmitError(res.error.message);
         isSubmittingRef.current = false;
         setIsSubmitting(false);
       }
     } catch (err) {
+      // KEEP the same id after an error
       setSubmitError(err instanceof Error ? err.message : en.errors.generic);
       isSubmittingRef.current = false;
       setIsSubmitting(false);
@@ -267,8 +322,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     isFormValid,
     stagedImage,
     normalizedSku,
-    templates,
-    selectedTemplateId,
+    selectedTemplate,
     selectedCategoryId,
     productName,
     isEditingPrompt,
@@ -277,8 +331,6 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     effectiveAspectRatio,
     onJobCreated,
   ]);
-
-  const selectedTemplate = templates.find((t) => t.id === selectedTemplateId);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
@@ -312,6 +364,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={handleBrowse}
+                onKeyDown={handleDropzoneKeyDown}
                 role="button"
                 tabIndex={0}
                 aria-label="Upload mockup image dropzone"
@@ -422,7 +475,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
               </select>
             </div>
 
-            {/* Template Select */}
+            {/* Template Select Keyed by id@@version */}
             <div className="form-group">
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 <label htmlFor="template-select">{en.create.form.template} *</label>
@@ -434,13 +487,13 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
               </div>
               <select
                 id="template-select"
-                value={selectedTemplateId}
-                onChange={(e) => setSelectedTemplateId(e.target.value)}
+                value={selectedTemplateKey}
+                onChange={(e) => setSelectedTemplateKey(e.target.value)}
               >
                 <option value="">{en.create.form.selectTemplate}</option>
                 {templates.map((tpl) => (
-                  <option key={tpl.id} value={tpl.id}>
-                    {tpl.title} ({tpl.version})
+                  <option key={makeTemplateKey(tpl)} value={makeTemplateKey(tpl)}>
+                    {tpl.title} — {tpl.version}
                     {tpl.isPlaceholder ? ' [PLACEHOLDER]' : ''}
                   </option>
                 ))}
@@ -518,7 +571,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
                   <button
                     type="button"
                     className="btn-secondary btn-sm"
-                    onClick={() => setIsEditingPrompt(true)}
+                    onClick={handleStartEditing}
                   >
                     {en.create.promptPreview.editPrompt}
                   </button>
@@ -526,15 +579,35 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
                 <button
                   type="button"
                   className="btn-secondary btn-sm"
-                  onClick={() => {
-                    setIsEditingPrompt(false);
-                    setPromptOverride('');
-                  }}
+                  onClick={handleResetToTemplate}
                 >
                   {en.create.promptPreview.resetPrompt}
                 </button>
               </div>
             </div>
+
+            {/* Stale prompt override warning */}
+            {isOverrideStale && (
+              <div
+                style={{
+                  backgroundColor: 'var(--warning-bg)',
+                  border: '1px solid var(--warning)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: '0.75rem',
+                }}
+              >
+                <p style={{ color: '#92400e', fontSize: '0.8125rem', marginBottom: '0.4rem' }}>
+                  {en.create.promptPreview.staleOverrideWarning}
+                </p>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleResetToTemplate}
+                >
+                  {en.create.promptPreview.resetPrompt}
+                </button>
+              </div>
+            )}
 
             {/* Prompt preview or editor */}
             {isEditingPrompt ? (
@@ -602,6 +675,23 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Failed quality checks notice next to button */}
+            {!isQualityPassed && renderedPrompt && failedQualityChecks.length > 0 && (
+              <div
+                style={{
+                  backgroundColor: 'var(--danger-bg)',
+                  border: '1px solid var(--danger)',
+                  borderRadius: 'var(--radius-md)',
+                  padding: '0.5rem 0.75rem',
+                  fontSize: '0.8125rem',
+                  color: 'var(--danger)',
+                }}
+              >
+                <span>Generation blocked — quality checks failed: </span>
+                <strong>{failedQualityChecks.map((c) => c.label).join(', ')}</strong>
               </div>
             )}
 

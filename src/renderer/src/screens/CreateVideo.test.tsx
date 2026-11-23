@@ -9,6 +9,7 @@ import { JOB_STATE_LABELS } from '@shared/job-state';
 describe('CreateVideo Screen', () => {
   let mockApi: PodApi;
   const mockJobCreate = vi.fn<PodApi['jobs']['create']>();
+  const mockPromptPreview = vi.fn<PodApi['prompts']['preview']>();
   let mockProviderStatus: ProviderStatus;
 
   beforeEach(() => {
@@ -57,6 +58,27 @@ describe('CreateVideo Screen', () => {
       return { ok: true, data: jobView };
     });
 
+    mockPromptPreview.mockReset();
+    mockPromptPreview.mockImplementation(async (input) => ({
+      ok: true,
+      data: {
+        text: `Preview prompt for ${input.sku} with template ${input.templateId} (${input.templateVersion ?? 'v1'})`,
+        chars: 40,
+        maxChars: 4000,
+        templateId: input.templateId,
+        templateVersion: input.templateVersion ?? 'v1',
+        isPlaceholder: false,
+        quality: {
+          passed: true,
+          checks: [
+            { rule: 'preserve_artwork', label: 'Preserves original artwork and text', passed: true },
+            { rule: 'no_design_changes', label: 'No redesign, recolor, or repositioning', passed: true },
+          ],
+        },
+        errors: [],
+      },
+    }));
+
     mockApi = {
       app: {
         getInfo: vi.fn().mockResolvedValue({
@@ -100,8 +122,18 @@ describe('CreateVideo Screen', () => {
           data: [
             {
               id: 'product-review',
+              version: 'v1',
+              title: 'Product Review',
+              isPlaceholder: false,
+              source: 'builtin',
+              isDefault: false,
+              createdAt: '2026-11-10',
+              note: null,
+            },
+            {
+              id: 'product-review',
               version: 'v2',
-              title: 'Review V2',
+              title: 'Product Review',
               isPlaceholder: false,
               source: 'builtin',
               isDefault: true,
@@ -111,29 +143,12 @@ describe('CreateVideo Screen', () => {
           ],
         }),
         getTemplate: vi.fn(),
-        preview: vi.fn().mockResolvedValue({
-          ok: true,
-          data: {
-            text: 'Preview prompt for TS-001',
-            chars: 25,
-            maxChars: 4000,
-            templateId: 'product-review',
-            templateVersion: 'v2',
-            isPlaceholder: false,
-            quality: {
-              passed: true,
-              checks: [
-                { rule: 'preserve_artwork', label: 'Preserves artwork', passed: true },
-              ],
-            },
-            errors: [],
-          },
-        }),
+        preview: mockPromptPreview,
         validate: vi.fn().mockResolvedValue({
           ok: true,
           data: {
-            text: 'Valid prompt override',
-            chars: 21,
+            text: 'Valid prompt override text',
+            chars: 25,
             maxChars: 4000,
             templateId: 'custom',
             templateVersion: 'custom',
@@ -235,51 +250,231 @@ describe('CreateVideo Screen', () => {
     expect(screen.getByLabelText(/Aspect Ratio/i)).toBeDefined();
   });
 
-  it('Generate button: disabled until valid; double click → jobs.create called exactly once; uses the same clientRequestId if the component re-renders', async () => {
-    const onJobCreated = vi.fn();
-    const { rerender } = render(
-      <CreateVideo providerStatus={mockProviderStatus} onJobCreated={onJobCreated} />,
-    );
+  it('Template selection: fake list [v1, v2(isDefault)] -> preview and jobs.create receive templateVersion "v2"', async () => {
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
 
-    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
-    // Initially disabled because no image staged and no SKU entered
-    expect(generateBtn.hasAttribute('disabled')).toBe(true);
-
-    // Stage image via browse button
-    const browseBtn = screen.getByRole('button', { name: /Browse…/i });
-    fireEvent.click(browseBtn);
+    // Stage image via browse
+    fireEvent.click(screen.getByRole('button', { name: /Browse…/i }));
     await waitFor(() => {
       expect(screen.getByText(/mock\.png/i)).toBeDefined();
     });
 
     // Enter valid SKU
-    const skuInput = screen.getByLabelText(/SKU/i);
-    fireEvent.change(skuInput, { target: { value: 'ts-001' } });
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-001' } });
 
-    // Wait for categories and prompt preview to populate
+    // Verify template select defaults to v2 (isDefault) and options show title — version
+    await waitFor(() => {
+      const select = screen.getByLabelText(/Prompt Template/i) as HTMLSelectElement;
+      expect(select.value).toBe('product-review@@v2');
+      expect(screen.getByText(/Product Review — v2/i)).toBeDefined();
+    });
+
+    // Wait for debounced preview call
+    await waitFor(() => {
+      expect(mockPromptPreview).toHaveBeenCalledWith(
+        expect.objectContaining({
+          templateId: 'product-review',
+          templateVersion: 'v2',
+        }),
+      );
+    });
+
+    // Click Generate video
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
     await waitFor(() => {
       expect(generateBtn.hasAttribute('disabled')).toBe(false);
     });
-
-    // Rerender the component before clicking to verify clientRequestId stability
-    rerender(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={onJobCreated} />);
-    const generateBtnAfterRerender = screen.getByRole('button', { name: /Generate video/i });
-    expect(generateBtnAfterRerender.hasAttribute('disabled')).toBe(false);
-
-    // Double click the button rapidly
-    fireEvent.click(generateBtnAfterRerender);
-    fireEvent.click(generateBtnAfterRerender);
+    fireEvent.click(generateBtn);
 
     await waitFor(() => {
-      expect(mockJobCreate).toHaveBeenCalledTimes(1);
+      expect(mockJobCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          templateId: 'product-review',
+          templateVersion: 'v2',
+        }),
+      );
+    });
+  });
+
+  it('Generate button requires renderedPrompt.quality.passed === true and displays failed checks', async () => {
+    // Mock prompt preview returning quality.passed === false
+    mockPromptPreview.mockImplementation(async (input) => ({
+      ok: true,
+      data: {
+        text: `Prompt with bad quality for ${input.sku}`,
+        chars: 23,
+        maxChars: 4000,
+        templateId: input.templateId,
+        templateVersion: input.templateVersion ?? 'v2',
+        isPlaceholder: false,
+        quality: {
+          passed: false,
+          checks: [
+            { rule: 'preserve_artwork', label: 'Preserves original artwork and text', passed: false },
+            { rule: 'no_design_changes', label: 'No redesign, recolor, or repositioning', passed: true },
+          ],
+        },
+        errors: [],
+      },
+    }));
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Stage image & SKU
+    fireEvent.click(screen.getByRole('button', { name: /Browse…/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/mock\.png/i)).toBeDefined();
+    });
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-001' } });
+
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+
+    // Wait for prompt preview to load with failed quality
+    await waitFor(() => {
+      expect(screen.getByText(/Generation blocked — quality checks failed:/i)).toBeDefined();
+      expect(screen.getAllByText(/Preserves original artwork and text/i).length).toBeGreaterThanOrEqual(2);
     });
 
-    const calls = mockJobCreate.mock.calls;
-    expect(calls.length).toBeGreaterThan(0);
-    const callArg = calls[0]?.[0];
-    expect(callArg?.sku).toBe('TS-001');
-    expect(callArg?.clientRequestId).toBeDefined();
-    expect(typeof callArg?.clientRequestId).toBe('string');
-    expect(onJobCreated).toHaveBeenCalledWith('test-job-uuid');
+    // Generate button MUST be disabled when quality check fails!
+    expect(generateBtn.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('Dropzone keyboard handler: Enter and Space trigger Browse', async () => {
+    const { unmount } = render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    let dropzone = screen.getByLabelText(/Upload mockup image dropzone/i);
+
+    // Press Enter
+    fireEvent.keyDown(dropzone, { key: 'Enter' });
+    await waitFor(() => {
+      expect(mockApi.images.pick).toHaveBeenCalledTimes(1);
+    });
+    unmount();
+
+    // Re-render and test Space
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+    dropzone = screen.getByLabelText(/Upload mockup image dropzone/i);
+    fireEvent.keyDown(dropzone, { key: ' ' });
+    await waitFor(() => {
+      expect(mockApi.images.pick).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('clientRequestIdRef: preserved after failed create, reset to new UUID after successful create', async () => {
+    let shouldFail = true;
+    mockJobCreate.mockImplementation(async (_input: CreateJobInput) => {
+      if (shouldFail) {
+        return {
+          ok: false,
+          error: { code: 'PROVIDER_ERROR', message: 'Temporary submission error' },
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          job: {
+            id: 'job-success',
+            skuSnapshot: 'TS-001',
+            idempotencyKey: _input.clientRequestId,
+          } as unknown as JobView['job'],
+          stateLabel: 'Queued',
+          category: 'T-shirt',
+          productName: null,
+          sourceUrl: null,
+          videoUrl: null,
+          videoAssetId: null,
+          elapsedMs: 0,
+          progress: null,
+          nextActions: [],
+        },
+      };
+    });
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Stage image and SKU
+    fireEvent.click(screen.getByRole('button', { name: /Browse…/i }));
+    await waitFor(() => expect(screen.getByText(/mock\.png/i)).toBeDefined());
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-001' } });
+
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    await waitFor(() => expect(generateBtn.hasAttribute('disabled')).toBe(false));
+
+    // First attempt -> Fails
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(/Temporary submission error/i)).toBeDefined();
+    });
+
+    const firstRequestId = mockJobCreate.mock.calls[0]?.[0]?.clientRequestId;
+    expect(firstRequestId).toBeDefined();
+
+    // Second attempt -> Fails again, verifies clientRequestId is KEPT IDENTICAL for safe retry
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledTimes(2);
+    });
+    const secondRequestId = mockJobCreate.mock.calls[1]?.[0]?.clientRequestId;
+    expect(secondRequestId).toBe(firstRequestId);
+
+    // Third attempt -> Succeeds
+    shouldFail = false;
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledTimes(3);
+    });
+
+    // Next time Generate is invoked, clientRequestIdRef has been reset to a fresh UUID
+    shouldFail = true;
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledTimes(4);
+    });
+    const fourthRequestId = mockJobCreate.mock.calls[3]?.[0]?.clientRequestId;
+    expect(fourthRequestId).not.toBe(firstRequestId);
+  });
+
+  it('Warns when prompt override was edited and template/category/SKU is changed', async () => {
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Stage image and SKU
+    fireEvent.click(screen.getByRole('button', { name: /Browse…/i }));
+    await waitFor(() => expect(screen.getByText(/mock\.png/i)).toBeDefined());
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-001' } });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Edit prompt/i })).toBeDefined();
+    });
+
+    // Click "Edit prompt"
+    fireEvent.click(screen.getByRole('button', { name: /Edit prompt/i }));
+    expect(screen.getByLabelText(/Editable prompt text/i)).toBeDefined();
+
+    // Stale warning should not be present initially
+    expect(
+      screen.queryByText(/The prompt override was edited for a different SKU, category, or template/i),
+    ).toBeNull();
+
+    // Now change the SKU to a different product
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-999' } });
+
+    // Warning should now be shown asking to reset
+    await waitFor(() => {
+      expect(
+        screen.getByText(/The prompt override was edited for a different SKU, category, or template/i),
+      ).toBeDefined();
+    });
+
+    // Click "Reset to template"
+    const resetBtns = screen.getAllByRole('button', { name: /Reset to template/i });
+    fireEvent.click(resetBtns[0]!);
+
+    // Warning is dismissed and editor returned to preview mode
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/The prompt override was edited for a different SKU, category, or template/i),
+      ).toBeNull();
+    });
   });
 });

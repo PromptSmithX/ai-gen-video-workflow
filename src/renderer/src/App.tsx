@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { AppInfo, ProviderStatus, JobView } from '@shared/ipc';
 import { ACTIVE_JOB_STATES } from '@shared/job-state';
-import { getApi } from './api';
+import { getApi, isBackendUnavailable } from './api';
 import { en } from './i18n/en';
 import { ToastProvider } from './components/Toast';
 import { Sidebar, type ScreenId } from './components/Sidebar';
@@ -13,6 +13,44 @@ import { Admin } from './screens/Admin';
 import './styles.css';
 
 export function App(): React.JSX.Element {
+  if (isBackendUnavailable()) {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100vh',
+          backgroundColor: 'var(--bg-app)',
+          padding: '1.5rem',
+        }}
+      >
+        <div
+          className="card"
+          style={{
+            maxWidth: '500px',
+            textAlign: 'center',
+            padding: '2.5rem 2rem',
+            borderColor: 'var(--danger)',
+          }}
+        >
+          <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⚠️</div>
+          <h1
+            style={{
+              fontSize: '1.35rem',
+              fontWeight: 700,
+              color: 'var(--danger)',
+              marginBottom: '0.75rem',
+            }}
+          >
+            {en.app.backendUnavailable}
+          </h1>
+          <p className="info-text">{en.app.backendUnavailableDesc}</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <ToastProvider>
       <AppContent />
@@ -30,15 +68,10 @@ function AppContent(): React.JSX.Element {
   // Initial app load: getInfo, getStatus, count active jobs
   useEffect(() => {
     let active = true;
-    const initApp = async () => {
-      try {
-        const api = getApi();
-        const [infoRes, statusRes, jobsRes] = await Promise.all([
-          api.app.getInfo(),
-          api.provider.getStatus(),
-          api.jobs.list(),
-        ]);
+    const api = getApi();
 
+    void Promise.all([api.app.getInfo(), api.provider.getStatus(), api.jobs.list()])
+      .then(([infoRes, statusRes, jobsRes]) => {
         if (!active) return;
         if (infoRes.ok) setAppInfo(infoRes.data);
         if (statusRes.ok) setProviderStatus(statusRes.data);
@@ -46,14 +79,11 @@ function AppContent(): React.JSX.Element {
           const count = jobsRes.data.filter((j) => ACTIVE_JOB_STATES.includes(j.job.state)).length;
           setActiveJobsCount(count);
         }
-      } catch {
+      })
+      .catch(() => {
         // handled gracefully
-      }
-    };
+      });
 
-    initApp();
-
-    const api = getApi();
     const unsubscribe = api.jobs.onUpdated((_updatedView: JobView) => {
       // Refresh count on job updates
       api.jobs.list().then((res) => {

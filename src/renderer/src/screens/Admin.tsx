@@ -71,7 +71,7 @@ function AdminContent({
 
   // Prompt Master inputs
   const [templates, setTemplates] = useState<PromptTemplateSummary[]>([]);
-  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [selectedTemplateKey, setSelectedTemplateKey] = useState('');
   const [activeTemplate, setActiveTemplate] = useState<PromptTemplate | null>(null);
   const [newVersionTitle, setNewVersionTitle] = useState('');
   const [newVersionNote, setNewVersionNote] = useState('');
@@ -103,7 +103,7 @@ function AdminContent({
         if (tplsRes.ok && tplsRes.data.length > 0) {
           setTemplates(tplsRes.data);
           const first = tplsRes.data[0];
-          if (first) setSelectedTemplateId(first.id);
+          if (first) setSelectedTemplateKey(`${first.id}@@${first.version}`);
         }
       })
       .catch((err) => {
@@ -118,10 +118,12 @@ function AdminContent({
 
   // Load selected template details
   useEffect(() => {
-    if (!selectedTemplateId) return;
+    if (!selectedTemplateKey) return;
+    const [id, version] = selectedTemplateKey.split('@@');
+    if (!id) return;
     let active = true;
     const api = getApi();
-    void api.prompts.getTemplate({ id: selectedTemplateId }).then((res) => {
+    void api.prompts.getTemplate({ id, version }).then((res) => {
       if (!active) return;
       if (res.ok) {
         setActiveTemplate(res.data);
@@ -133,7 +135,7 @@ function AdminContent({
     return () => {
       active = false;
     };
-  }, [selectedTemplateId]);
+  }, [selectedTemplateKey]);
 
   // Validate new template body as employee types (debounced 300ms)
   useEffect(() => {
@@ -569,12 +571,12 @@ function AdminContent({
               <label htmlFor="admin-tpl-select">{en.admin.promptMaster.templatesList}</label>
               <select
                 id="admin-tpl-select"
-                value={selectedTemplateId}
-                onChange={(e) => setSelectedTemplateId(e.target.value)}
+                value={selectedTemplateKey}
+                onChange={(e) => setSelectedTemplateKey(e.target.value)}
               >
                 {templates.map((tpl) => (
-                  <option key={tpl.id} value={tpl.id}>
-                    {tpl.title} ({tpl.version}) {tpl.isDefault ? '[DEFAULT]' : ''}
+                  <option key={`${tpl.id}@@${tpl.version}`} value={`${tpl.id}@@${tpl.version}`}>
+                    {tpl.title} — {tpl.version} {tpl.isDefault ? '[DEFAULT]' : ''}
                   </option>
                 ))}
               </select>
@@ -781,7 +783,7 @@ function AdminContent({
             </div>
 
             <div className="form-group">
-              <label htmlFor="log-retention">{en.admin.categories.logRetention}</label>
+              <label htmlFor="log-retention">{en.admin.categories.logRetentionDays}</label>
               <input
                 id="log-retention"
                 type="number"
