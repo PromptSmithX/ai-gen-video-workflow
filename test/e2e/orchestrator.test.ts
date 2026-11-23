@@ -809,6 +809,38 @@ describe('JobOrchestrator E2E', () => {
     stack.orchestrator.stop();
   });
 
+  it('provider 404 for an accepted job while polling -> AMBIGUOUS (no retry spin, no resubmit)', async () => {
+    server.setBehavior('healthy');
+    const stack = await createTestStack({ pollIntervalMs: 50 });
+    const token = await stack.stageImage('TS-POLL-404.png');
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-POLL-404',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+    await waitForJobState(stack.db, view.job.id, 'RUNNING');
+    server.setCustomGetJobResponse({ statusCode: 404, body: { error: 'NOT_FOUND' } });
+
+    const ambiguous = await waitForJobState(stack.db, view.job.id, 'AMBIGUOUS');
+    expect(ambiguous.state).toBe('AMBIGUOUS');
+
+    const getsBefore = server.getRequests().filter((r) => r.method === 'GET' && r.url.startsWith('/v1/jobs/')).length;
+    await new Promise((r) => setTimeout(r, 300));
+    const getsAfter = server.getRequests().filter((r) => r.method === 'GET' && r.url.startsWith('/v1/jobs/')).length;
+    expect(getsAfter).toBe(getsBefore);
+
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(1);
+    server.setCustomGetJobResponse(null);
+    stack.orchestrator.stop();
+  });
+
   // 11. writeMetadata failure continues to SUCCEEDED; storeVideo failure moves to DOWNLOAD_FAILED with exactly 1 downloadOutput
   it('writeMetadata failure continues to SUCCEEDED; storeVideo failure moves to DOWNLOAD_FAILED with exactly 1 downloadOutput', async () => {
     // 11a: writeMetadata failure -> job SUCCEEDED, 1 video stored

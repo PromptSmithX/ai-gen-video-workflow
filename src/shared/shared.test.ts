@@ -16,6 +16,8 @@ describe('shared contracts', () => {
     expect(canTransition('SUBMITTING', 'QUEUED')).toBe(false);
     expect(canTransition('AMBIGUOUS', 'QUEUED')).toBe(false);
     expect(canTransition('SUBMITTING', 'AMBIGUOUS')).toBe(true);
+    expect(canTransition('RUNNING', 'AMBIGUOUS')).toBe(true);
+    expect(canTransition('RUNNING', 'QUEUED')).toBe(false);
   });
 
   it('can load the native sqlite driver in the test runtime', () => {
