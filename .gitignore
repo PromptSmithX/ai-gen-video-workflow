@@ -9,3 +9,4 @@ coverage/
 *.part
 POD_VIDEO_LIBRARY/
 .vitest-tmp/
+*.tsbuildinfo
