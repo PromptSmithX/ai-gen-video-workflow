@@ -127,14 +127,14 @@ describe('RestBridgeMuseProvider Integration', () => {
     const unreachableState = await unreachableProvider.getConnectionState();
     expect(unreachableState).toBe('not_installed');
 
-    // 2. Login required (no API key configured)
+    // 2. No API key configured returns error (UI shows hasApiKey separately)
     const noKeyProvider = new RestBridgeMuseProvider({
       config: createConfig(serverBaseUrl),
       getApiKey: () => null,
       logger: mockLogger,
     });
     const loginState = await noKeyProvider.getConnectionState();
-    expect(loginState).toBe('needs_login');
+    expect(loginState).toBe('error');
 
     // 3. Status returns needs_login flag
     server.setBehavior('needs_login');
@@ -208,30 +208,93 @@ describe('RestBridgeMuseProvider Integration', () => {
     expect(poll2.progress).toBe(1.0);
   });
 
-  it('handles refusal (422) and quota (429) on submit', async () => {
-    // 1. Refusal
-    server.setBehavior('refused');
-    const providerRefused = new RestBridgeMuseProvider({
+  it('maps submitJob 4xx responses per explicit review table', async () => {
+    const provider = new RestBridgeMuseProvider({
       config: createConfig(),
       getApiKey: () => testApiKey,
       logger: mockLogger,
     });
-    await expect(providerRefused.generateVideo(createInput())).rejects.toMatchObject({
-      code: 'CONTENT_REFUSED',
+
+    // Row 1: 401, 403 (no body code) -> NEEDS_LOGIN, phase before_submit
+    server.setCustomJobResponse({ statusCode: 401, body: {} });
+    await expect(provider.generateVideo(createInput('req-401'))).rejects.toMatchObject({
+      code: 'NEEDS_LOGIN',
       phase: 'before_submit',
     });
 
-    // 2. Quota
-    server.setBehavior('quota');
-    const providerQuota = new RestBridgeMuseProvider({
-      config: createConfig(),
-      getApiKey: () => testApiKey,
-      logger: mockLogger,
+    server.setCustomJobResponse({ statusCode: 403, body: {} });
+    await expect(provider.generateVideo(createInput('req-403'))).rejects.toMatchObject({
+      code: 'NEEDS_LOGIN',
+      phase: 'before_submit',
     });
-    await expect(providerQuota.generateVideo(createInput())).rejects.toMatchObject({
+
+    // Row 2: 400, 413, 415, 422 -> PROVIDER_ERROR (validation), phase before_submit
+    for (const status of [400, 413, 415, 422]) {
+      server.setCustomJobResponse({ statusCode: status, body: { message: 'Invalid payload' } });
+      await expect(provider.generateVideo(createInput(`req-${status}`))).rejects.toMatchObject({
+        code: 'PROVIDER_ERROR',
+        phase: 'before_submit',
+      });
+    }
+
+    // Row 3: 429 -> QUOTA_LIMITED, phase before_submit unless body says submitted:true
+    server.setCustomJobResponse({ statusCode: 429, body: { submitted: false } });
+    await expect(provider.generateVideo(createInput('req-429-before'))).rejects.toMatchObject({
       code: 'QUOTA_LIMITED',
       phase: 'before_submit',
     });
+
+    server.setCustomJobResponse({ statusCode: 429, body: { submitted: true } });
+    await expect(provider.generateVideo(createInput('req-429-after'))).rejects.toMatchObject({
+      code: 'QUOTA_LIMITED',
+      phase: 'after_submit',
+    });
+
+    // Row 4: Explicit refusal code -> CONTENT_REFUSED, phase after_submit
+    server.setCustomJobResponse({ statusCode: 422, body: { code: 'content_refused' } });
+    await expect(provider.generateVideo(createInput('req-refused-1'))).rejects.toMatchObject({
+      code: 'CONTENT_REFUSED',
+      phase: 'after_submit',
+    });
+
+    server.setCustomJobResponse({ statusCode: 400, body: { error: 'refused' } });
+    await expect(provider.generateVideo(createInput('req-refused-2'))).rejects.toMatchObject({
+      code: 'CONTENT_REFUSED',
+      phase: 'after_submit',
+    });
+
+    server.setCustomJobResponse({ statusCode: 400, body: { error: { code: 'safety' } } });
+    await expect(provider.generateVideo(createInput('req-refused-3'))).rejects.toMatchObject({
+      code: 'CONTENT_REFUSED',
+      phase: 'after_submit',
+    });
+
+    // Explicit body error codes for quota and login
+    server.setCustomJobResponse({ statusCode: 400, body: { code: 'quota' } });
+    await expect(provider.generateVideo(createInput('req-code-quota'))).rejects.toMatchObject({
+      code: 'QUOTA_LIMITED',
+      phase: 'before_submit',
+    });
+
+    server.setCustomJobResponse({ statusCode: 400, body: { code: 'credits', submitted: true } });
+    await expect(provider.generateVideo(createInput('req-code-credits'))).rejects.toMatchObject({
+      code: 'QUOTA_LIMITED',
+      phase: 'after_submit',
+    });
+
+    server.setCustomJobResponse({ statusCode: 400, body: { code: 'login_required' } });
+    await expect(provider.generateVideo(createInput('req-code-login'))).rejects.toMatchObject({
+      code: 'NEEDS_LOGIN',
+      phase: 'before_submit',
+    });
+
+    // Row 5: 408, 409 and any other 4xx -> return ambiguous (SUBMIT_AMBIGUOUS), never resubmit
+    for (const otherStatus of [408, 409, 418]) {
+      server.setCustomJobResponse({ statusCode: otherStatus, body: { message: 'Conflict or timeout' } });
+      const job = await provider.generateVideo(createInput(`req-amb-${otherStatus}`));
+      expect(job.state).toBe('ambiguous');
+      expect(job.errorCode).toBe('SUBMIT_AMBIGUOUS');
+    }
   });
 
   it('handles 5xx on submit by returning ambiguous with no second POST', async () => {
@@ -401,5 +464,107 @@ describe('RestBridgeMuseProvider Integration', () => {
       expect(safeMsg).not.toContain(sensitiveKey);
       expect(safeMsg).not.toContain(sensitivePrompt);
     }
+  });
+
+  it('wraps getJob and cancelJob connection errors and JSON parse failures', async () => {
+    // 1. Stopped bridge connection refused for getJob
+    const stoppedBridgeProvider = new RestBridgeMuseProvider({
+      config: createConfig('http://127.0.0.1:49997'), // inactive port
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+
+    await expect(stoppedBridgeProvider.getJob('job-123')).rejects.toMatchObject({
+      code: 'NOT_CONNECTED',
+      phase: 'after_submit',
+    });
+
+    // When bridge is stopped/unreachable, cancel is unsupported so cancelJob safely throws INVALID_STATE
+    await expect(stoppedBridgeProvider.cancelJob('job-123')).rejects.toMatchObject({
+      code: 'INVALID_STATE',
+      phase: 'before_submit',
+    });
+
+    // 2. Unparseable JSON returned by bridge for getJob
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+
+    server.setCustomGetJobResponse({
+      statusCode: 200,
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'MALFORMED_NON_JSON_RESPONSE',
+    });
+
+    await expect(provider.getJob('job-123')).rejects.toMatchObject({
+      code: 'PROVIDER_ERROR',
+      phase: 'after_submit',
+    });
+
+    // 3. cancelJob fetch timeout when canCancel capability is supported
+    const cancelTimeoutProvider = new RestBridgeMuseProvider(
+      {
+        config: createConfig(),
+        getApiKey: () => testApiKey,
+        logger: mockLogger,
+      },
+      { standardTimeoutMs: 100 }
+    );
+    // Populate capability cache while server is healthy
+    await cancelTimeoutProvider.getCapabilities();
+
+    server.setBehavior('hang_after_request_body');
+    await expect(cancelTimeoutProvider.cancelJob('job-123')).rejects.toMatchObject({
+      code: 'PROVIDER_ERROR',
+      phase: 'after_submit',
+    });
+    server.reset();
+  });
+
+  it('wraps pre-download getJob failure as DOWNLOAD_FAILED in downloadOutput', async () => {
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+
+    // Force getJob to fail with 500
+    server.setCustomGetJobResponse({
+      statusCode: 500,
+      body: { error: 'INTERNAL_ERROR' },
+    });
+
+    const destPath = path.join(tempDir, 'fail-download.part');
+    await expect(provider.downloadOutput('job-123', destPath, 1024 * 1024)).rejects.toMatchObject({
+      code: 'DOWNLOAD_FAILED',
+      phase: 'after_submit',
+    });
+  });
+
+  it('rejects image files without a valid PNG, JPEG, or WEBP signature', async () => {
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+
+    // Write a file with .png extension but invalid magic bytes
+    const fakeImagePath = path.join(tempDir, 'fake.png');
+    fs.writeFileSync(fakeImagePath, Buffer.from('NOT_A_VALID_IMAGE_SIGNATURE'));
+
+    const invalidInput: GenerateVideoInput = {
+      sku: 'TS-999',
+      sourceImagePath: fakeImagePath,
+      sourceFileName: 'fake.png',
+      prompt: 'Valid prompt text',
+      requestId: 'req-invalid-img',
+    };
+
+    await expect(provider.generateVideo(invalidInput)).rejects.toMatchObject({
+      code: 'INVALID_IMAGE',
+      phase: 'before_submit',
+    });
   });
 });

@@ -39,11 +39,13 @@ import {
 } from './mapping';
 
 const DEFAULT_CAPABILITIES_CACHE_TTL_MS = 60_000;
-const DEFAULT_SUBMIT_TIMEOUT_MS = 15_000;
+const DEFAULT_SUBMIT_TIMEOUT_MS = 30_000;
+const DEFAULT_UPLOAD_TIMEOUT_MS = 60_000;
 const DEFAULT_STANDARD_REQUEST_TIMEOUT_MS = 5_000;
 
 export interface RestBridgeOptions {
   submitTimeoutMs?: number;
+  uploadTimeoutMs?: number;
   standardTimeoutMs?: number;
 }
 
@@ -54,6 +56,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
   private readonly logger: Logger;
   private readonly validatedBaseUrl: URL | null = null;
   private readonly submitTimeoutMs: number;
+  private readonly uploadTimeoutMs: number;
   private readonly standardTimeoutMs: number;
 
   private cachedCapabilities: ProviderCapabilities | null = null;
@@ -65,6 +68,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
     this.getApiKey = deps.getApiKey;
     this.logger = deps.logger;
     this.submitTimeoutMs = options.submitTimeoutMs ?? DEFAULT_SUBMIT_TIMEOUT_MS;
+    this.uploadTimeoutMs = options.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS;
     this.standardTimeoutMs = options.standardTimeoutMs ?? DEFAULT_STANDARD_REQUEST_TIMEOUT_MS;
 
     if (this.config.bridgeBaseUrl) {
@@ -115,7 +119,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
     // 2. Status check (authenticated)
     const apiKey = this.getApiKey();
     if (!apiKey) {
-      return 'needs_login';
+      return 'error';
     }
 
     const statusUrl = new URL(STATUS_ENDPOINT, baseUrl).toString();
@@ -284,7 +288,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
       });
     }
 
-    const mime = detectImageMime(imageBuffer, input.sourceImagePath);
+    const mime = detectImageMime(imageBuffer);
     const safeFileName = path.basename(input.sourceFileName);
 
     try {
@@ -297,7 +301,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
         },
         body: imageBuffer,
         redirect: 'manual',
-        signal: AbortSignal.timeout(this.submitTimeoutMs),
+        signal: AbortSignal.timeout(this.uploadTimeoutMs),
       });
 
       if (!res.ok) {
@@ -438,20 +442,29 @@ export class RestBridgeMuseProvider implements MuseProvider {
       };
     }
 
-    // 4xx handling (Refusal, Quota, Login)
+    // 4xx handling per explicit review table
     if (res.status >= 400 && res.status < 500) {
+      let bodyCode: string | undefined;
       let isSubmitted = false;
+
       try {
         const errorJson = await res.json();
         const parsedError = BridgeErrorResponseSchema.safeParse(errorJson);
-        if (parsedError.success && parsedError.data.submitted === true) {
-          isSubmitted = true;
+        if (parsedError.success) {
+          if (parsedError.data.submitted === true) {
+            isSubmitted = true;
+          }
+          if (parsedError.data.code) {
+            bodyCode = parsedError.data.code.toLowerCase();
+          } else if (typeof parsedError.data.error === 'object' && parsedError.data.error?.code) {
+            bodyCode = parsedError.data.error.code.toLowerCase();
+          } else if (typeof parsedError.data.error === 'string') {
+            bodyCode = parsedError.data.error.toLowerCase();
+          }
         }
       } catch {
         // Ignored
       }
-
-      const phase = isSubmitted ? 'after_submit' : 'before_submit';
 
       this.logger.warn('muse.submit_client_error', {
         requestId: input.requestId,
@@ -459,16 +472,69 @@ export class RestBridgeMuseProvider implements MuseProvider {
         durationMs: Date.now() - startTime,
       });
 
-      if (res.status === 401) {
-        throw new ProviderError('NEEDS_LOGIN', phase);
+      // 1. Explicit body error code wins when present:
+      // content_refused | refused | safety -> CONTENT_REFUSED, phase after_submit (terminal anyway)
+      if (
+        bodyCode === 'content_refused' ||
+        bodyCode === 'refused' ||
+        bodyCode === 'safety'
+      ) {
+        throw new ProviderError('CONTENT_REFUSED', 'after_submit', SAFE_ERROR_MESSAGES.CONTENT_REFUSED);
       }
-      if (res.status === 403 || res.status === 422) {
-        throw new ProviderError('CONTENT_REFUSED', phase);
+
+      // quota | credits | rate_limited -> QUOTA_LIMITED, phase before_submit unless body says submitted:true
+      if (
+        bodyCode === 'quota' ||
+        bodyCode === 'credits' ||
+        bodyCode === 'rate_limited'
+      ) {
+        const phase = isSubmitted ? 'after_submit' : 'before_submit';
+        throw new ProviderError('QUOTA_LIMITED', phase, SAFE_ERROR_MESSAGES.QUOTA_LIMITED);
       }
+
+      // needs_login | login_required | unauthenticated -> NEEDS_LOGIN, phase before_submit
+      if (
+        bodyCode === 'needs_login' ||
+        bodyCode === 'login_required' ||
+        bodyCode === 'unauthenticated'
+      ) {
+        throw new ProviderError('NEEDS_LOGIN', 'before_submit', SAFE_ERROR_MESSAGES.NEEDS_LOGIN);
+      }
+
+      // 2. Status code mapping when no explicit body code matched:
+      // - 401, 403 (no body code) -> NEEDS_LOGIN, phase before_submit (auth layer rejects before processing)
+      if (res.status === 401 || res.status === 403) {
+        throw new ProviderError('NEEDS_LOGIN', 'before_submit', SAFE_ERROR_MESSAGES.NEEDS_LOGIN);
+      }
+
+      // - 400, 413, 415, 422 -> PROVIDER_ERROR (validation), phase before_submit
+      if (
+        res.status === 400 ||
+        res.status === 413 ||
+        res.status === 415 ||
+        res.status === 422
+      ) {
+        throw new ProviderError('PROVIDER_ERROR', 'before_submit', `Provider validation error (${res.status}).`);
+      }
+
+      // - 429 -> QUOTA_LIMITED, phase before_submit unless body says submitted:true
       if (res.status === 429) {
-        throw new ProviderError('QUOTA_LIMITED', phase);
+        const phase = isSubmitted ? 'after_submit' : 'before_submit';
+        throw new ProviderError('QUOTA_LIMITED', phase, SAFE_ERROR_MESSAGES.QUOTA_LIMITED);
       }
-      throw new ProviderError('PROVIDER_ERROR', phase, `Job submission failed with status ${res.status}.`);
+
+      // - 408, 409 and any other 4xx -> return ambiguous (SUBMIT_AMBIGUOUS), never resubmit
+      this.logger.warn('muse.submit_other_4xx_ambiguous', {
+        requestId: input.requestId,
+        statusCode: res.status,
+        durationMs: Date.now() - startTime,
+      });
+      return {
+        providerJobId: '',
+        state: 'ambiguous',
+        errorCode: 'SUBMIT_AMBIGUOUS',
+        safeMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+      };
     }
 
     // 200 or 202 Success response
@@ -547,14 +613,28 @@ export class RestBridgeMuseProvider implements MuseProvider {
 
     const url = new URL(jobEndpoint(providerJobId), baseUrl).toString();
 
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(this.standardTimeoutMs),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(this.standardTimeoutMs),
+      });
+    } catch (err: unknown) {
+      const errorObj = err as { code?: string; cause?: { code?: string } };
+      const errorCode = errorObj.code ?? errorObj.cause?.code;
+      if (errorCode === 'ECONNREFUSED' || errorCode === 'ENOTFOUND') {
+        throw new ProviderError('NOT_CONNECTED', 'after_submit', 'Bridge connection was refused.', {
+          cause: err,
+        });
+      }
+      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Failed to query job from bridge.', {
+        cause: err,
+      });
+    }
 
     if (res.status === 404) {
       throw new ProviderError('NOT_FOUND', 'after_submit', `Job ${providerJobId} not found.`);
@@ -569,10 +649,20 @@ export class RestBridgeMuseProvider implements MuseProvider {
       throw new ProviderError('PROVIDER_ERROR', 'after_submit', `Failed to query job ${providerJobId}.`);
     }
 
-    const json = await res.json();
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (err) {
+      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Failed to parse job status response JSON.', {
+        cause: err,
+      });
+    }
+
     const parseResult = JobStatusResponseSchema.safeParse(json);
     if (!parseResult.success) {
-      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Invalid job status payload from bridge.');
+      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Invalid job status payload from bridge.', {
+        cause: parseResult.error,
+      });
     }
 
     const data = parseResult.data;
@@ -665,7 +755,17 @@ export class RestBridgeMuseProvider implements MuseProvider {
     maxBytes: number
   ): Promise<DownloadResult> {
     const startTime = Date.now();
-    const job = await this.getJob(providerJobId);
+    let job: ProviderJob;
+    try {
+      job = await this.getJob(providerJobId);
+    } catch (err) {
+      if (err instanceof ProviderError && err.code === 'DOWNLOAD_FAILED') {
+        throw err;
+      }
+      throw new ProviderError('DOWNLOAD_FAILED', 'after_submit', 'Failed to retrieve job status before download.', {
+        cause: err,
+      });
+    }
 
     if (job.state !== 'succeeded') {
       throw new ProviderError('OUTPUT_MISSING', 'after_submit', 'Job has not succeeded.');
@@ -717,14 +817,28 @@ export class RestBridgeMuseProvider implements MuseProvider {
     }
 
     const url = new URL(jobCancelEndpoint(providerJobId), baseUrl).toString();
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(this.standardTimeoutMs),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(this.standardTimeoutMs),
+      });
+    } catch (err: unknown) {
+      const errorObj = err as { code?: string; cause?: { code?: string } };
+      const errorCode = errorObj.code ?? errorObj.cause?.code;
+      if (errorCode === 'ECONNREFUSED' || errorCode === 'ENOTFOUND') {
+        throw new ProviderError('NOT_CONNECTED', 'after_submit', 'Bridge connection was refused.', {
+          cause: err,
+        });
+      }
+      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Failed to cancel job on bridge.', {
+        cause: err,
+      });
+    }
 
     if (!res.ok) {
       throw new ProviderError('PROVIDER_ERROR', 'after_submit', `Failed to cancel job ${providerJobId}.`);
@@ -732,7 +846,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
   }
 }
 
-function detectImageMime(buffer: Buffer, filePath: string): string {
+function detectImageMime(buffer: Buffer): string {
   if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
     return 'image/png';
   }
@@ -746,9 +860,9 @@ function detectImageMime(buffer: Buffer, filePath: string): string {
   ) {
     return 'image/webp';
   }
-
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  return 'image/png';
+  throw new ProviderError(
+    'INVALID_IMAGE',
+    'before_submit',
+    'Unsupported image format; signature must be PNG, JPEG, or WEBP.'
+  );
 }

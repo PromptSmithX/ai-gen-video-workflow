@@ -37,6 +37,12 @@ interface MockServerJob {
   polls: number;
 }
 
+export interface CustomResponse {
+  statusCode: number;
+  headers?: Record<string, string>;
+  body?: unknown;
+}
+
 export class MockBridgeServer {
   private server: http.Server | null = null;
   private port = 0;
@@ -46,6 +52,8 @@ export class MockBridgeServer {
   private jobs = new Map<string, MockServerJob>();
   private jobsByIdempotencyKey = new Map<string, MockServerJob>();
   private idCounter = 1;
+  private customJobResponse: CustomResponse | null = null;
+  private customGetJobResponse: CustomResponse | null = null;
 
   constructor(options: { behavior?: MockBridgeBehavior; expectedToken?: string } = {}) {
     if (options.behavior) this.behavior = options.behavior;
@@ -64,6 +72,14 @@ export class MockBridgeServer {
     this.expectedToken = token;
   }
 
+  setCustomJobResponse(response: CustomResponse | null): void {
+    this.customJobResponse = response;
+  }
+
+  setCustomGetJobResponse(response: CustomResponse | null): void {
+    this.customGetJobResponse = response;
+  }
+
   getRequests(): RecordedRequest[] {
     return [...this.requests];
   }
@@ -78,6 +94,8 @@ export class MockBridgeServer {
     this.jobsByIdempotencyKey.clear();
     this.idCounter = 1;
     this.behavior = 'healthy';
+    this.customJobResponse = null;
+    this.customGetJobResponse = null;
   }
 
   async start(): Promise<string> {
@@ -230,6 +248,19 @@ export class MockBridgeServer {
     if (pathname === '/v1/jobs' && req.method === 'POST') {
       if (!checkAuth()) return;
 
+      if (this.customJobResponse) {
+        res.writeHead(this.customJobResponse.statusCode, {
+          'Content-Type': 'application/json',
+          ...(this.customJobResponse.headers ?? {}),
+        });
+        const bodyStr =
+          typeof this.customJobResponse.body === 'string'
+            ? this.customJobResponse.body
+            : JSON.stringify(this.customJobResponse.body ?? {});
+        res.end(bodyStr);
+        return;
+      }
+
       if (this.behavior === 'hang_after_request_body') {
         // Hang indefinitely without responding (triggers client timeout)
         return;
@@ -327,6 +358,20 @@ export class MockBridgeServer {
     const jobMatch = pathname.match(/^\/v1\/jobs\/([^/]+)$/);
     if (jobMatch && req.method === 'GET') {
       if (!checkAuth()) return;
+
+      if (this.customGetJobResponse) {
+        res.writeHead(this.customGetJobResponse.statusCode, {
+          'Content-Type': 'application/json',
+          ...(this.customGetJobResponse.headers ?? {}),
+        });
+        const bodyStr =
+          typeof this.customGetJobResponse.body === 'string'
+            ? this.customGetJobResponse.body
+            : JSON.stringify(this.customGetJobResponse.body ?? {});
+        res.end(bodyStr);
+        return;
+      }
+
       const jobId = decodeURIComponent(jobMatch[1] ?? '');
       const job = this.jobs.get(jobId);
       if (!job) {
@@ -378,6 +423,9 @@ export class MockBridgeServer {
     const cancelMatch = pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
     if (cancelMatch && req.method === 'POST') {
       if (!checkAuth()) return;
+      if (this.behavior === 'hang_after_request_body') {
+        return;
+      }
       const jobId = decodeURIComponent(cancelMatch[1] ?? '');
       const job = this.jobs.get(jobId);
       if (job) {

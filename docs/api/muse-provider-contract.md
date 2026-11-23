@@ -177,20 +177,34 @@ flowchart TD
 
 ## 6. Error Mapping Table
 
-| HTTP Status / Condition | Provider Error Code | Failure Phase | Safe Message |
+### 6.1 `POST /v1/jobs` Explicit Mapping Table
+
+| Trigger | Provider Error Code | Failure Phase | Action / State |
+|---|---|---|---|
+| Body code: `content_refused`, `refused`, `safety` | `CONTENT_REFUSED` | `after_submit` | Terminal refusal; do not alter artwork |
+| Body code: `quota`, `credits`, `rate_limited` | `QUOTA_LIMITED` | `before_submit`* | Stop; show quota message |
+| Body code: `needs_login`, `login_required`, `unauthenticated` | `NEEDS_LOGIN` | `before_submit` | Prompt user to sign in through provider UI |
+| HTTP 401, 403 (no matching body code) | `NEEDS_LOGIN` | `before_submit` | Auth layer rejected before processing |
+| HTTP 400, 413, 415, 422 (validation errors) | `PROVIDER_ERROR` | `before_submit` | Client validation failure |
+| HTTP 429 (no body code) | `QUOTA_LIMITED` | `before_submit`* | Generation stopped |
+| HTTP 408, 409, or any other 4xx | `SUBMIT_AMBIGUOUS` | `after_submit` | Return ambiguous job; **never resubmit** |
+| HTTP 5xx, timeout, socket reset after send | `SUBMIT_AMBIGUOUS` | `after_submit` | Return ambiguous job; **never resubmit** |
+
+_\* Phase is `after_submit` only when the bridge response explicitly asserts `submitted: true`._
+
+### 6.2 Connection, Query, and Download Error Mapping
+
+| Condition | Provider Error Code | Failure Phase | Safe Message |
 |---|---|---|---|
 | Unreachable `/v1/health` | `NOT_CONNECTED` | `before_submit` | The Muse bridge is not running or cannot be reached. |
 | Non-loopback base URL | `UNSUPPORTED_PLATFORM` | `before_submit` | Non-loopback bridge URLs are strictly forbidden. |
-| Missing API Key | `NEEDS_LOGIN` | `before_submit` | Please sign in to Muse through the normal Muse login. |
-| Status 401 / 403 | `NEEDS_LOGIN` / `error` | `before_submit` | Please sign in to Muse through the normal Muse login. |
-| Submit 422 / 403 refusal | `CONTENT_REFUSED` | `before_submit`* | Muse refused this request. The artwork was not changed. |
-| Submit 429 quota | `QUOTA_LIMITED` | `before_submit`* | Muse reports generation quota/credits are exhausted. |
-| Submit 5xx server error | `SUBMIT_AMBIGUOUS` | `after_submit` | The request may already have been sent; it will not be resent. |
-| Submit socket timeout/reset | `SUBMIT_AMBIGUOUS` | `after_submit` | The request may already have been sent; it will not be resent. |
+| Missing API Key (`getConnectionState`) | `error` | N/A | Provider state is error; hasApiKey shown separately in UI. |
+| Missing API Key (`generateVideo` / `getJob`) | `NEEDS_LOGIN` | `before_submit` | Please sign in to Muse through the normal Muse login. |
+| `getJob` / `cancelJob` connection refused | `NOT_CONNECTED` | `after_submit` | Bridge connection was refused. |
+| `getJob` timeout / malformed JSON | `PROVIDER_ERROR` | `after_submit` | Failed to query job from bridge. |
 | Missing MP4 asset | `OUTPUT_MISSING` | `after_submit` | Muse marked the job complete but no video was delivered. |
-| Stream truncated / oversized | `DOWNLOAD_FAILED` | `after_submit` | The video was generated but could not be downloaded. |
-
-_\* Phase is `before_submit` only when the bridge response explicitly asserts `submitted: false`._
+| Pre-download `getJob` query failure | `DOWNLOAD_FAILED` | `after_submit` | Failed to retrieve job status before download. |
+| Stream truncated / oversized / redirect | `DOWNLOAD_FAILED` | `after_submit` | The video was generated but could not be downloaded. |
 
 ---
 

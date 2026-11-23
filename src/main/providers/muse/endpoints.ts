@@ -129,7 +129,17 @@ export type JobStatusResponse = z.infer<typeof JobStatusResponseSchema>;
 // ASSUMPTION (verify against live /v1/openapi.json): Bridge error payload shape
 export const BridgeErrorResponseSchema = z
   .object({
-    error: z.string().optional(),
+    error: z
+      .union([
+        z.string(),
+        z
+          .object({
+            code: z.string().optional(),
+            message: z.string().optional(),
+          })
+          .passthrough(),
+      ])
+      .optional(),
     code: z.string().optional(),
     message: z.string().optional(),
     submitted: z.boolean().optional(),
