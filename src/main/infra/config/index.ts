@@ -140,6 +140,14 @@ export interface LoadConfigArgs {
   envFilePath?: string;
 }
 
+export interface ReadEffectiveEnvArgs {
+  env: NodeJS.ProcessEnv;
+  isDev: boolean;
+  userDataDir: string;
+  envFilePath?: string;
+  cwd?: string;
+}
+
 function cleanEnvVal(val: string | undefined): string | undefined {
   if (val === undefined) return undefined;
   const trimmed = val.trim();
@@ -147,20 +155,13 @@ function cleanEnvVal(val: string | undefined): string | undefined {
 }
 
 /**
- * Loads and validates application configuration.
- * Merges environment variables (.env via dotenv) and admin settings.
- * Empty env values are treated as unset and fall back to defaults.
- * Supports optional .env in paths.userData when not dev.
- * On validation failure, throws PodError('CONFIG_INVALID') with a message
- * naming the offending key, never the value.
+ * Reads and merges environment configuration from file (.env) and process environment.
+ * In dev: reads from cwd (.env).
+ * In installed / non-dev: reads optional .env from userDataDir.
+ * If envFilePath is provided: reads from that path explicitly.
+ * Treats blank/empty string values as unset.
  */
-export function loadConfig(args: {
-  env: NodeJS.ProcessEnv;
-  settings: Partial<AdminSettings>;
-  paths: { userData: string; documents: string };
-  isDev: boolean;
-  envFilePath?: string;
-}): AppConfig {
+export function readEffectiveEnv(args: ReadEffectiveEnvArgs): Record<string, string | undefined> {
   let fileEnv: Record<string, string> = {};
 
   if (args.envFilePath) {
@@ -171,14 +172,15 @@ export function loadConfig(args: {
       throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: envFilePath');
     }
   } else if (args.isDev) {
-    const defaultEnvPath = resolve('.env');
+    const baseDir = args.cwd ?? resolve('.');
+    const defaultEnvPath = join(baseDir, '.env');
     if (existsSync(defaultEnvPath)) {
       const content = readFileSync(defaultEnvPath, 'utf-8');
       fileEnv = dotenv.parse(content);
     }
   } else {
-    // Installed / production app: check optional .env in paths.userData
-    const prodEnvPath = join(args.paths.userData, '.env');
+    // Installed / production app: check optional .env in userDataDir
+    const prodEnvPath = join(args.userDataDir, '.env');
     if (existsSync(prodEnvPath)) {
       const content = readFileSync(prodEnvPath, 'utf-8');
       fileEnv = dotenv.parse(content);
@@ -202,6 +204,31 @@ export function loadConfig(args: {
       delete effectiveEnv[key];
     }
   }
+
+  return effectiveEnv;
+}
+
+/**
+ * Loads and validates application configuration.
+ * Merges environment variables (.env via dotenv) and admin settings.
+ * Empty env values are treated as unset and fall back to defaults.
+ * Supports optional .env in paths.userData when not dev.
+ * On validation failure, throws PodError('CONFIG_INVALID') with a message
+ * naming the offending key, never the value.
+ */
+export function loadConfig(args: {
+  env: NodeJS.ProcessEnv;
+  settings: Partial<AdminSettings>;
+  paths: { userData: string; documents: string };
+  isDev: boolean;
+  envFilePath?: string;
+}): AppConfig {
+  const effectiveEnv = readEffectiveEnv({
+    env: args.env,
+    isDev: args.isDev,
+    userDataDir: args.paths.userData,
+    envFilePath: args.envFilePath,
+  });
 
   // Provider mode
   const rawProviderMode = effectiveEnv['PROVIDER_MODE'] || 'mock';

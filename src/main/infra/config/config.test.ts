@@ -3,7 +3,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PodError } from '@shared/errors';
-import { assertLoopbackUrl, assertPlatformOrigin, assertDataDir, isAdmin, loadConfig } from './index';
+import { createSecretStore, getBridgeApiKey, type SafeStorageLike } from '../secrets/index';
+import {
+  assertLoopbackUrl,
+  assertPlatformOrigin,
+  assertDataDir,
+  isAdmin,
+  loadConfig,
+  readEffectiveEnv,
+} from './index';
 
 describe('Config Infrastructure', () => {
   let tempDir: string;
@@ -280,6 +288,44 @@ LOG_RETENTION_DAYS=14
           isDev: false,
         })
       ).toThrow(PodError);
+    });
+  });
+
+  describe('readEffectiveEnv and getBridgeApiKey integration', () => {
+    function makeMockSafeStorage(available: boolean): SafeStorageLike {
+      return {
+        isEncryptionAvailable: () => available,
+        encryptString: (s: string) => Buffer.from(`ENC:${s}`, 'utf-8'),
+        decryptString: (b: Buffer) => b.toString('utf-8').slice(4),
+      };
+    }
+
+    it('reads MUSE_BRIDGE_API_KEY from .env into effectiveEnv and supplies getBridgeApiKey, while store value still wins', () => {
+      const envPath = path.join(tempDir, 'key-test.env');
+      writeFileSync(envPath, 'MUSE_BRIDGE_API_KEY=abc\n');
+
+      const effectiveEnv = readEffectiveEnv({
+        env: {},
+        isDev: true,
+        userDataDir: dummyPaths.userData,
+        envFilePath: envPath,
+      });
+
+      expect(effectiveEnv['MUSE_BRIDGE_API_KEY']).toBe('abc');
+
+      const mockSafeStorage = makeMockSafeStorage(true);
+      const secretFile = path.join(tempDir, 'secrets.json');
+      const storeWithoutKey = createSecretStore({
+        safeStorage: mockSafeStorage,
+        filePath: secretFile,
+      });
+
+      // When store has no key, effectiveEnv provides the fallback
+      expect(getBridgeApiKey(storeWithoutKey, effectiveEnv)).toBe('abc');
+
+      // When store has a key, the store value wins
+      storeWithoutKey.set('bridge_api_key', 'store-key-wins');
+      expect(getBridgeApiKey(storeWithoutKey, effectiveEnv)).toBe('store-key-wins');
     });
   });
 
