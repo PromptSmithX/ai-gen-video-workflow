@@ -19,6 +19,17 @@ The application allows employees to drag and drop product mockups, select SKUs a
 
 ## Environment Configuration
 
+### Which `.env` file is loaded?
+- **Development Mode (`npm run dev`):** Reads `.env` from the repository root directory (working directory).
+- **Installed Desktop Application (Production):** Reads an optional `.env` file from the user data directory:
+  `%APPDATA%\pod-video-studio\.env` (or `<userData>/.env`).
+  This allows testing and custom configurations on installed desktop builds.
+- **Explicit Override:** Pass `envFilePath` to `loadConfig` to load an explicit file path.
+
+### Bridge API Key Storage: Recommended vs Fallback
+- **Recommended (Production):** Enter the bridge API key in the **Admin** settings screen. It is encrypted using Windows DPAPI via Electron's `safeStorage` and stored with restrictive permissions (`0o600`).
+- **Testing Convenience:** `MUSE_BRIDGE_API_KEY` may be set in `.env` as a fallback when no DPAPI secret has been saved. It is read on-demand in both development and installed mode, is never persisted to the secret store, and is never written to logs or diagnostics.
+
 Copy `.env.example` to `.env` for local development. **Never commit `.env`.**
 
 All URLs and keys are company-supplied and must use placeholders:
@@ -27,8 +38,8 @@ All URLs and keys are company-supplied and must use placeholders:
 |---|---|---|
 | `PROVIDER_MODE` | `mock` | `mock` (offline, no network) or `bridge` (approved local Muse bridge) |
 | `MUSE_PLATFORM_ORIGIN` | `PLACEHOLDER` | Exact HTTPS origin of Muse product (e.g. `https://muse.ai`) |
-| `MUSE_BRIDGE_BASE_URL` | `PLACEHOLDER` | Loopback-only bridge base URL (e.g. `http://127.0.0.1:47821`) |
-| `MUSE_BRIDGE_API_KEY` | `PLACEHOLDER` | Dev-only convenience API key. Production uses DPAPI secret store. |
+| `MUSE_BRIDGE_BASE_URL` | `PLACEHOLDER` | Loopback-only bridge base URL (e.g. `http://127.0.0.1:47821`). Trailing slashes are automatically stripped. |
+| `MUSE_BRIDGE_API_KEY` | `PLACEHOLDER` | Convenience API key fallback. Admin screen (DPAPI) is recommended for production. |
 | `PROMPT_MASTER_PATH` | `PLACEHOLDER` | Optional absolute path to company Prompt Master markdown file. |
 | `POD_LIBRARY_ROOT` | `<Documents>/POD_VIDEO_LIBRARY` | Destination folder for SKU video library. |
 | `PROMPT_MAX_CHARS` | `4000` | Maximum character length for prompts. |

@@ -140,9 +140,17 @@ export interface LoadConfigArgs {
   envFilePath?: string;
 }
 
+function cleanEnvVal(val: string | undefined): string | undefined {
+  if (val === undefined) return undefined;
+  const trimmed = val.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
 /**
  * Loads and validates application configuration.
  * Merges environment variables (.env via dotenv) and admin settings.
+ * Empty env values are treated as unset and fall back to defaults.
+ * Supports optional .env in paths.userData when not dev.
  * On validation failure, throws PodError('CONFIG_INVALID') with a message
  * naming the offending key, never the value.
  */
@@ -168,13 +176,30 @@ export function loadConfig(args: {
       const content = readFileSync(defaultEnvPath, 'utf-8');
       fileEnv = dotenv.parse(content);
     }
+  } else {
+    // Installed / production app: check optional .env in paths.userData
+    const prodEnvPath = join(args.paths.userData, '.env');
+    if (existsSync(prodEnvPath)) {
+      const content = readFileSync(prodEnvPath, 'utf-8');
+      fileEnv = dotenv.parse(content);
+    }
   }
 
-  // Combine dotenv file and args.env (args.env overrides fileEnv when defined)
-  const effectiveEnv: Record<string, string | undefined> = { ...fileEnv };
+  // Combine dotenv file and args.env.
+  // Treat empty/blank string values as unset so they fall back to defaults.
+  const effectiveEnv: Record<string, string | undefined> = {};
+  for (const [key, val] of Object.entries(fileEnv)) {
+    const cleaned = cleanEnvVal(val);
+    if (cleaned !== undefined) {
+      effectiveEnv[key] = cleaned;
+    }
+  }
   for (const [key, val] of Object.entries(args.env)) {
-    if (val !== undefined) {
-      effectiveEnv[key] = val;
+    const cleaned = cleanEnvVal(val);
+    if (cleaned !== undefined) {
+      effectiveEnv[key] = cleaned;
+    } else if (val !== undefined && val.trim() === '') {
+      delete effectiveEnv[key];
     }
   }
 
@@ -185,7 +210,7 @@ export function loadConfig(args: {
   }
   const providerMode = rawProviderMode as ProviderMode;
 
-  // Bridge base URL
+  // Bridge base URL (normalize by stripping trailing slashes for clean URL concatenation)
   let bridgeBaseUrl: string | null = null;
   const bridgeBaseUrlRaw =
     args.settings.bridgeBaseUrl !== undefined
@@ -194,7 +219,11 @@ export function loadConfig(args: {
 
   if (bridgeBaseUrlRaw && bridgeBaseUrlRaw.trim() !== '') {
     assertLoopbackUrl(bridgeBaseUrlRaw.trim());
-    bridgeBaseUrl = bridgeBaseUrlRaw.trim();
+    let normalized = bridgeBaseUrlRaw.trim();
+    while (normalized.endsWith('/')) {
+      normalized = normalized.slice(0, -1);
+    }
+    bridgeBaseUrl = normalized;
   }
 
   // Muse platform origin
@@ -225,7 +254,7 @@ export function loadConfig(args: {
   const dataDir = args.paths.userData;
   assertDataDir(dataDir);
 
-  // Numbers & Bounds validation
+  // Numbers & Bounds validation (empty values fall back to defaults)
   const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? 4000;
   const pollIntervalMsRaw = effectiveEnv['POLL_INTERVAL_MS'] ?? 3000;
   const pollMaxIntervalMsRaw = effectiveEnv['POLL_MAX_INTERVAL_MS'] ?? 15000;

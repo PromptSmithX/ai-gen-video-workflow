@@ -72,7 +72,7 @@ describe('Secrets Infrastructure', () => {
   });
 
   describe('When encryption is available', () => {
-    it('round trips values without storing plaintext', () => {
+    it('round trips values without storing plaintext and writes atomically', () => {
       const mockSafeStorage = makeMockSafeStorage(true);
       const store = createSecretStore({
         safeStorage: mockSafeStorage,
@@ -82,8 +82,9 @@ describe('Secrets Infrastructure', () => {
       const secretValue = 'top-secret-token-12345';
       store.set('bridge_api_key', secretValue);
 
-      // Verify file exists
+      // Verify file exists and temporary file was cleanly replaced
       expect(existsSync(secretFilePath)).toBe(true);
+      expect(existsSync(`${secretFilePath}.tmp`)).toBe(false);
 
       // Check file content does NOT contain raw plaintext or raw base64 of plaintext
       const rawFileContent = readFileSync(secretFilePath, 'utf-8');
@@ -112,7 +113,7 @@ describe('Secrets Infrastructure', () => {
       expect(store.get('bridge_api_key')).toBe('recovered-key');
     });
 
-    it('deletes secret successfully', () => {
+    it('deletes secret successfully and atomically', () => {
       const mockSafeStorage = makeMockSafeStorage(true);
       const store = createSecretStore({
         safeStorage: mockSafeStorage,
@@ -124,11 +125,12 @@ describe('Secrets Infrastructure', () => {
 
       store.delete('bridge_api_key');
       expect(store.get('bridge_api_key')).toBeNull();
+      expect(existsSync(`${secretFilePath}.tmp`)).toBe(false);
     });
   });
 
   describe('getBridgeApiKey helper', () => {
-    it('returns stored key first even if env is set in dev', () => {
+    it('returns stored key first even if env is set', () => {
       const mockSafeStorage = makeMockSafeStorage(true);
       const store = createSecretStore({
         safeStorage: mockSafeStorage,
@@ -138,22 +140,31 @@ describe('Secrets Infrastructure', () => {
 
       const key = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env' }, true);
       expect(key).toBe('from-store');
+
+      const keyProd = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env' }, false);
+      expect(keyProd).toBe('from-store');
     });
 
-    it('falls back to env MUSE_BRIDGE_API_KEY ONLY in dev mode', () => {
+    it('falls back to env MUSE_BRIDGE_API_KEY when no secret-store value exists (without persisting)', () => {
       const mockSafeStorage = makeMockSafeStorage(true);
       const store = createSecretStore({
         safeStorage: mockSafeStorage,
         filePath: secretFilePath,
       });
 
-      // In dev: falls back to env
-      const devKey = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env' }, true);
-      expect(devKey).toBe('from-env');
+      // Falls back to env value
+      const devKey = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env-convenience' }, true);
+      expect(devKey).toBe('from-env-convenience');
 
-      // In production (isDev = false): env is ignored
-      const prodKey = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env' }, false);
-      expect(prodKey).toBeNull();
+      const prodKey = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: 'from-env-convenience' }, false);
+      expect(prodKey).toBe('from-env-convenience');
+
+      // Does not persist to secret store
+      expect(store.get('bridge_api_key')).toBeNull();
+
+      // When env is absent or blank
+      const nullKey = getBridgeApiKey(store, { MUSE_BRIDGE_API_KEY: '   ' }, false);
+      expect(nullKey).toBeNull();
     });
   });
 });

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { PodError } from '@shared/errors';
 import type { SecretName, SecretStore } from '@shared/services';
@@ -18,10 +18,26 @@ export interface SecretStoreDeps {
  * Creates a DPAPI-backed secret store injecting Electron's safeStorage.
  * If encryption is unavailable, set throws SECRET_STORE_UNAVAILABLE, get returns null,
  * and no plaintext or base64 of plaintext is ever stored.
+ * Writes are performed atomically (<filePath>.tmp -> rename) to prevent file corruption.
  * Corrupt files are handled gracefully as empty.
  */
 export function createSecretStore(deps: SecretStoreDeps): SecretStore {
   const { safeStorage, filePath } = deps;
+
+  function writeAtomically(data: Record<string, string>): void {
+    mkdirSync(dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify(data, null, 2), {
+      mode: 0o600,
+      encoding: 'utf-8',
+    });
+    try {
+      chmodSync(tmpPath, 0o600);
+    } catch {
+      // Ignore on platforms without chmod support
+    }
+    renameSync(tmpPath, filePath);
+  }
 
   return {
     isAvailable(): boolean {
@@ -74,16 +90,7 @@ export function createSecretStore(deps: SecretStoreDeps): SecretStore {
       const encryptedBuf = safeStorage.encryptString(value);
       data[name] = encryptedBuf.toString('base64');
 
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, JSON.stringify(data, null, 2), {
-        mode: 0o600,
-        encoding: 'utf-8',
-      });
-      try {
-        chmodSync(filePath, 0o600);
-      } catch {
-        // Ignore on platforms without chmod
-      }
+      writeAtomically(data);
     },
 
     delete(name: SecretName): void {
@@ -101,35 +108,28 @@ export function createSecretStore(deps: SecretStoreDeps): SecretStore {
         return;
       }
       delete data[name];
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, JSON.stringify(data, null, 2), {
-        mode: 0o600,
-        encoding: 'utf-8',
-      });
-      try {
-        chmodSync(filePath, 0o600);
-      } catch {
-        // Ignore
-      }
+      writeAtomically(data);
     },
   };
 }
 
 /**
  * Retrieves the bridge API key:
- * Checks secret store first; falls back to MUSE_BRIDGE_API_KEY environment variable ONLY in dev.
+ * Checks secret store first; falls back to MUSE_BRIDGE_API_KEY environment variable
+ * (in any mode) when no secret store value exists, but never persists it.
  */
 export function getBridgeApiKey(
   store: SecretStore,
   env: NodeJS.ProcessEnv,
-  isDev: boolean
+  _isDev?: boolean
 ): string | null {
   const stored = store.get('bridge_api_key');
   if (stored) {
     return stored;
   }
-  if (isDev && env['MUSE_BRIDGE_API_KEY']) {
-    return env['MUSE_BRIDGE_API_KEY'];
+  const fromEnv = env['MUSE_BRIDGE_API_KEY']?.trim();
+  if (fromEnv && fromEnv !== '') {
+    return fromEnv;
   }
   return null;
 }

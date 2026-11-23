@@ -1,12 +1,31 @@
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PodError } from '@shared/errors';
 import { assertLoopbackUrl, assertPlatformOrigin, assertDataDir, isAdmin, loadConfig } from './index';
 
 describe('Config Infrastructure', () => {
-  const dummyPaths = {
-    userData: 'C:\\Users\\testuser\\AppData\\Roaming\\pod-video-studio',
-    documents: 'C:\\Users\\testuser\\Documents',
-  };
+  let tempDir: string;
+  let dummyPaths: { userData: string; documents: string };
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), 'pod-config-test-'));
+    dummyPaths = {
+      userData: path.join(tempDir, 'userData'),
+      documents: path.join(tempDir, 'documents'),
+    };
+    mkdirSync(dummyPaths.userData, { recursive: true });
+    mkdirSync(dummyPaths.documents, { recursive: true });
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // Ignore
+    }
+  });
 
   describe('assertLoopbackUrl', () => {
     it('accepts valid loopback URLs', () => {
@@ -56,6 +75,26 @@ describe('Config Infrastructure', () => {
           expect(podErr.code).toBe('CONFIG_INVALID');
         }
       }
+    });
+  });
+
+  describe('bridgeBaseUrl normalization', () => {
+    it('strips trailing slashes from bridgeBaseUrl', () => {
+      const config1 = loadConfig({
+        env: { MUSE_BRIDGE_BASE_URL: 'http://127.0.0.1:47821/' },
+        settings: {},
+        paths: dummyPaths,
+        isDev: false,
+      });
+      expect(config1.bridgeBaseUrl).toBe('http://127.0.0.1:47821');
+
+      const config2 = loadConfig({
+        env: {},
+        settings: { bridgeBaseUrl: 'http://localhost:3000///' },
+        paths: dummyPaths,
+        isDev: false,
+      });
+      expect(config2.bridgeBaseUrl).toBe('http://localhost:3000');
     });
   });
 
@@ -114,6 +153,71 @@ describe('Config Infrastructure', () => {
       expect(config.adminUsers).toEqual([]);
       expect(config.categories.length).toBeGreaterThan(0);
       expect(config.libraryRoot).toContain('POD_VIDEO_LIBRARY');
+    });
+
+    it('treats empty env values (e.g. from copied .env.example) as unset and falls back to defaults', () => {
+      const blankEnvContent = `
+PROVIDER_MODE=
+MUSE_PLATFORM_ORIGIN=
+MUSE_BRIDGE_BASE_URL=
+MUSE_BRIDGE_API_KEY=
+PROMPT_MASTER_PATH=
+POD_LIBRARY_ROOT=
+PROMPT_MAX_CHARS=
+POLL_INTERVAL_MS=
+POLL_MAX_INTERVAL_MS=
+MAX_SOURCE_MB=
+MAX_SOURCE_PIXELS=
+MAX_VIDEO_MB=
+LOG_RETENTION_DAYS=
+POD_ADMIN_USERS=
+CSC_LINK=
+CSC_KEY_PASSWORD=
+`;
+      const envFilePath = path.join(tempDir, 'blank.env');
+      writeFileSync(envFilePath, blankEnvContent);
+
+      const config = loadConfig({
+        env: {},
+        settings: {},
+        paths: dummyPaths,
+        isDev: false,
+        envFilePath,
+      });
+
+      expect(config.providerMode).toBe('mock');
+      expect(config.bridgeBaseUrl).toBeNull();
+      expect(config.musePlatformOrigin).toBeNull();
+      expect(config.promptMasterPath).toBeNull();
+      expect(config.promptMaxChars).toBe(4000);
+      expect(config.pollIntervalMs).toBe(3000);
+      expect(config.pollMaxIntervalMs).toBe(15000);
+      expect(config.maxSourceBytes).toBe(15 * 1024 * 1024);
+      expect(config.maxSourcePixels).toBe(50000000);
+      expect(config.maxVideoBytes).toBe(500 * 1024 * 1024);
+      expect(config.logRetentionDays).toBe(30);
+      expect(config.adminUsers).toEqual([]);
+    });
+
+    it('supports optional .env in paths.userData when not in dev mode', () => {
+      const prodEnvPath = path.join(dummyPaths.userData, '.env');
+      const prodEnvContent = `
+PROVIDER_MODE=bridge
+MUSE_BRIDGE_BASE_URL=http://127.0.0.1:47821
+LOG_RETENTION_DAYS=14
+`;
+      writeFileSync(prodEnvPath, prodEnvContent);
+
+      const config = loadConfig({
+        env: {},
+        settings: {},
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      expect(config.providerMode).toBe('bridge');
+      expect(config.bridgeBaseUrl).toBe('http://127.0.0.1:47821');
+      expect(config.logRetentionDays).toBe(14);
     });
 
     it('settings override env defaults', () => {
