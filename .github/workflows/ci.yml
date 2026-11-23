@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    name: Build, Lint, Test, Audit & SBOM
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run Vitest tests
+        run: npm test
+
+      - name: Security audit (High+ vulnerabilities)
+        run: npm audit --audit-level=high
+
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm@1.19.0 --output-file sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: cyclonedx-sbom
+          path: sbom.json
+
+      - name: Run Gitleaks Secret Scanner
+        shell: pwsh
+        run: |
+          $version = "8.21.2"
+          $expectedSha256 = "f238c85e5f47e18fac779ce71ee11091cf70a0a8fb4415f165efba2800eef133"
+          $url = "https://github.com/gitleaks/gitleaks/releases/download/v$version/gitleaks_${version}_windows_x64.zip"
+          $zipPath = "$env:TEMP\gitleaks.zip"
+          $extractDir = "$env:TEMP\gitleaks"
+          
+          Write-Host "Downloading Gitleaks v$version..."
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+
+          $fileHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+          if ($fileHash.ToLower() -ne $expectedSha256.ToLower()) {
+            throw "Gitleaks checksum mismatch! Expected $expectedSha256 but got $fileHash"
+          }
+          Write-Host "Gitleaks Archive SHA-256 verified: $fileHash"
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          & "$extractDir\gitleaks.exe" detect --source . -v --config .gitleaks.toml
+
+      - name: Build Application
+        run: npm run build

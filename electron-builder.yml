@@ -1,0 +1,19 @@
+appId: com.company.podvideostudio
+productName: POD Video Studio
+directories:
+  output: release
+files:
+  - "out/**"
+extraResources:
+  - from: "prompts"
+    to: "prompts"
+asar: true
+publish: null
+win:
+  target: nsis
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false

@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist development template and test files containing dummy credentials"
+paths = [
+  '''\.env\.example$''',
+  '''src/main/infra/logging/logging\.test\.ts$''',
+  '''src/main/infra/secrets/secrets\.test\.ts$''',
+  '''src/main/infra/config/config\.test\.ts$''',
+  '''src/main/infra/diagnostics/diagnostics\.test\.ts$''',
+]
