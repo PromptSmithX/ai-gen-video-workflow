@@ -6,6 +6,45 @@ The application allows employees to drag and drop product mockups, select SKUs a
 
 ---
 
+## Quick start (what you still need to fill in)
+
+1. `npm install`, then `npm run dev`. With the default `PROVIDER_MODE=mock` the whole workflow runs offline
+   (mock provider writes a tiny valid MP4) — no URL or key needed.
+2. To test against the real Muse bridge, edit `.env` (dev) or `%APPDATA%\POD Video Studio\.env` (installed app):
+   - `PROVIDER_MODE=bridge`
+   - `MUSE_PLATFORM_ORIGIN=` exact Muse origin your team uses (compatibility gate, see
+     `docs/integration/platform-compatibility.md`)
+   - `MUSE_BRIDGE_BASE_URL=` e.g. `http://127.0.0.1:47821` (loopback only — anything else is rejected at startup)
+   - `MUSE_BRIDGE_API_KEY=` (or enter it in **Admin → Provider**, stored with DPAPI)
+   - `PROMPT_MASTER_PATH=` absolute path to the company-approved Prompt Master V2 `.md`
+     (until then the built-in **PLACEHOLDER** template is used and is clearly labelled in the UI)
+   - `POD_ADMIN_USERS=` your Windows username(s), required to see the **Admin** screen in the installed app
+3. Before the first live run, read the bridge's live `/v1/openapi.json` and adjust
+   `src/main/providers/muse/endpoints.ts` (all assumed field names are marked `ASSUMPTION`).
+4. Installer: `npm run dist` → `release/POD Video Studio Setup <version>.exe` (unsigned until `CSC_LINK` is set).
+
+## MVP Definition of Done status (brief §12)
+
+| Item | Status |
+|---|---|
+| One company-branded Windows installer | Built (NSIS per-user); **unsigned** until `CSC_LINK`/`CSC_KEY_PASSWORD` are provided; default Electron icon (`build/` has a note for the company icon) |
+| Upload mockup, SKU, versioned Prompt Master | Done |
+| Prompt preview + artwork-preservation checks | Done (generation blocked when checks fail) |
+| Exact existing Muse generator, no substitution | Only `MockMuseProvider` and the loopback `RestBridgeMuseProvider` exist |
+| Provider compatibility + permitted method approved | **Pending company** — origin, ToS/legal approval |
+| One click → at most one generation | Done (single-flight UI + idempotency key + DB unique key) |
+| Ambiguous submit never auto-duplicates | Done (SUBMITTING→AMBIGUOUS on crash/timeout; transient poll errors keep RUNNING) |
+| MP4 validated, hashed, stored under SKU | Done |
+| Metadata survives restart | Done (SQLite + restart recovery) |
+| Safe, understandable states/errors | Done |
+| No plaintext secrets / secrets in logs | Done (DPAPI fail-closed, log redaction) |
+| Loopback-only, authenticated network | Done (app opens no listener; bridge URL must be loopback) |
+| Tests + SBOM/security scan on release commit | Tests pass locally; CI workflow with audit, SBOM, Gitleaks ready (`.github/workflows/ci.yml`) |
+| Signed installer and executable | **Pending company certificate** |
+| Pilot on one isolated Windows PC | **Pending** |
+
+---
+
 ## Architecture Overview
 
 - **Desktop Framework:** Electron 45 + Node 24 + TypeScript (strict).
@@ -22,7 +61,8 @@ The application allows employees to drag and drop product mockups, select SKUs a
 ### Which `.env` file is loaded?
 - **Development Mode (`npm run dev`):** Reads `.env` from the repository root directory (working directory).
 - **Installed Desktop Application (Production):** Reads an optional `.env` file from the user data directory:
-  `%APPDATA%\pod-video-studio\.env` (or `<userData>/.env`).
+  `%APPDATA%\POD Video Studio\.env` (Electron `userData`; the SQLite database `pod-studio.db`,
+  `secrets.json` and `logs\` live in the same folder).
   This allows testing and custom configurations on installed desktop builds.
 - **Explicit Override:** Pass `envFilePath` to `loadConfig` to load an explicit file path.
 

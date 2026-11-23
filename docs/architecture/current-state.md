@@ -1,6 +1,6 @@
 # Current state and proposed architecture
 
-_Last updated: 2026-11-23 (Phase 0, lead)._
+_Last updated: 2026-11-23 — MVP integrated (W1–W6 merged, 193 tests, NSIS installer builds). Remaining gates below._
 
 ## Repository at start
 The repository contained only `POD_VIDEO_STUDIO_AGENT_BRIEF.md` — no existing framework, build pipeline, tests,
