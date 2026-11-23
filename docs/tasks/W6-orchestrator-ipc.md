@@ -86,3 +86,22 @@ RestBridge provider against W3's `test/mock-bridge`)
 - Prompt with unknown placeholder / too long → createJob rejected, no job row.
 - IPC helper: invalid payload → `ok:false` with code, no throw; non-admin calling admin channel → FORBIDDEN.
 - Logs written during the e2e run contain no prompt text and no API key.
+
+## Integration notes from the lead (actual merged APIs — use these)
+- Config: `readEffectiveEnv({ env: process.env, isDev, userDataDir, cwd })` + `loadConfig({ env, settings, paths:{userData, documents}, isDev })`
+  from `src/main/infra/config`; `isAdmin(config, username)`. Admin settings come from `db.settings` (key `admin_settings`).
+- Secrets: `createSecretStore({ safeStorage, filePath })` and `getBridgeApiKey(store, effectiveEnv)` from `src/main/infra/secrets`
+  (pass the env returned by `readEffectiveEnv`, not raw `process.env`, so a key in `.env` works).
+- Logging: `createLogger({ dir: <userData>/logs, retentionDays })`, `cleanupLogs(dir, days)`, `redactText`.
+- Diagnostics: `buildDiagnostics(...)`, `exportDiagnosticsToFile(path, content)` from `src/main/infra/diagnostics`.
+- DB: `openDatabase(path)`. **`db.transaction(fn)` is synchronous** — never `await` inside it. In `createJob` do the async file work
+  first (`media.importSourceImage`, `media.writePromptSnapshot`), then a single sync transaction for product upsert + asset rows +
+  job insert. If the transaction fails, best-effort delete the files you just wrote.
+- Media: `createMediaLibrary({ root, tempDir, maxSourceBytes, maxSourcePixels, maxVideoBytes })`; temp cleanup via exported
+  `cleanupTemp(tempDir, olderThanMs)`. Domain helpers: `newId`, `nowIso`, `assertTransition`, `nextActionsFor` in `src/main/domain`.
+- Prompts: `createPromptService({ builtinDir, adminDir, companyMasterPath })` from `src/main/prompts`. builtinDir = `join(app.getAppPath(),'prompts')`
+  in dev, `join(process.resourcesPath,'prompts')` when packaged (electron-builder copies `prompts/` there as extraResources).
+- Provider: `createMuseProvider({ config, getApiKey, logger })`, `nextPollDelay`, `createMinimalValidMp4` from `src/main/providers/muse`.
+  Mock scenario can be chosen in dev with env `POD_MOCK_SCENARIO`. Mock bridge server for tests: `test/mock-bridge/server.ts`.
+- `src/renderer/**` is owned by W4 (still in review) — do not edit it. Your preload must satisfy `PodApi` exactly.
+- In dev, `npm run dev` must start with `PROVIDER_MODE=mock` and an empty `.env` without crashing.
