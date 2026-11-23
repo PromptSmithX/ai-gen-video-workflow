@@ -6,6 +6,8 @@ export interface QualityRuleDef {
   description: string;
   /** Patterns representing accepted phrasings. If any pattern matches, the check passes. */
   patterns: RegExp[];
+  /** When true, matches preceded by negation words (not, never, don't) are rejected. */
+  guardNegation?: boolean;
 }
 
 /**
@@ -17,6 +19,7 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
     id: 'preserve_artwork',
     label: 'Preserve exact artwork and print design',
     description: 'Requires preserving the exact uploaded design, artwork, or print without redesign.',
+    guardNegation: true,
     patterns: [
       /(?:preserve|keep|maintain|retaining|retain)\s+.*?(?:artwork|design|print|graphic)/i,
       /(?:exact|original|uploaded)\s+.*?(?:artwork|design|print|graphic)/i,
@@ -47,6 +50,7 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
     id: 'natural_texture',
     label: 'Natural material, skin, and hand textures',
     description: 'Ensures natural, non-plastic appearance for fabric, hands, skin, and materials.',
+    guardNegation: true,
     patterns: [
       /(?:natural|realistic)\s+.*?(?:texture|material|skin|hands|fabric)/i,
       /non-plastic/i,
@@ -57,6 +61,7 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
     id: 'physical_continuity',
     label: 'Physical continuity and realistic physics',
     description: 'Requires physically continuous motion, realistic gravity, folds, and object permanence.',
+    guardNegation: true,
     patterns: [
       /(?:physically|physical)\s+continuous/i,
       /(?:continuous\s+(?:motion|movement)|object\s+permanence|realistic\s+gravity)/i,
@@ -97,11 +102,44 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
 ];
 
 /**
+ * Checks whether a regex match is preceded by negation words in the preceding ~3 words.
+ */
+function isMatchNegated(text: string, matchIndex: number): boolean {
+  const sliceStart = Math.max(0, matchIndex - 50);
+  const precedingText = text.slice(sliceStart, matchIndex);
+  const words = precedingText.trim().split(/\s+/);
+  const last3Words = words.slice(-3).join(' ');
+  return /\b(not|never|don't|dont|no)\b/i.test(last3Words);
+}
+
+/**
+ * Tests if a pattern matches within text, rejecting negated matches when guardNegation is active.
+ */
+function matchPattern(pattern: RegExp, text: string, guardNegation?: boolean): boolean {
+  if (!guardNegation) {
+    return pattern.test(text);
+  }
+
+  // Iterate over matches to find at least one non-negated match
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const globalRegex = new RegExp(pattern.source, flags);
+  let match: RegExpExecArray | null;
+
+  while ((match = globalRegex.exec(text)) !== null) {
+    if (!isMatchNegated(text, match.index)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Runs all quality checks against the given prompt text.
  */
 export function checkQuality(text: string): QualityReport {
   const checks: QualityCheck[] = QUALITY_RULES.map((rule) => {
-    const passed = rule.patterns.some((pattern) => pattern.test(text));
+    const passed = rule.patterns.some((pattern) => matchPattern(pattern, text, rule.guardNegation));
     return {
       rule: rule.id,
       label: rule.label,
@@ -116,7 +154,8 @@ export function checkQuality(text: string): QualityReport {
 }
 
 /**
- * Validates an employee-edited prompt override against quality rules and character limits.
+ * Validates an employee-edited prompt override against quality rules, character limits,
+ * and unresolved template placeholders.
  */
 export function validatePrompt(
   text: string,
@@ -127,6 +166,11 @@ export function validatePrompt(
 
   if (!text || text.trim().length === 0) {
     errors.push('Prompt text cannot be empty');
+  }
+
+  // Check for unresolved template placeholders (e.g. {{sku}}, {{product_name}}, or leftover braces)
+  if (text.includes('{{') || text.includes('}}')) {
+    errors.push('Prompt contains unresolved template placeholders');
   }
 
   if (text.length > maxChars) {

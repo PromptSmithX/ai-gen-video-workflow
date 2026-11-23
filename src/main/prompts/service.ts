@@ -104,10 +104,17 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           defaultPlaceholder: false,
         });
 
-        const version = parsed.metadata.version || `company-${hash}`;
+        const targetId = parsed.metadata.id || 'product-review';
+        let targetVersion = parsed.metadata.version || `company-${hash}`;
+
+        // Ensure (id, version) is unique across sources; suffix with -company on collision
+        if (templates.some((t) => t.id === targetId && t.version === targetVersion)) {
+          targetVersion = `${targetVersion}-company`;
+        }
+
         templates.push({
-          id: parsed.metadata.id || 'product-review',
-          version,
+          id: targetId,
+          version: targetVersion,
           title: parsed.metadata.title || 'Company Product Review',
           isPlaceholder: false,
           source: 'company',
@@ -118,10 +125,12 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
         });
         companyLoaded = true;
       } else {
-        companyFileWarning = `Company master file not found: ${companyMasterPath}`;
+        // Safe fixed string (no path, no sensitive info)
+        companyFileWarning = 'Company Prompt Master file not found';
       }
-    } catch (err) {
-      companyFileWarning = `Company master file unreadable: ${err instanceof Error ? err.message : String(err)}`;
+    } catch {
+      // Safe fixed string (no raw error message, no sensitive info)
+      companyFileWarning = 'Company Prompt Master file could not be read';
     }
   }
 
@@ -150,9 +159,14 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
               defaultPlaceholder: false,
             });
 
+            let adminVersion = parsed.metadata.version;
+            if (templates.some((t) => t.id === parsed.metadata.id && t.version === adminVersion)) {
+              adminVersion = `${adminVersion}-admin`;
+            }
+
             templates.push({
               id: parsed.metadata.id,
-              version: parsed.metadata.version,
+              version: adminVersion,
               title: parsed.metadata.title,
               isPlaceholder: false,
               source: 'admin',
@@ -184,6 +198,7 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
         t.isDefault = t.version === persistedDefaultVer;
       }
     } else if (companyLoaded && matching.some((t) => t.source === 'company')) {
+      // Company template wins as default
       for (const t of matching) {
         t.isDefault = t.source === 'company';
       }
@@ -199,12 +214,22 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
     }
   }
 
-  // Helper to load category snippet
+  // Helper to load category snippet with path traversal defense
   function loadCategorySnippet(group: string): string | undefined {
-    const candidates = [
-      path.join(builtinDir, 'categories', group.endsWith('.md') ? group : `${group}.md`),
-      path.join(builtinDir, 'categories', 'other.md'),
-    ];
+    const safeGroupPattern = /^[a-z0-9-]{1,64}$/;
+    const normalizedGroup = group.toLowerCase().replace(/\.md$/, '');
+    const isValid = safeGroupPattern.test(normalizedGroup);
+
+    const candidates: string[] = [];
+    if (isValid) {
+      candidates.push(
+        path.join(builtinDir, 'categories', `${normalizedGroup}.md`),
+        path.join(builtinDir, 'categories', 'other.md'),
+      );
+    } else {
+      // Invalid group name (e.g. traversal attempt like '../../secret') -> immediately fall back to other.md
+      candidates.push(path.join(builtinDir, 'categories', 'other.md'));
+    }
 
     for (const cand of candidates) {
       if (fs.existsSync(cand)) {
@@ -307,7 +332,12 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           }
         }
       }
-      const nextVersion = `v${maxN + 1}`;
+      let nextVersion = `v${maxN + 1}`;
+      while (matching.some((t) => t.version === nextVersion)) {
+        maxN++;
+        nextVersion = `v${maxN + 1}`;
+      }
+
       const title = args.title ?? (matching[0]?.title ?? args.id);
       const createdAt = new Date().toISOString().split('T')[0] ?? null;
 

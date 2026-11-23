@@ -25,7 +25,7 @@ describe('Prompt Master Manager (W2)', () => {
     fs.mkdirSync(path.join(builtinDir, 'categories'), { recursive: true });
     fs.mkdirSync(adminDir, { recursive: true });
 
-    // Copy repo templates or set up test fixture
+    // Copy repo templates
     const repoPromptsDir = path.resolve(__dirname, '../../../prompts');
     if (fs.existsSync(repoPromptsDir)) {
       fs.cpSync(repoPromptsDir, builtinDir, { recursive: true });
@@ -159,7 +159,7 @@ Company master prompt body for {{sku}}`,
       expect(defaultTmpl.version).toBe('v2.1-company');
     });
 
-    it('missing company file → no crash, placeholder remains default', () => {
+    it('missing company file → no crash, placeholder remains default with safe warning message', () => {
       const nonExistentPath = path.join(tempBaseDir, 'does-not-exist.md');
       const service = createPromptService({
         builtinDir,
@@ -168,12 +168,60 @@ Company master prompt body for {{sku}}`,
       });
 
       expect(service.hasCompanyWarning).toBe(true);
-      expect(service.companyFileWarning).toContain('Company master file not found');
+      // Safe warning must not leak absolute path or internal errors
+      expect(service.companyFileWarning).toBe('Company Prompt Master file not found');
+      expect(service.companyFileWarning).not.toContain(nonExistentPath);
 
       const defaultTmpl = service.getTemplate('product-review');
       expect(defaultTmpl.isPlaceholder).toBe(true);
       expect(defaultTmpl.version).toBe('v2');
       expect(defaultTmpl.isDefault).toBe(true);
+    });
+
+    it('company master version collision: suffixes version to v2-company and company wins as default', () => {
+      const companyPath = path.join(tempBaseDir, 'company-v2-colliding.md');
+      fs.writeFileSync(
+        companyPath,
+        `---
+id: product-review
+version: v2
+title: Company Master with Colliding Version
+---
+Company prompt body text for {{sku}}`,
+        'utf8',
+      );
+
+      const service = createPromptService({
+        builtinDir,
+        adminDir,
+        companyMasterPath: companyPath,
+      });
+
+      const all = service.listTemplates();
+      const versions = all.map((t) => t.version);
+
+      // Must have both builtin v2 and suffixed v2-company
+      expect(versions).toContain('v2');
+      expect(versions).toContain('v2-company');
+
+      // (id, version) is unique
+      const v2Templates = all.filter((t) => t.id === 'product-review' && t.version === 'v2');
+      expect(v2Templates).toHaveLength(1);
+      expect(v2Templates[0]?.source).toBe('builtin');
+
+      const companyTemplate = all.find((t) => t.version === 'v2-company');
+      expect(companyTemplate).toBeDefined();
+      expect(companyTemplate?.source).toBe('company');
+
+      // Company wins as default
+      expect(companyTemplate?.isDefault).toBe(true);
+      const defaultTmpl = service.getTemplate('product-review');
+      expect(defaultTmpl.version).toBe('v2-company');
+      expect(defaultTmpl.source).toBe('company');
+
+      // Explicitly fetching v2 returns the builtin template
+      const builtinV2 = service.getTemplate('product-review', 'v2');
+      expect(builtinV2.source).toBe('builtin');
     });
   });
 
@@ -383,7 +431,7 @@ SKU: {{sku and no close`,
           product_name: 'Very long product name '.repeat(50),
         },
         categoryGroup: 'apparel',
-        maxChars: 150, // very small limit to trigger over-length
+        maxChars: 150,
         supportsDuration: false,
         supportsAspectRatio: false,
       });
@@ -391,9 +439,29 @@ SKU: {{sku and no close`,
       expect(result.chars).toBeGreaterThan(150);
       expect(result.errors.some((e) => e.includes('PROMPT_TOO_LONG') && e.includes(String(result.chars)))).toBe(true);
     });
+
+    it('loadCategorySnippet validates categoryGroup and falls back to other.md on path traversal like ../../secret', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+
+      const result = service.render({
+        templateId: 'product-review',
+        variables: {
+          sku: 'TS-SAFE-01',
+          product_category: 'apparel',
+        },
+        categoryGroup: '../../secret',
+        maxChars: 4000,
+        supportsDuration: false,
+        supportsAspectRatio: false,
+      });
+
+      expect(result.errors).toEqual([]);
+      // Should safely fall back to other.md
+      expect(result.text).toContain('Category handling notes (General)');
+    });
   });
 
-  describe('4. Quality checker', () => {
+  describe('4. Quality checker and employee validation', () => {
     it('all 8 quality rules are defined in the canonical rules table', () => {
       expect(QUALITY_RULES).toHaveLength(8);
       const ruleIds = QUALITY_RULES.map((r) => r.id);
@@ -407,13 +475,20 @@ SKU: {{sku and no close`,
       expect(ruleIds).toContain('no_fake_claims');
     });
 
-    it('shipped placeholder v2 passes all checks', () => {
+    it('shipped placeholder v2 and v1 pass all checks', () => {
       const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
-      const tmpl = service.getTemplate('product-review', 'v2');
-      const report = checkQuality(tmpl.body);
 
-      expect(report.passed).toBe(true);
-      for (const check of report.checks) {
+      const v2 = service.getTemplate('product-review', 'v2');
+      const reportV2 = checkQuality(v2.body);
+      expect(reportV2.passed).toBe(true);
+      for (const check of reportV2.checks) {
+        expect(check.passed).toBe(true);
+      }
+
+      const v1 = service.getTemplate('product-review', 'v1');
+      const reportV1 = checkQuality(v1.body);
+      expect(reportV1.passed).toBe(true);
+      for (const check of reportV1.checks) {
         expect(check.passed).toBe(true);
       }
     });
@@ -438,7 +513,7 @@ A reviewer presents and examines the product.
 1. Preserve artwork: Keep the exact uploaded design and artwork.
 2. No design changes: Do not alter or modify the design.
 3. Consistent product: Maintain consistent product identity throughout.
-4. Natural texture: Ensure natural textures for materials and non-plastic skin.
+4. Natural texture: Ensure natural, non-plastic textures for materials and skin.
 5. Physical continuity: Require physically continuous motion and gravity.
 6. No impossible transitions: Avoid impossible transitions and teleporting.
 7. Human review action: Believable human product review action demonstrating features.
@@ -457,13 +532,59 @@ A reviewer presents and examines the product.
       expect(fakeClaimsCheckWith?.passed).toBe(true);
     });
 
-    it('validatePrompt reports quality checks and character limits for employee overrides', () => {
+    it('negation guard rejects negated text for preserve_artwork, natural_texture, and physical_continuity', () => {
+      // 1. Negated preserve_artwork
+      const negatedArtwork = `
+Reviewer presents and examines the product.
+Do not preserve the artwork.
+Consistent product construction.
+Natural, non-plastic textures.
+Physical continuity and gravity.
+No impossible transitions.
+No fake claims.
+`;
+      const report1 = checkQuality(negatedArtwork);
+      const artworkCheck = report1.checks.find((c) => c.rule === 'preserve_artwork');
+      expect(artworkCheck?.passed).toBe(false);
+
+      // 2. Negated natural_texture
+      const negatedTexture = `
+Reviewer presents and examines the product.
+Preserve exact artwork and printed graphic.
+Do not alter the design.
+Consistent product construction.
+Never use natural textures for materials.
+Physical continuity and gravity.
+No impossible transitions.
+No fake claims.
+`;
+      const report2 = checkQuality(negatedTexture);
+      const textureCheck = report2.checks.find((c) => c.rule === 'natural_texture');
+      expect(textureCheck?.passed).toBe(false);
+
+      // 3. Negated physical_continuity
+      const negatedPhysics = `
+Reviewer presents and examines the product.
+Preserve exact artwork and printed graphic.
+Do not alter the design.
+Consistent product construction.
+Natural, non-plastic textures.
+Don't maintain physical continuity or gravity.
+No impossible transitions.
+No fake claims.
+`;
+      const report3 = checkQuality(negatedPhysics);
+      const physicsCheck = report3.checks.find((c) => c.rule === 'physical_continuity');
+      expect(physicsCheck?.passed).toBe(false);
+    });
+
+    it('validatePrompt detects unresolved template placeholders and validates length and quality', () => {
       const validText = `
 Human product review action where the reviewer presents and examines the product.
 Preserve exact artwork and printed graphic.
 Do not alter or change the artwork.
 Consistent product construction throughout.
-Natural textures and non-plastic hands.
+Ensure natural, non-plastic textures for hands and materials; avoid plastic look.
 Physically continuous movement with gravity.
 No impossible transitions or teleporting.
 No fake claims or ratings.
@@ -471,6 +592,15 @@ No fake claims or ratings.
       const res = validatePrompt(validText, 4000);
       expect(res.quality.passed).toBe(true);
       expect(res.errors).toEqual([]);
+
+      // Override containing unresolved {{sku}} or leftover braces
+      const withUnresolved = `${validText}\nSKU identifier: {{sku}}`;
+      const resUnresolved = validatePrompt(withUnresolved, 4000);
+      expect(resUnresolved.errors).toContain('Prompt contains unresolved template placeholders');
+
+      const withLeftoverBrace = `${validText}\nSome text with unresolved }}`;
+      const resLeftover = validatePrompt(withLeftoverBrace, 4000);
+      expect(resLeftover.errors).toContain('Prompt contains unresolved template placeholders');
 
       // Over length
       const overLengthRes = validatePrompt(validText, 50);

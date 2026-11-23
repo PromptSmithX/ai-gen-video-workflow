@@ -24,7 +24,7 @@ Rules:
 1. Preserve artwork: Keep the exact uploaded design, artwork, and printed text with complete fidelity.
 2. No design changes: Do not alter, modify, recolor, reposition, distort, mirror, or replace the artwork or design in any way.
 3. Consistent product: Maintain consistent product identity, garment construction, and appearance throughout the video.
-4. Natural texture: Ensure natural textures for materials, fabric, hands, and skin; avoid any artificial or non-plastic look.
+4. Natural texture: Ensure natural, non-plastic textures for fabric, materials, hands, and skin; avoid any artificial or plastic look.
 5. Physical continuity: Maintain physically continuous motion, realistic gravity, folds, and object permanence.
 6. No impossible transitions: Avoid impossible transitions, teleporting objects, sudden morphing, or hands passing through the product.
 7. Human review action: Feature an authentic human product review action with real interaction, not just a static pan or slow zoom.
