@@ -1,0 +1,1015 @@
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
+import type { AppConfig } from '@shared/config';
+import type { Job, ReviewStatus } from '@shared/domain';
+import { normalizeSku } from '@shared/domain';
+import { PodError, SAFE_ERROR_MESSAGES } from '@shared/errors';
+import type { CreateJobInput, JobView } from '@shared/ipc';
+import { JOB_STATE_LABELS } from '@shared/job-state';
+import type { MuseProvider, ProviderCapabilities } from '@shared/provider';
+import { ProviderError } from '@shared/provider';
+import type { JobFilter, Logger, MediaLibrary, PodDatabase, PromptService, StoredFile } from '@shared/services';
+import { newId, nowIso } from '../domain/ids';
+import { isTerminal, nextActionsFor } from '../domain/job-machine';
+import { nextPollDelay } from '../providers/muse/poll';
+import type { ImageStagingService } from './image-staging';
+
+export interface OrchestratorDeps {
+  db: PodDatabase;
+  media: MediaLibrary;
+  prompts: PromptService;
+  provider: MuseProvider;
+  config: AppConfig;
+  logger: Logger;
+  imageStaging: ImageStagingService;
+  /** Max concurrent active generations. Defaults to 1. */
+  maxConcurrent?: number;
+}
+
+const DEFAULT_CAPABILITIES: ProviderCapabilities = {
+  canCancel: false,
+  reportsProgress: false,
+  supportedDurations: [],
+  supportedAspectRatios: [],
+  maxPromptChars: 4000,
+  maxUploadBytes: 20 * 1024 * 1024,
+};
+
+export class JobOrchestrator extends EventEmitter {
+  private readonly db: PodDatabase;
+  private readonly media: MediaLibrary;
+  private readonly prompts: PromptService;
+  private provider: MuseProvider;
+  private config: AppConfig;
+  private readonly logger: Logger;
+  private readonly imageStaging: ImageStagingService;
+  private readonly maxConcurrent: number;
+
+  private isProcessing = false;
+  private hasPendingWork = false;
+  private stopped = false;
+  private pollAttempt = 0;
+  private readonly jobProgress = new Map<string, number>();
+  private sleepAbortController: AbortController | null = null;
+
+  constructor(deps: OrchestratorDeps) {
+    super();
+    this.db = deps.db;
+    this.media = deps.media;
+    this.prompts = deps.prompts;
+    this.provider = deps.provider;
+    this.config = deps.config;
+    this.logger = deps.logger;
+    this.imageStaging = deps.imageStaging;
+    this.maxConcurrent = deps.maxConcurrent ?? 1;
+  }
+
+  setProvider(provider: MuseProvider): void {
+    this.provider = provider;
+  }
+
+  setConfig(config: AppConfig): void {
+    this.config = config;
+  }
+
+  async getCapabilities(): Promise<ProviderCapabilities> {
+    try {
+      return await this.provider.getCapabilities();
+    } catch {
+      return DEFAULT_CAPABILITIES;
+    }
+  }
+
+  /**
+   * Startup recovery:
+   * - QUEUED -> stays queued
+   * - SUBMITTING -> AMBIGUOUS (we cannot know if it was sent)
+   * - RUNNING -> resume polling
+   * - DOWNLOADING -> retry download
+   * Never resubmit.
+   */
+  async recover(): Promise<void> {
+    const activeJobs = this.db.jobs.listActive();
+    for (const job of activeJobs) {
+      if (job.state === 'SUBMITTING') {
+        this.db.jobs.transition(job.id, 'AMBIGUOUS', {
+          errorCode: 'SUBMIT_AMBIGUOUS',
+          safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+        });
+        this.logger.warn('job_recovered_ambiguous', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+        });
+        await this.emitJobUpdated(job.id);
+      } else if (job.state === 'DOWNLOADING') {
+        this.logger.info('job_recovered_downloading', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+        });
+      } else if (job.state === 'RUNNING') {
+        this.logger.info('job_recovered_running', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+        });
+      }
+    }
+
+    this.scheduleProcessQueue();
+  }
+
+  /**
+   * Creates a new video generation job or returns existing if clientRequestId was already used.
+   */
+  async createJob(input: CreateJobInput, employeeId: string): Promise<JobView> {
+    const normalizedSku = normalizeSku(input.sku);
+    if (!normalizedSku) {
+      throw new PodError('INVALID_SKU');
+    }
+
+    const staged = this.imageStaging.get(input.sourceToken);
+    if (!staged) {
+      throw new PodError('INVALID_IMAGE', 'Staged image token expired or invalid');
+    }
+
+    const category = this.config.categories.find((c) => c.id === input.categoryId);
+    if (!category) {
+      throw new PodError('CONFIG_INVALID', 'Category not found in configuration');
+    }
+
+    // Ensure template exists
+    this.prompts.getTemplate(input.templateId, input.templateVersion);
+
+    // Validate prompt override or render prompt template
+    let promptText: string;
+    if (input.promptOverride && input.promptOverride.trim().length > 0) {
+      const validated = this.prompts.validatePrompt(input.promptOverride, this.config.promptMaxChars);
+      if (validated.errors.length > 0 || !validated.quality.passed) {
+        const code = validated.errors.includes('PROMPT_TOO_LONG') ? 'PROMPT_TOO_LONG' : 'INVALID_PROMPT';
+        throw new PodError(code, validated.errors[0] || 'Prompt quality check failed');
+      }
+      promptText = input.promptOverride;
+    } else {
+      const caps = await this.getCapabilities();
+      const rendered = this.prompts.render({
+        templateId: input.templateId,
+        templateVersion: input.templateVersion,
+        variables: {
+          sku: normalizedSku,
+          product_category: category.label,
+          product_name: input.productName,
+          source_image_filename: staged.fileName,
+          duration_seconds: input.durationSeconds,
+          aspect_ratio: input.aspectRatio,
+          review_style: input.reviewStyle,
+        },
+        categoryGroup: category.promptGroup,
+        maxChars: this.config.promptMaxChars,
+        supportsDuration: caps.supportedDurations.length > 0,
+        supportsAspectRatio: caps.supportedAspectRatios.length > 0,
+      });
+
+      if (rendered.errors.length > 0 || !rendered.quality.passed) {
+        const code = rendered.errors.includes('PROMPT_TOO_LONG') ? 'PROMPT_TOO_LONG' : 'INVALID_PROMPT';
+        throw new PodError(code, rendered.errors[0] || 'Prompt rendering or quality check failed');
+      }
+      promptText = rendered.text;
+    }
+
+    // Idempotency: return existing job if clientRequestId is already recorded
+    const existing = this.db.jobs.findByIdempotencyKey(input.clientRequestId);
+    if (existing) {
+      return this.toJobView(existing);
+    }
+
+    // Perform async file operations before the single synchronous DB transaction
+    const sourceAssetFile = await this.media.importSourceImage(staged.absPath, normalizedSku);
+    const promptSnapshotFile = await this.media.writePromptSnapshot(
+      normalizedSku,
+      input.templateVersion || 'v1',
+      promptText
+    );
+
+    const jobId = newId();
+    let job: Job;
+    try {
+      job = this.db.transaction(() => {
+        const product = this.db.products.upsertBySku({
+          sku: normalizedSku,
+          category: input.categoryId,
+          productName: input.productName ?? null,
+        });
+
+        const sourceAsset = this.db.assets.insert({
+          productId: product.id,
+          jobId: null,
+          role: 'source_image',
+          path: sourceAssetFile.relPath,
+          mime: sourceAssetFile.mime,
+          bytes: sourceAssetFile.bytes,
+          width: sourceAssetFile.width,
+          height: sourceAssetFile.height,
+          durationMs: null,
+          sha256: sourceAssetFile.sha256,
+        });
+
+        const newJob = this.db.jobs.insert({
+          id: jobId,
+          productId: product.id,
+          skuSnapshot: normalizedSku,
+          employeeId,
+          provider: 'muse',
+          sourceAssetId: sourceAsset.id,
+          promptTemplateId: input.templateId,
+          promptTemplateVersion: input.templateVersion,
+          promptSha256: promptSnapshotFile.sha256,
+          promptOverridden: Boolean(input.promptOverride && input.promptOverride.trim().length > 0),
+          durationSeconds: input.durationSeconds ?? null,
+          aspectRatio: input.aspectRatio ?? null,
+          idempotencyKey: input.clientRequestId,
+          regeneratedFromJobId: null,
+        });
+
+        this.db.assets.insert({
+          productId: product.id,
+          jobId: newJob.id,
+          role: 'prompt_snapshot',
+          path: promptSnapshotFile.relPath,
+          mime: promptSnapshotFile.mime,
+          bytes: promptSnapshotFile.bytes,
+          width: null,
+          height: null,
+          durationMs: null,
+          sha256: promptSnapshotFile.sha256,
+        });
+
+        return newJob;
+      });
+    } catch (err) {
+      // Best-effort cleanup of files if the transaction fails
+      try {
+        if (fs.existsSync(sourceAssetFile.absPath)) fs.unlinkSync(sourceAssetFile.absPath);
+      } catch {
+        // ignore
+      }
+      try {
+        if (fs.existsSync(promptSnapshotFile.absPath)) fs.unlinkSync(promptSnapshotFile.absPath);
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+
+    this.logger.info('job_created', {
+      jobId: job.id,
+      sku: job.skuSnapshot,
+      employeeId,
+    });
+
+    this.scheduleProcessQueue();
+    const view = await this.toJobView(job);
+    this.emit('job:updated', view);
+    return view;
+  }
+
+  async listJobs(filter?: JobFilter): Promise<JobView[]> {
+    const jobs = this.db.jobs.list(filter);
+    const caps = await this.getCapabilities();
+    return Promise.all(jobs.map((j) => this.toJobView(j, caps)));
+  }
+
+  async getJob(jobId: string): Promise<JobView> {
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+    return this.toJobView(job);
+  }
+
+  async retry(jobId: string, acknowledged: boolean): Promise<JobView> {
+    if (!acknowledged) {
+      throw new PodError('INVALID_STATE', 'Retry requires acknowledgement');
+    }
+
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+
+    const canRetry =
+      job.state === 'FAILED_RETRYABLE' ||
+      (job.state === 'FAILED_PROVIDER' && job.attempt < 2);
+
+    if (!canRetry) {
+      throw new PodError('INVALID_STATE', `Job in state ${job.state} (attempt ${job.attempt}) cannot be retried`);
+    }
+
+    const updated = this.db.jobs.transition(job.id, 'QUEUED', {
+      attempt: job.attempt + 1,
+      errorCode: null,
+      safeErrorMessage: null,
+    });
+
+    this.logger.info('job_retried', {
+      jobId: updated.id,
+      sku: updated.skuSnapshot,
+      attempt: updated.attempt,
+    });
+
+    this.scheduleProcessQueue();
+    await this.emitJobUpdated(updated.id);
+    return this.toJobView(updated);
+  }
+
+  async regenerate(jobId: string, confirmed: boolean, clientRequestId: string): Promise<JobView> {
+    if (!confirmed) {
+      throw new PodError('INVALID_STATE', 'Regeneration requires confirmation');
+    }
+
+    const original = this.db.jobs.getById(jobId);
+    if (!original) {
+      throw new PodError('NOT_FOUND', 'Original job not found');
+    }
+
+    if (!isTerminal(original.state)) {
+      throw new PodError('INVALID_STATE', 'Cannot regenerate a non-terminal job');
+    }
+
+    const newJobId = newId();
+    const newJob = this.db.transaction(() => {
+      return this.db.jobs.insert({
+        id: newJobId,
+        productId: original.productId,
+        skuSnapshot: original.skuSnapshot,
+        employeeId: original.employeeId,
+        provider: 'muse',
+        sourceAssetId: original.sourceAssetId,
+        promptTemplateId: original.promptTemplateId,
+        promptTemplateVersion: original.promptTemplateVersion,
+        promptSha256: original.promptSha256,
+        promptOverridden: original.promptOverridden,
+        durationSeconds: original.durationSeconds,
+        aspectRatio: original.aspectRatio,
+        idempotencyKey: clientRequestId,
+        regeneratedFromJobId: original.id,
+      });
+    });
+
+    this.logger.info('job_regenerated', {
+      jobId: newJob.id,
+      originalJobId: original.id,
+      sku: newJob.skuSnapshot,
+    });
+
+    this.scheduleProcessQueue();
+    await this.emitJobUpdated(newJob.id);
+    return this.toJobView(newJob);
+  }
+
+  async resolveAmbiguous(jobId: string, resolution: 'check_again' | 'mark_failed'): Promise<JobView> {
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+
+    if (job.state !== 'AMBIGUOUS') {
+      throw new PodError('INVALID_STATE', `Job is in state ${job.state}, expected AMBIGUOUS`);
+    }
+
+    if (resolution === 'check_again') {
+      if (this.provider.findJobByRequestId) {
+        try {
+          const found = await this.provider.findJobByRequestId(job.idempotencyKey);
+          if (found && (found.state === 'running' || found.state === 'queued')) {
+            const updated = this.db.jobs.transition(job.id, 'RUNNING', {
+              providerJobId: found.providerJobId,
+              providerReferenceId: found.providerReferenceId ?? null,
+              acceptedAt: nowIso(),
+              errorCode: null,
+              safeErrorMessage: null,
+            });
+            this.logger.info('job_ambiguous_reconciled', {
+              jobId: updated.id,
+              providerJobId: found.providerJobId,
+            });
+            this.scheduleProcessQueue();
+            await this.emitJobUpdated(updated.id);
+            return this.toJobView(updated);
+          } else if (found && found.state === 'succeeded') {
+            const updated = this.db.jobs.transition(job.id, 'RUNNING', {
+              providerJobId: found.providerJobId,
+              providerReferenceId: found.providerReferenceId ?? null,
+              acceptedAt: nowIso(),
+              errorCode: null,
+              safeErrorMessage: null,
+            });
+            this.scheduleProcessQueue();
+            await this.emitJobUpdated(updated.id);
+            return this.toJobView(updated);
+          }
+        } catch {
+          // Stay in AMBIGUOUS if provider query fails
+        }
+      }
+      // Unknown or findJobByRequestId returned null -> stays in AMBIGUOUS
+      return this.toJobView(job);
+    } else {
+      // resolution === 'mark_failed'
+      const updated = this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+        errorCode: 'PROVIDER_ERROR',
+        safeErrorMessage: 'Marked failed by user.',
+      });
+      this.logger.info('job_ambiguous_marked_failed', {
+        jobId: updated.id,
+        sku: updated.skuSnapshot,
+      });
+      await this.emitJobUpdated(updated.id);
+      return this.toJobView(updated);
+    }
+  }
+
+  async retryDownload(jobId: string): Promise<JobView> {
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+
+    if (job.state !== 'DOWNLOAD_FAILED') {
+      throw new PodError('INVALID_STATE', `Job is in state ${job.state}, expected DOWNLOAD_FAILED`);
+    }
+
+    const updated = this.db.jobs.transition(job.id, 'DOWNLOADING', {
+      errorCode: null,
+      safeErrorMessage: null,
+    });
+
+    this.logger.info('job_retry_download', {
+      jobId: updated.id,
+      sku: updated.skuSnapshot,
+    });
+
+    this.scheduleProcessQueue();
+    await this.emitJobUpdated(updated.id);
+    return this.toJobView(updated);
+  }
+
+  async cancel(jobId: string): Promise<JobView> {
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+
+    if (job.state !== 'QUEUED' && job.state !== 'RUNNING') {
+      throw new PodError('INVALID_STATE', `Cannot cancel job in state ${job.state}`);
+    }
+
+    const caps = await this.getCapabilities();
+    if (!caps.canCancel) {
+      throw new PodError('INVALID_STATE', 'Cancellation is not supported by the provider');
+    }
+
+    if (job.state === 'RUNNING' && job.providerJobId && this.provider.cancelJob) {
+      try {
+        await this.provider.cancelJob(job.providerJobId);
+      } catch (err) {
+        this.logger.warn('job_cancel_provider_failed', {
+          jobId: job.id,
+          error: String(err),
+        });
+      }
+    }
+
+    const updated = this.db.jobs.transition(job.id, 'CANCELLED');
+    this.abortSleep();
+    this.logger.info('job_cancelled', {
+      jobId: updated.id,
+      sku: updated.skuSnapshot,
+    });
+    await this.emitJobUpdated(updated.id);
+    return this.toJobView(updated);
+  }
+
+  setReview(jobId: string, status: ReviewStatus): JobView {
+    const job = this.db.jobs.getById(jobId);
+    if (!job) {
+      throw new PodError('NOT_FOUND', 'Job not found');
+    }
+
+    const updated = this.db.jobs.update(job.id, { reviewStatus: status });
+    void this.emitJobUpdated(updated.id);
+    return this.toJobViewSync(updated);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.abortSleep();
+  }
+
+  private abortSleep(): void {
+    if (this.sleepAbortController) {
+      this.sleepAbortController.abort();
+      this.sleepAbortController = null;
+    }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    this.sleepAbortController = new AbortController();
+    const { signal } = this.sleepAbortController;
+
+    return new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve();
+      }, ms);
+
+      signal.addEventListener('abort', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    }).finally(() => {
+      this.sleepAbortController = null;
+    });
+  }
+
+  private scheduleProcessQueue(): void {
+    this.hasPendingWork = true;
+    if (this.isProcessing || this.stopped) return;
+    void this.processQueue();
+  }
+
+  /**
+   * Authoritative single-flight worker loop: at most `maxConcurrent` (1) provider generation.
+   */
+  private async processQueue(): Promise<void> {
+    if (this.isProcessing || this.stopped) return;
+    this.isProcessing = true;
+
+    try {
+      while (!this.stopped) {
+        this.hasPendingWork = false;
+        const activeJobs = this.db.jobs.listActive();
+
+        // 1. Process any job currently in DOWNLOADING state
+        const downloadingJob = activeJobs.find((j) => j.state === 'DOWNLOADING');
+        if (downloadingJob) {
+          try {
+            await this.handleDownloading(downloadingJob);
+          } catch (err) {
+            this.logger.error('download_handler_error', { error: String(err) });
+          }
+          continue;
+        }
+
+        // 2. Poll any job currently in RUNNING state
+        const runningJob = activeJobs.find((j) => j.state === 'RUNNING');
+        if (runningJob) {
+          try {
+            await this.handleRunning(runningJob);
+          } catch (err) {
+            this.logger.error('running_handler_error', { error: String(err) });
+          }
+          continue;
+        }
+
+        // 3. Handle leftover SUBMITTING job (reconcile to AMBIGUOUS)
+        const submittingJob = activeJobs.find((j) => j.state === 'SUBMITTING');
+        if (submittingJob) {
+          try {
+            this.db.jobs.transition(submittingJob.id, 'AMBIGUOUS', {
+              errorCode: 'SUBMIT_AMBIGUOUS',
+              safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+            });
+            await this.emitJobUpdated(submittingJob.id);
+          } catch (err) {
+            this.logger.error('submitting_reconcile_error', { error: String(err) });
+          }
+          continue;
+        }
+
+        // 4. Submit oldest QUEUED job (single flight: at most 1 generation)
+        const queuedJob = activeJobs.find((j) => j.state === 'QUEUED');
+        if (queuedJob) {
+          try {
+            await this.handleSubmit(queuedJob);
+          } catch (err) {
+            this.logger.error('submit_handler_error', { error: String(err) });
+          }
+          continue;
+        }
+
+        // If more work was scheduled while finishing up, check again
+        if (this.hasPendingWork) {
+          continue;
+        }
+
+        // No more active jobs to process
+        break;
+      }
+    } catch (err) {
+      this.logger.error('worker_loop_error', { error: String(err) });
+    } finally {
+      this.isProcessing = false;
+      if (this.hasPendingWork && !this.stopped) {
+        this.scheduleProcessQueue();
+      }
+    }
+  }
+
+  private async handleSubmit(job: Job): Promise<void> {
+    // 1. Persist SUBMITTING + submitIntentAt before calling provider.generateVideo
+    const now = nowIso();
+    const updated = this.db.jobs.transition(job.id, 'SUBMITTING', {
+      submitIntentAt: now,
+      attempt: job.attempt === 0 ? 1 : job.attempt,
+    });
+    this.logger.info('job_submitting', {
+      jobId: updated.id,
+      sku: updated.skuSnapshot,
+    });
+    await this.emitJobUpdated(updated.id);
+
+    // Retrieve source asset file
+    const sourceAsset = this.db.assets.getById(updated.sourceAssetId);
+    if (!sourceAsset) {
+      this.db.jobs.transition(updated.id, 'FAILED_RETRYABLE', {
+        errorCode: 'NOT_FOUND',
+        safeErrorMessage: 'Source image asset missing',
+      });
+      await this.emitJobUpdated(updated.id);
+      return;
+    }
+
+    const sourceAbsPath = this.media.resolve(sourceAsset.path);
+
+    // Retrieve prompt snapshot text
+    const assets = this.db.assets.listByJob(updated.id);
+    const promptAsset = assets.find((a) => a.role === 'prompt_snapshot');
+    let promptText = '';
+    if (promptAsset) {
+      const promptAbsPath = this.media.resolve(promptAsset.path);
+      try {
+        promptText = fs.readFileSync(promptAbsPath, 'utf-8');
+      } catch {
+        promptText = '';
+      }
+    }
+
+    try {
+      const res = await this.provider.generateVideo({
+        sku: updated.skuSnapshot,
+        sourceImagePath: sourceAbsPath,
+        sourceFileName: path.basename(sourceAsset.path),
+        prompt: promptText,
+        requestId: updated.idempotencyKey,
+        durationSeconds: updated.durationSeconds ?? undefined,
+        aspectRatio: updated.aspectRatio ?? undefined,
+      });
+
+      if (res.state === 'ambiguous') {
+        this.db.jobs.transition(updated.id, 'AMBIGUOUS', {
+          providerJobId: res.providerJobId || null,
+          providerReferenceId: res.providerReferenceId || null,
+          errorCode: 'SUBMIT_AMBIGUOUS',
+          safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+        });
+        this.logger.warn('job_submit_ambiguous', {
+          jobId: updated.id,
+          sku: updated.skuSnapshot,
+        });
+      } else if (res.state === 'failed') {
+        const code = res.errorCode ?? 'PROVIDER_ERROR';
+        if (code === 'QUOTA_LIMITED') {
+          this.db.jobs.transition(updated.id, 'FAILED_QUOTA', {
+            providerJobId: res.providerJobId || null,
+            providerReferenceId: res.providerReferenceId || null,
+            errorCode: 'QUOTA_LIMITED',
+            safeErrorMessage: res.safeMessage ?? SAFE_ERROR_MESSAGES.QUOTA_LIMITED,
+          });
+        } else if (code === 'CONTENT_REFUSED') {
+          this.db.jobs.transition(updated.id, 'FAILED_REFUSED', {
+            providerJobId: res.providerJobId || null,
+            providerReferenceId: res.providerReferenceId || null,
+            errorCode: 'CONTENT_REFUSED',
+            safeErrorMessage: res.safeMessage ?? SAFE_ERROR_MESSAGES.CONTENT_REFUSED,
+          });
+        } else {
+          this.db.jobs.transition(updated.id, 'FAILED_PROVIDER', {
+            providerJobId: res.providerJobId || null,
+            providerReferenceId: res.providerReferenceId || null,
+            errorCode: code,
+            safeErrorMessage: res.safeMessage ?? SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
+          });
+        }
+      } else {
+        // Confirmed acceptance: running or queued
+        this.pollAttempt = 0;
+        this.db.jobs.transition(updated.id, 'RUNNING', {
+          providerJobId: res.providerJobId,
+          providerReferenceId: res.providerReferenceId ?? null,
+          acceptedAt: nowIso(),
+        });
+        this.logger.info('job_running', {
+          jobId: updated.id,
+          sku: updated.skuSnapshot,
+        });
+      }
+      await this.emitJobUpdated(updated.id);
+    } catch (err: unknown) {
+      if (err instanceof ProviderError) {
+        if (err.code === 'QUOTA_LIMITED') {
+          this.db.jobs.transition(updated.id, 'FAILED_QUOTA', {
+            errorCode: 'QUOTA_LIMITED',
+            safeErrorMessage: err.safeMessage,
+          });
+        } else if (err.code === 'CONTENT_REFUSED') {
+          this.db.jobs.transition(updated.id, 'FAILED_REFUSED', {
+            errorCode: 'CONTENT_REFUSED',
+            safeErrorMessage: err.safeMessage,
+          });
+        } else if (err.phase === 'before_submit') {
+          this.db.jobs.transition(updated.id, 'FAILED_RETRYABLE', {
+            errorCode: err.code,
+            safeErrorMessage: err.safeMessage,
+          });
+        } else {
+          // after_submit or unknown -> AMBIGUOUS (never automatic resubmit)
+          this.db.jobs.transition(updated.id, 'AMBIGUOUS', {
+            errorCode: 'SUBMIT_AMBIGUOUS',
+            safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+          });
+        }
+      } else {
+        this.db.jobs.transition(updated.id, 'AMBIGUOUS', {
+          errorCode: 'SUBMIT_AMBIGUOUS',
+          safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+        });
+      }
+      await this.emitJobUpdated(updated.id);
+    }
+  }
+
+  private async handleRunning(job: Job): Promise<void> {
+    if (!job.providerJobId) {
+      this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+        errorCode: 'PROVIDER_ERROR',
+        safeErrorMessage: 'Missing provider job ID',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    try {
+      const providerJob = await this.provider.getJob(job.providerJobId);
+
+      if (typeof providerJob.progress === 'number') {
+        this.jobProgress.set(job.id, providerJob.progress);
+        await this.emitJobUpdated(job.id);
+      }
+
+      if (providerJob.state === 'running' || providerJob.state === 'queued') {
+        const delay = nextPollDelay(
+          this.pollAttempt,
+          this.config.pollIntervalMs,
+          this.config.pollMaxIntervalMs
+        );
+        this.pollAttempt++;
+        await this.sleep(delay);
+        return;
+      }
+
+      this.pollAttempt = 0;
+      this.jobProgress.delete(job.id);
+
+      if (providerJob.state === 'succeeded') {
+        this.db.jobs.transition(job.id, 'DOWNLOADING', {
+          providerAssetId: providerJob.providerAssetId ?? null,
+        });
+        this.logger.info('job_generating_completed', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+        });
+        await this.emitJobUpdated(job.id);
+      } else if (providerJob.state === 'failed') {
+        const code = providerJob.errorCode ?? 'PROVIDER_ERROR';
+        if (code === 'QUOTA_LIMITED') {
+          this.db.jobs.transition(job.id, 'FAILED_QUOTA', {
+            errorCode: 'QUOTA_LIMITED',
+            safeErrorMessage: providerJob.safeMessage ?? SAFE_ERROR_MESSAGES.QUOTA_LIMITED,
+          });
+        } else if (code === 'CONTENT_REFUSED') {
+          this.db.jobs.transition(job.id, 'FAILED_REFUSED', {
+            errorCode: 'CONTENT_REFUSED',
+            safeErrorMessage: providerJob.safeMessage ?? SAFE_ERROR_MESSAGES.CONTENT_REFUSED,
+          });
+        } else {
+          this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+            errorCode: code,
+            safeErrorMessage: providerJob.safeMessage ?? SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
+          });
+        }
+        await this.emitJobUpdated(job.id);
+      } else if (providerJob.state === 'cancelled') {
+        this.db.jobs.transition(job.id, 'CANCELLED');
+        await this.emitJobUpdated(job.id);
+      }
+    } catch (err: unknown) {
+      this.pollAttempt = 0;
+      this.jobProgress.delete(job.id);
+
+      if (err instanceof ProviderError) {
+        if (err.code === 'QUOTA_LIMITED') {
+          this.db.jobs.transition(job.id, 'FAILED_QUOTA', {
+            errorCode: 'QUOTA_LIMITED',
+            safeErrorMessage: err.safeMessage,
+          });
+        } else if (err.code === 'CONTENT_REFUSED') {
+          this.db.jobs.transition(job.id, 'FAILED_REFUSED', {
+            errorCode: 'CONTENT_REFUSED',
+            safeErrorMessage: err.safeMessage,
+          });
+        } else {
+          this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+            errorCode: err.code,
+            safeErrorMessage: err.safeMessage,
+          });
+        }
+      } else {
+        this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+          errorCode: 'PROVIDER_ERROR',
+          safeErrorMessage: SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
+        });
+      }
+      await this.emitJobUpdated(job.id);
+    }
+  }
+
+  private async handleDownloading(job: Job): Promise<void> {
+    if (!job.providerJobId) {
+      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+        errorCode: 'DOWNLOAD_FAILED',
+        safeErrorMessage: 'Missing provider job ID for download',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    const tempPartPath = this.media.newTempPath();
+
+    // 1. Download output to temp file
+    try {
+      await this.provider.downloadOutput(job.providerJobId, tempPartPath, this.config.maxVideoBytes);
+    } catch (err: unknown) {
+      const code = err instanceof ProviderError ? err.code : 'DOWNLOAD_FAILED';
+      const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
+      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+        errorCode: code,
+        safeErrorMessage: safeMessage,
+      });
+      this.logger.error('job_download_failed', {
+        jobId: job.id,
+        sku: job.skuSnapshot,
+        code,
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    // 2. Validate and store video in SKU folder
+    let storedVideo: StoredFile;
+    try {
+      storedVideo = await this.media.storeVideo(tempPartPath, job.skuSnapshot);
+    } catch (err: unknown) {
+      const code = err instanceof PodError ? err.code : 'DOWNLOAD_FAILED';
+      const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
+      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+        errorCode: code,
+        safeErrorMessage: safeMessage,
+      });
+      this.logger.error('job_store_video_failed', {
+        jobId: job.id,
+        sku: job.skuSnapshot,
+        code,
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    // 3. Write sanitized metadata json (no prompt text, no absolute paths)
+    const baseName = path.parse(storedVideo.relPath).name;
+    const completedAt = nowIso();
+    const metadata = {
+      jobId: job.id,
+      productId: job.productId,
+      sku: job.skuSnapshot,
+      provider: job.provider,
+      providerJobId: job.providerJobId,
+      providerAssetId: job.providerAssetId,
+      templateId: job.promptTemplateId,
+      templateVersion: job.promptTemplateVersion,
+      promptSha256: job.promptSha256,
+      videoSha256: storedVideo.sha256,
+      videoBytes: storedVideo.bytes,
+      createdAt: job.createdAt,
+      completedAt,
+    };
+    await this.media.writeMetadata(job.skuSnapshot, baseName, metadata);
+
+    // 4. In a sync transaction: insert generated_video asset and set SUCCEEDED
+    this.db.transaction(() => {
+      this.db.assets.insert({
+        productId: job.productId,
+        jobId: job.id,
+        role: 'generated_video',
+        path: storedVideo.relPath,
+        mime: 'video/mp4',
+        bytes: storedVideo.bytes,
+        width: storedVideo.width,
+        height: storedVideo.height,
+        durationMs: null,
+        sha256: storedVideo.sha256,
+      });
+      this.db.jobs.transition(job.id, 'SUCCEEDED', {
+        completedAt,
+      });
+    });
+
+    const elapsed = Math.max(0, new Date(completedAt).getTime() - new Date(job.createdAt).getTime());
+    this.logger.info('job_succeeded', {
+      jobId: job.id,
+      sku: job.skuSnapshot,
+      durationMs: elapsed,
+    });
+    await this.emitJobUpdated(job.id);
+  }
+
+  private async emitJobUpdated(jobId: string): Promise<void> {
+    const job = this.db.jobs.getById(jobId);
+    if (job) {
+      const view = await this.toJobView(job);
+      this.emit('job:updated', view);
+    }
+  }
+
+  async toJobView(job: Job, capsOverride?: ProviderCapabilities): Promise<JobView> {
+    const caps = capsOverride ?? (await this.getCapabilities());
+    const product = this.db.products.getById(job.productId);
+    const assets = this.db.assets.listByJob(job.id);
+    const sourceAsset = this.db.assets.getById(job.sourceAssetId);
+    const videoAsset = assets.find((a) => a.role === 'generated_video');
+
+    let elapsedMs: number;
+    if (isTerminal(job.state)) {
+      if (job.completedAt) {
+        elapsedMs = Math.max(0, new Date(job.completedAt).getTime() - new Date(job.createdAt).getTime());
+      } else {
+        elapsedMs = Math.max(0, new Date(job.updatedAt).getTime() - new Date(job.createdAt).getTime());
+      }
+    } else {
+      elapsedMs = Math.max(0, Date.now() - new Date(job.createdAt).getTime());
+    }
+
+    return {
+      job,
+      stateLabel: JOB_STATE_LABELS[job.state],
+      category: product?.category ?? '',
+      productName: product?.productName ?? null,
+      sourceUrl: sourceAsset ? `pod-media://asset/${sourceAsset.id}` : null,
+      videoUrl: videoAsset ? `pod-media://asset/${videoAsset.id}` : null,
+      videoAssetId: videoAsset?.id ?? null,
+      elapsedMs,
+      progress: this.jobProgress.get(job.id) ?? null,
+      nextActions: nextActionsFor(job, caps),
+    };
+  }
+
+  private toJobViewSync(job: Job): JobView {
+    const product = this.db.products.getById(job.productId);
+    const assets = this.db.assets.listByJob(job.id);
+    const sourceAsset = this.db.assets.getById(job.sourceAssetId);
+    const videoAsset = assets.find((a) => a.role === 'generated_video');
+
+    let elapsedMs: number;
+    if (isTerminal(job.state)) {
+      if (job.completedAt) {
+        elapsedMs = Math.max(0, new Date(job.completedAt).getTime() - new Date(job.createdAt).getTime());
+      } else {
+        elapsedMs = Math.max(0, new Date(job.updatedAt).getTime() - new Date(job.createdAt).getTime());
+      }
+    } else {
+      elapsedMs = Math.max(0, Date.now() - new Date(job.createdAt).getTime());
+    }
+
+    return {
+      job,
+      stateLabel: JOB_STATE_LABELS[job.state],
+      category: product?.category ?? '',
+      productName: product?.productName ?? null,
+      sourceUrl: sourceAsset ? `pod-media://asset/${sourceAsset.id}` : null,
+      videoUrl: videoAsset ? `pod-media://asset/${videoAsset.id}` : null,
+      videoAssetId: videoAsset?.id ?? null,
+      elapsedMs,
+      progress: this.jobProgress.get(job.id) ?? null,
+      nextActions: nextActionsFor(job, null),
+    };
+  }
+}
