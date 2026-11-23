@@ -110,4 +110,36 @@ describe('IPC Helper E2E', () => {
       expect(unexpRes.error.message).toBe('An unexpected error occurred.');
     }
   });
+
+  // 4. SenderFrame validation: null frame / unauthorized frame -> FORBIDDEN; no event -> allowed
+  it('senderFrame validation: null frame / unauthorized frame -> FORBIDDEN; no event -> allowed', async () => {
+    const handler = createIpcHandler({
+      channel: 'test:frame',
+      logger: testLogger,
+      isDev: false,
+      handler: () => ({ success: true }),
+    });
+
+    // 4a. Unit test path: event === undefined -> allowed
+    const noEventRes = await handler();
+    expect(noEventRes.ok).toBe(true);
+
+    // 4b. Event present but senderFrame is null (destroyed/navigated frame) -> FORBIDDEN
+    const nullFrameEvent = { senderFrame: null } as unknown as import('electron').IpcMainInvokeEvent;
+    const nullFrameRes = await handler({}, nullFrameEvent);
+    expect(nullFrameRes.ok).toBe(false);
+    if (!nullFrameRes.ok) {
+      expect(nullFrameRes.error.code).toBe('FORBIDDEN');
+    }
+
+    // 4c. Event present with invalid / unauthorized origin -> FORBIDDEN
+    const untrustedFrameEvent = {
+      senderFrame: { url: 'http://malicious.example.com' },
+    } as unknown as import('electron').IpcMainInvokeEvent;
+    const untrustedRes = await handler({}, untrustedFrameEvent);
+    expect(untrustedRes.ok).toBe(false);
+    if (!untrustedRes.ok) {
+      expect(untrustedRes.error.code).toBe('FORBIDDEN');
+    }
+  });
 });

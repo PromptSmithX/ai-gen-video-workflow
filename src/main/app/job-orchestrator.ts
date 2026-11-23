@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -145,7 +146,9 @@ export class JobOrchestrator extends EventEmitter {
     if (input.promptOverride && input.promptOverride.trim().length > 0) {
       const validated = this.prompts.validatePrompt(input.promptOverride, this.config.promptMaxChars);
       if (validated.errors.length > 0 || !validated.quality.passed) {
-        const code = validated.errors.includes('PROMPT_TOO_LONG') ? 'PROMPT_TOO_LONG' : 'INVALID_PROMPT';
+        const code = validated.errors.some((e) => e.startsWith('PROMPT_TOO_LONG'))
+          ? 'PROMPT_TOO_LONG'
+          : 'INVALID_PROMPT';
         throw new PodError(code, validated.errors[0] || 'Prompt quality check failed');
       }
       promptText = input.promptOverride;
@@ -170,7 +173,9 @@ export class JobOrchestrator extends EventEmitter {
       });
 
       if (rendered.errors.length > 0 || !rendered.quality.passed) {
-        const code = rendered.errors.includes('PROMPT_TOO_LONG') ? 'PROMPT_TOO_LONG' : 'INVALID_PROMPT';
+        const code = rendered.errors.some((e) => e.startsWith('PROMPT_TOO_LONG'))
+          ? 'PROMPT_TOO_LONG'
+          : 'INVALID_PROMPT';
         throw new PodError(code, rendered.errors[0] || 'Prompt rendering or quality check failed');
       }
       promptText = rendered.text;
@@ -257,6 +262,13 @@ export class JobOrchestrator extends EventEmitter {
       } catch {
         // ignore
       }
+
+      // Check if duplicate key from idempotency race
+      const existingAfterRace = this.db.jobs.findByIdempotencyKey(input.clientRequestId);
+      if (existingAfterRace) {
+        return this.toJobView(existingAfterRace);
+      }
+
       throw err;
     }
 
@@ -471,11 +483,13 @@ export class JobOrchestrator extends EventEmitter {
     if (job.state === 'RUNNING' && job.providerJobId && this.provider.cancelJob) {
       try {
         await this.provider.cancelJob(job.providerJobId);
-      } catch (err) {
+      } catch (err: unknown) {
+        const code = err instanceof PodError ? err.code : 'PROVIDER_ERROR';
         this.logger.warn('job_cancel_provider_failed', {
           jobId: job.id,
-          error: String(err),
+          code,
         });
+        throw new PodError('PROVIDER_ERROR', 'Failed to cancel job with provider');
       }
     }
 
@@ -555,7 +569,20 @@ export class JobOrchestrator extends EventEmitter {
           try {
             await this.handleDownloading(downloadingJob);
           } catch (err) {
-            this.logger.error('download_handler_error', { error: String(err) });
+            this.logger.error('download_handler_error', {
+              jobId: downloadingJob.id,
+              error: (err as PodError)?.code ?? 'DOWNLOAD_FAILED',
+            });
+            try {
+              this.db.jobs.transition(downloadingJob.id, 'DOWNLOAD_FAILED', {
+                errorCode: 'DOWNLOAD_FAILED',
+                safeErrorMessage: SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED,
+              });
+              await this.emitJobUpdated(downloadingJob.id);
+            } catch {
+              // ignore
+            }
+            await this.sleep(100);
           }
           continue;
         }
@@ -566,7 +593,12 @@ export class JobOrchestrator extends EventEmitter {
           try {
             await this.handleRunning(runningJob);
           } catch (err) {
-            this.logger.error('running_handler_error', { error: String(err) });
+            this.logger.error('running_handler_error', {
+              jobId: runningJob.id,
+              error: (err as PodError)?.code ?? 'PROVIDER_ERROR',
+            });
+            // RUNNING stays RUNNING per spec, backoff sleep so loop doesn't spin
+            await this.sleep(250);
           }
           continue;
         }
@@ -581,7 +613,11 @@ export class JobOrchestrator extends EventEmitter {
             });
             await this.emitJobUpdated(submittingJob.id);
           } catch (err) {
-            this.logger.error('submitting_reconcile_error', { error: String(err) });
+            this.logger.error('submitting_reconcile_error', {
+              jobId: submittingJob.id,
+              error: (err as PodError)?.code ?? 'DB_ERROR',
+            });
+            await this.sleep(100);
           }
           continue;
         }
@@ -592,7 +628,29 @@ export class JobOrchestrator extends EventEmitter {
           try {
             await this.handleSubmit(queuedJob);
           } catch (err) {
-            this.logger.error('submit_handler_error', { error: String(err) });
+            this.logger.error('submit_handler_error', {
+              jobId: queuedJob.id,
+              error: (err as PodError)?.code ?? 'PROVIDER_ERROR',
+            });
+            try {
+              const current = this.db.jobs.getById(queuedJob.id);
+              if (current?.state === 'SUBMITTING') {
+                this.db.jobs.transition(current.id, 'AMBIGUOUS', {
+                  errorCode: 'SUBMIT_AMBIGUOUS',
+                  safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+                });
+                await this.emitJobUpdated(current.id);
+              } else if (current?.state === 'QUEUED') {
+                this.db.jobs.transition(current.id, 'FAILED_RETRYABLE', {
+                  errorCode: 'PROVIDER_ERROR',
+                  safeErrorMessage: SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
+                });
+                await this.emitJobUpdated(current.id);
+              }
+            } catch {
+              // ignore
+            }
+            await this.sleep(100);
           }
           continue;
         }
@@ -616,7 +674,68 @@ export class JobOrchestrator extends EventEmitter {
   }
 
   private async handleSubmit(job: Job): Promise<void> {
-    // 1. Persist SUBMITTING + submitIntentAt before calling provider.generateVideo
+    // 1. Resolve source asset file BEFORE transitioning to SUBMITTING
+    const sourceAsset = this.db.assets.getById(job.sourceAssetId);
+    let sourceAbsPath: string | null = null;
+    if (sourceAsset) {
+      const p = this.media.resolve(sourceAsset.path);
+      if (fs.existsSync(p)) {
+        sourceAbsPath = p;
+      }
+    }
+    if (!sourceAsset || !sourceAbsPath) {
+      this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+        errorCode: 'NOT_FOUND',
+        safeErrorMessage: 'Source image asset missing',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    // 2. Resolve and verify prompt snapshot text BEFORE transitioning to SUBMITTING
+    const assets = this.db.assets.listByJob(job.id);
+    const promptAsset = assets.find((a) => a.role === 'prompt_snapshot');
+    let promptText: string | null = null;
+    if (promptAsset) {
+      const promptAbsPath = this.media.resolve(promptAsset.path);
+      try {
+        if (fs.existsSync(promptAbsPath)) {
+          promptText = fs.readFileSync(promptAbsPath, 'utf-8');
+        }
+      } catch {
+        promptText = null;
+      }
+    }
+
+    if (promptText === null || !promptAsset) {
+      this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+        errorCode: 'INVALID_PROMPT',
+        safeErrorMessage: 'Prompt snapshot file unreadable or missing',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    if (promptText.trim().length === 0) {
+      this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+        errorCode: 'INVALID_PROMPT',
+        safeErrorMessage: 'Prompt text is empty',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    const calculatedSha256 = crypto.createHash('sha256').update(promptText, 'utf-8').digest('hex');
+    if (calculatedSha256 !== job.promptSha256) {
+      this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+        errorCode: 'INVALID_PROMPT',
+        safeErrorMessage: 'Prompt snapshot hash mismatch',
+      });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+
+    // 3. Persist SUBMITTING + submitIntentAt before calling provider.generateVideo
     const now = nowIso();
     const updated = this.db.jobs.transition(job.id, 'SUBMITTING', {
       submitIntentAt: now,
@@ -627,32 +746,6 @@ export class JobOrchestrator extends EventEmitter {
       sku: updated.skuSnapshot,
     });
     await this.emitJobUpdated(updated.id);
-
-    // Retrieve source asset file
-    const sourceAsset = this.db.assets.getById(updated.sourceAssetId);
-    if (!sourceAsset) {
-      this.db.jobs.transition(updated.id, 'FAILED_RETRYABLE', {
-        errorCode: 'NOT_FOUND',
-        safeErrorMessage: 'Source image asset missing',
-      });
-      await this.emitJobUpdated(updated.id);
-      return;
-    }
-
-    const sourceAbsPath = this.media.resolve(sourceAsset.path);
-
-    // Retrieve prompt snapshot text
-    const assets = this.db.assets.listByJob(updated.id);
-    const promptAsset = assets.find((a) => a.role === 'prompt_snapshot');
-    let promptText = '';
-    if (promptAsset) {
-      const promptAbsPath = this.media.resolve(promptAsset.path);
-      try {
-        promptText = fs.readFileSync(promptAbsPath, 'utf-8');
-      } catch {
-        promptText = '';
-      }
-    }
 
     try {
       const res = await this.provider.generateVideo({
@@ -750,9 +843,9 @@ export class JobOrchestrator extends EventEmitter {
 
   private async handleRunning(job: Job): Promise<void> {
     if (!job.providerJobId) {
-      this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
-        errorCode: 'PROVIDER_ERROR',
-        safeErrorMessage: 'Missing provider job ID',
+      this.db.jobs.transition(job.id, 'AMBIGUOUS', {
+        errorCode: 'SUBMIT_AMBIGUOUS',
+        safeErrorMessage: SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
       });
       await this.emitJobUpdated(job.id);
       return;
@@ -760,6 +853,16 @@ export class JobOrchestrator extends EventEmitter {
 
     try {
       const providerJob = await this.provider.getJob(job.providerJobId);
+
+      // Clear any prior transient connection error note on successful poll
+      if (job.safeErrorMessage) {
+        this.db.jobs.update(job.id, {
+          safeErrorMessage: null,
+          errorCode: null,
+        });
+        job.safeErrorMessage = null;
+        job.errorCode = null;
+      }
 
       if (typeof providerJob.progress === 'number') {
         this.jobProgress.set(job.id, providerJob.progress);
@@ -813,33 +916,55 @@ export class JobOrchestrator extends EventEmitter {
         await this.emitJobUpdated(job.id);
       }
     } catch (err: unknown) {
-      this.pollAttempt = 0;
-      this.jobProgress.delete(job.id);
-
       if (err instanceof ProviderError) {
         if (err.code === 'QUOTA_LIMITED') {
+          this.pollAttempt = 0;
+          this.jobProgress.delete(job.id);
           this.db.jobs.transition(job.id, 'FAILED_QUOTA', {
             errorCode: 'QUOTA_LIMITED',
             safeErrorMessage: err.safeMessage,
           });
-        } else if (err.code === 'CONTENT_REFUSED') {
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+        if (err.code === 'CONTENT_REFUSED') {
+          this.pollAttempt = 0;
+          this.jobProgress.delete(job.id);
           this.db.jobs.transition(job.id, 'FAILED_REFUSED', {
             errorCode: 'CONTENT_REFUSED',
             safeErrorMessage: err.safeMessage,
           });
-        } else {
-          this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
-            errorCode: err.code,
-            safeErrorMessage: err.safeMessage,
-          });
+          await this.emitJobUpdated(job.id);
+          return;
         }
-      } else {
-        this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
-          errorCode: 'PROVIDER_ERROR',
-          safeErrorMessage: SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
-        });
+        if (err.code === 'NOT_FOUND' || (err as { statusCode?: number }).statusCode === 404) {
+          this.pollAttempt = 0;
+          this.jobProgress.delete(job.id);
+          this.db.jobs.transition(job.id, 'AMBIGUOUS', {
+            errorCode: 'NOT_FOUND',
+            safeErrorMessage: 'Provider job not found during polling — state ambiguous',
+          });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
       }
+
+      // Transient polling error (bridge down, timeout, 5xx, network drop, etc.):
+      // Keep the job RUNNING, record a safe note, and back off
+      const note = 'Connection to the Muse bridge lost — still checking';
+      this.db.jobs.update(job.id, {
+        safeErrorMessage: note,
+      });
+      job.safeErrorMessage = note;
       await this.emitJobUpdated(job.id);
+
+      const delay = nextPollDelay(
+        this.pollAttempt,
+        this.config.pollIntervalMs,
+        this.config.pollMaxIntervalMs
+      );
+      this.pollAttempt++;
+      await this.sleep(delay);
     }
   }
 
@@ -912,26 +1037,57 @@ export class JobOrchestrator extends EventEmitter {
       createdAt: job.createdAt,
       completedAt,
     };
-    await this.media.writeMetadata(job.skuSnapshot, baseName, metadata);
+    try {
+      await this.media.writeMetadata(job.skuSnapshot, baseName, metadata);
+    } catch (err) {
+      this.logger.warn('metadata_write_failed', {
+        jobId: job.id,
+        sku: job.skuSnapshot,
+        error: (err as PodError)?.code ?? 'IO_ERROR',
+      });
+      // Non-critical: continue to SUCCEEDED
+    }
 
     // 4. In a sync transaction: insert generated_video asset and set SUCCEEDED
-    this.db.transaction(() => {
-      this.db.assets.insert({
-        productId: job.productId,
+    try {
+      this.db.transaction(() => {
+        this.db.assets.insert({
+          productId: job.productId,
+          jobId: job.id,
+          role: 'generated_video',
+          path: storedVideo.relPath,
+          mime: 'video/mp4',
+          bytes: storedVideo.bytes,
+          width: storedVideo.width,
+          height: storedVideo.height,
+          durationMs: null,
+          sha256: storedVideo.sha256,
+        });
+        this.db.jobs.transition(job.id, 'SUCCEEDED', {
+          completedAt,
+        });
+      });
+    } catch (err) {
+      // Transaction failed: delete stored file and move to DOWNLOAD_FAILED
+      try {
+        if (fs.existsSync(storedVideo.absPath)) {
+          fs.unlinkSync(storedVideo.absPath);
+        }
+      } catch {
+        // ignore
+      }
+      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+        errorCode: 'DOWNLOAD_FAILED',
+        safeErrorMessage: SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED,
+      });
+      this.logger.error('job_asset_insert_failed', {
         jobId: job.id,
-        role: 'generated_video',
-        path: storedVideo.relPath,
-        mime: 'video/mp4',
-        bytes: storedVideo.bytes,
-        width: storedVideo.width,
-        height: storedVideo.height,
-        durationMs: null,
-        sha256: storedVideo.sha256,
+        sku: job.skuSnapshot,
+        error: (err as PodError)?.code ?? 'DB_ERROR',
       });
-      this.db.jobs.transition(job.id, 'SUCCEEDED', {
-        completedAt,
-      });
-    });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
 
     const elapsed = Math.max(0, new Date(completedAt).getTime() - new Date(job.createdAt).getTime());
     this.logger.info('job_succeeded', {

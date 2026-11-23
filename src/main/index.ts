@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { app, BrowserWindow, net, protocol } from 'electron';
+import { app, BrowserWindow, dialog, net, protocol } from 'electron';
+import { PodError } from '@shared/errors';
 import { IPC, MEDIA_PROTOCOL } from '@shared/ipc';
 import { createAppContainer, type AppContainer } from './app/container';
 import { registerAllIpcHandlers } from './ipc/register';
@@ -67,13 +68,20 @@ if (!gotLock) {
 
   void app.whenReady().then(async () => {
     // 1. Create composition root / container
-    container = createAppContainer({
-      appPath: app.getAppPath(),
-      userData: app.getPath('userData'),
-      documents: app.getPath('documents'),
-      isPackaged: app.isPackaged,
-      appVersion: app.getVersion(),
-    });
+    try {
+      container = createAppContainer({
+        appPath: app.getAppPath(),
+        userData: app.getPath('userData'),
+        documents: app.getPath('documents'),
+        isPackaged: app.isPackaged,
+        appVersion: app.getVersion(),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof PodError ? err.safeMessage : 'Configuration error';
+      dialog.showErrorBox('POD Video Studio', msg);
+      app.quit();
+      return;
+    }
 
     // 2. Register pod-media protocol
     protocol.handle(MEDIA_PROTOCOL, async (request) => {

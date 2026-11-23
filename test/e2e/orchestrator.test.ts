@@ -5,8 +5,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { AppConfig } from '@shared/config';
 import type { Job } from '@shared/domain';
 import { PodError } from '@shared/errors';
+import { ProviderError } from '@shared/provider';
 import type { JobState } from '@shared/job-state';
 import type { Logger, LogFields, MediaLibrary, PodDatabase, PromptService } from '@shared/services';
+import { createAppContainer } from '../../src/main/app/container';
 import { ImageStagingService } from '../../src/main/app/image-staging';
 import { JobOrchestrator } from '../../src/main/app/job-orchestrator';
 import { newId } from '../../src/main/domain/ids';
@@ -97,6 +99,7 @@ describe('JobOrchestrator E2E', () => {
     prompts: PromptService;
     imageStaging: ImageStagingService;
     orchestrator: JobOrchestrator;
+    provider: RestBridgeMuseProvider;
     config: AppConfig;
     stageImage: (name?: string) => Promise<string>;
   }
@@ -185,6 +188,7 @@ describe('JobOrchestrator E2E', () => {
       prompts,
       imageStaging,
       orchestrator,
+      provider,
       config,
       stageImage,
     };
@@ -751,5 +755,301 @@ describe('JobOrchestrator E2E', () => {
     expect(stack.db.jobs.list().length).toBe(0);
 
     stack.orchestrator.stop();
+  });
+
+  // 10. Polling resilience: bridge down during RUNNING -> stays RUNNING with safe note, bridge back -> SUCCEEDED, exactly 1 POST /v1/jobs
+  it('bridge down during RUNNING -> stays RUNNING with safe note, bridge back -> SUCCEEDED, exactly 1 POST /v1/jobs', async () => {
+    server.setBehavior('healthy');
+    const stack = await createTestStack({ pollIntervalMs: 50 });
+    const token = await stack.stageImage('TS-POLL-RESILIENT.png');
+    const clientRequestId = newId();
+
+    const initialView = await stack.orchestrator.createJob(
+      {
+        clientRequestId,
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-POLL-RESILIENT',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+
+    // Wait until RUNNING
+    const running = await waitForJobState(stack.db, initialView.job.id, 'RUNNING');
+    expect(running.state).toBe('RUNNING');
+
+    // Simulate bridge failure during polling (e.g. 500 error / bridge restart)
+    server.setCustomGetJobResponse({
+      statusCode: 500,
+      body: { error: 'INTERNAL_ERROR' },
+    });
+
+    // Wait for a poll attempt to encounter the error
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Job must still be RUNNING, and safe note must be recorded
+    const stillRunning = stack.db.jobs.getById(initialView.job.id);
+    expect(stillRunning?.state).toBe('RUNNING');
+    expect(stillRunning?.safeErrorMessage).toBe('Connection to the Muse bridge lost — still checking');
+
+    // Bridge comes back
+    server.setCustomGetJobResponse(null);
+
+    // Job completes to SUCCEEDED
+    const completed = await waitForJobState(stack.db, initialView.job.id, 'SUCCEEDED');
+    expect(completed.state).toBe('SUCCEEDED');
+    expect(completed.safeErrorMessage).toBeNull();
+
+    // Exactly 1 POST /v1/jobs was made
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(1);
+
+    stack.orchestrator.stop();
+  });
+
+  // 11. writeMetadata failure continues to SUCCEEDED; storeVideo failure moves to DOWNLOAD_FAILED with exactly 1 downloadOutput
+  it('writeMetadata failure continues to SUCCEEDED; storeVideo failure moves to DOWNLOAD_FAILED with exactly 1 downloadOutput', async () => {
+    // 11a: writeMetadata failure -> job SUCCEEDED, 1 video stored
+    {
+      server.clearRequests();
+      server.setBehavior('healthy');
+      const stack = await createTestStack();
+      const token = await stack.stageImage('TS-META-FAIL.png');
+
+      // Make writeMetadata throw
+      stack.media.writeMetadata = async () => {
+        throw new Error('EACCES: permission denied, open metadata');
+      };
+
+      const view = await stack.orchestrator.createJob(
+        {
+          clientRequestId: newId(),
+          sourceToken: token,
+          templateId: 'product-review',
+          templateVersion: 'v2',
+          sku: 'TS-META-FAIL',
+          categoryId: 't-shirt',
+        },
+        'employee-1'
+      );
+
+      const completed = await waitForJobState(stack.db, view.job.id, 'SUCCEEDED');
+      expect(completed.state).toBe('SUCCEEDED');
+
+      // Check stored video exists
+      const videoRelPath = 'TS-META-FAIL/videos/TS-META-FAIL-video-001.mp4';
+      expect(fs.existsSync(stack.media.resolve(videoRelPath))).toBe(true);
+
+      stack.orchestrator.stop();
+    }
+
+    // 11b: storeVideo throws non-PodError -> DOWNLOAD_FAILED, provider.downloadOutput called once (no hot loop)
+    {
+      server.clearRequests();
+      server.setBehavior('healthy');
+      const stack = await createTestStack();
+      const token = await stack.stageImage('TS-STORE-FAIL.png');
+
+      let downloadOutputCalls = 0;
+      const originalDownload = stack.provider.downloadOutput.bind(stack.provider);
+      stack.provider.downloadOutput = async (jobId: string, destPath: string, maxBytes: number) => {
+        downloadOutputCalls++;
+        return originalDownload(jobId, destPath, maxBytes);
+      };
+
+      // Make storeVideo throw unexpected non-PodError
+      stack.media.storeVideo = async () => {
+        throw new Error('Disk write error in storeVideo');
+      };
+
+      const view = await stack.orchestrator.createJob(
+        {
+          clientRequestId: newId(),
+          sourceToken: token,
+          templateId: 'product-review',
+          templateVersion: 'v2',
+          sku: 'TS-STORE-FAIL',
+          categoryId: 't-shirt',
+        },
+        'employee-1'
+      );
+
+      const failedJob = await waitForJobState(stack.db, view.job.id, 'DOWNLOAD_FAILED');
+      expect(failedJob.state).toBe('DOWNLOAD_FAILED');
+
+      // Wait a moment to ensure no hot loop spins
+      await new Promise((r) => setTimeout(r, 200));
+      expect(downloadOutputCalls).toBe(1);
+
+      stack.orchestrator.stop();
+    }
+  });
+
+  // 12. Pre-submit validation: missing asset / corrupt snapshot / empty prompt -> QUEUED to FAILED_RETRYABLE without network call
+  it('pre-submit validation: missing asset, unreadable/mismatch prompt snapshot -> QUEUED to FAILED_RETRYABLE with 0 network calls', async () => {
+    server.clearRequests();
+    const stack = await createTestStack();
+    const token = await stack.stageImage('TS-PRECHECK.png');
+
+    // Stop orchestrator before creating the job so it doesn't process immediately
+    stack.orchestrator.stop();
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-PRECHECK',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+
+    // Corrupt prompt snapshot on disk so hash mismatches
+    const assets = stack.db.assets.listByJob(view.job.id);
+    const promptAsset = assets.find((a) => a.role === 'prompt_snapshot')!;
+    const promptAbsPath = stack.media.resolve(promptAsset.path);
+    fs.writeFileSync(promptAbsPath, 'tampered prompt text that does not match sha256');
+
+    // Start a new orchestrator to process the QUEUED job via recover()
+    const stack2 = await createTestStack({
+      db: stack.db,
+      media: stack.media,
+      prompts: stack.prompts,
+    });
+    await stack2.orchestrator.recover();
+
+    const failed = await waitForJobState(stack2.db, view.job.id, 'FAILED_RETRYABLE');
+    expect(failed.state).toBe('FAILED_RETRYABLE');
+    expect(failed.errorCode).toBe('INVALID_PROMPT');
+
+    // 0 POST /v1/jobs calls
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(0);
+
+    stack2.orchestrator.stop();
+  });
+
+  // 13. cancel(): if provider.cancelJob throws, throw PROVIDER_ERROR and leave state RUNNING
+  it('cancel(): if provider.cancelJob throws, throw PROVIDER_ERROR and leave state RUNNING', async () => {
+    server.setBehavior('healthy');
+    const stack = await createTestStack();
+    const token = await stack.stageImage('TS-CANCEL.png');
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-CANCEL',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+
+    const running = await waitForJobState(stack.db, view.job.id, 'RUNNING');
+    expect(running.state).toBe('RUNNING');
+
+    // Make provider.cancelJob throw
+    stack.provider.cancelJob = async () => {
+      throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Network connection severed during cancel');
+    };
+
+    // Attempt cancel -> rejects with PodError('PROVIDER_ERROR')
+    await expect(stack.orchestrator.cancel(running.id)).rejects.toThrow(PodError);
+
+    // Job in DB must remain RUNNING
+    const current = stack.db.jobs.getById(running.id);
+    expect(current?.state).toBe('RUNNING');
+
+    // Check logged warning has code only, not String(err)
+    const cancelLogs = capturedLogs.filter((l) => l.event === 'job_cancel_provider_failed');
+    expect(cancelLogs.length).toBe(1);
+    expect(cancelLogs[0]?.fields?.code).toBe('PROVIDER_ERROR');
+    expect(cancelLogs[0]?.fields?.error).toBeUndefined();
+
+    stack.orchestrator.stop();
+  });
+
+  // 14. createJob idempotency race: Promise.all of two concurrent creates -> 1 job row, 1 source file
+  it('createJob idempotency race: Promise.all of two concurrent creates -> 1 job row, 1 source file', async () => {
+    server.setBehavior('healthy');
+    const stack = await createTestStack();
+    const token = await stack.stageImage('TS-RACE.png');
+    const clientRequestId = newId();
+
+    const [view1, view2] = await Promise.all([
+      stack.orchestrator.createJob(
+        {
+          clientRequestId,
+          sourceToken: token,
+          templateId: 'product-review',
+          templateVersion: 'v2',
+          sku: 'TS-RACE',
+          categoryId: 't-shirt',
+        },
+        'employee-1'
+      ),
+      stack.orchestrator.createJob(
+        {
+          clientRequestId,
+          sourceToken: token,
+          templateId: 'product-review',
+          templateVersion: 'v2',
+          sku: 'TS-RACE',
+          categoryId: 't-shirt',
+        },
+        'employee-1'
+      ),
+    ]);
+
+    expect(view1.job.id).toBe(view2.job.id);
+    expect(stack.db.jobs.list().length).toBe(1);
+
+    // Check source files in SKU folder: exactly 1 source image
+    const sourceDir = path.join(stack.config.libraryRoot, 'TS-RACE', 'source');
+    if (fs.existsSync(sourceDir)) {
+      const sourceFiles = fs.readdirSync(sourceDir);
+      expect(sourceFiles.length).toBe(1);
+    }
+
+    stack.orchestrator.stop();
+  });
+
+  // 15. createAppContainer throws PodError('CONFIG_INVALID') on invalid config (no Electron needed)
+  it('createAppContainer throws PodError("CONFIG_INVALID") on bad bridgeBaseUrl', () => {
+    expect(() => {
+      createAppContainer({
+        appPath: tempRoot,
+        userData: path.join(tempRoot, 'userdata'),
+        documents: path.join(tempRoot, 'docs'),
+        isPackaged: false,
+        env: {
+          MUSE_BRIDGE_BASE_URL: 'http://192.168.1.100:8080',
+        },
+      });
+    }).toThrow(PodError);
+
+    try {
+      createAppContainer({
+        appPath: tempRoot,
+        userData: path.join(tempRoot, 'userdata'),
+        documents: path.join(tempRoot, 'docs'),
+        isPackaged: false,
+        env: {
+          MUSE_BRIDGE_BASE_URL: 'http://192.168.1.100:8080',
+        },
+      });
+    } catch (err: unknown) {
+      expect(err).toBeInstanceOf(PodError);
+      if (err instanceof PodError) {
+        expect(err.code).toBe('CONFIG_INVALID');
+        expect(err.safeMessage).toContain('bridgeBaseUrl');
+      }
+    }
   });
 });

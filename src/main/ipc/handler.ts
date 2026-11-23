@@ -4,7 +4,7 @@ import { PodError, SAFE_ERROR_MESSAGES, type IpcResult } from '@shared/errors';
 import type { Logger } from '@shared/services';
 
 export function isValidSenderFrame(frame: WebFrameMain | null | undefined, isDev: boolean): boolean {
-  if (!frame) return true; // In unit tests / mocked event
+  if (!frame) return false;
   const frameUrl = frame.url;
   if (!frameUrl) return false;
 
@@ -47,14 +47,16 @@ export function createIpcHandler<TSchema extends z.ZodTypeAny, TResult>(
 ): (rawInput?: unknown, event?: IpcMainInvokeEvent) => Promise<IpcResult<TResult>> {
   return async (rawInput?: unknown, event?: IpcMainInvokeEvent): Promise<IpcResult<TResult>> => {
     // 1. Frame origin validation
-    if (event?.senderFrame && !isValidSenderFrame(event.senderFrame, opts.isDev ?? false)) {
-      return {
-        ok: false,
-        error: {
-          code: 'FORBIDDEN',
-          message: 'Unauthorized frame URL',
-        },
-      };
+    if (event !== undefined) {
+      if (!event.senderFrame || !isValidSenderFrame(event.senderFrame, opts.isDev ?? false)) {
+        return {
+          ok: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Unauthorized frame URL',
+          },
+        };
+      }
     }
 
     // 2. Admin authorization
