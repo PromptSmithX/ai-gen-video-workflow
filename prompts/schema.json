@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PromptMasterFrontmatter",
+  "description": "JSON schema for Prompt Master YAML-like frontmatter metadata",
+  "type": "object",
+  "required": ["id", "version", "title"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Template identifier, e.g. product-review"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version string, e.g. v1, v2"
+    },
+    "title": {
+      "type": "string",
+      "description": "Human-readable template title"
+    },
+    "placeholder": {
+      "type": "boolean",
+      "description": "True when this template is a built-in placeholder"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "Creation date formatted as YYYY-MM-DD or ISO timestamp"
+    },
+    "note": {
+      "type": "string",
+      "description": "Explanatory note or instruction regarding this version"
+    },
+    "default": {
+      "type": "boolean",
+      "description": "Whether this version is the default version for its id"
+    }
+  },
+  "additionalProperties": true
+}
