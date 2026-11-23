@@ -10,23 +10,18 @@ export function isValidSenderFrame(frame: WebFrameMain | null | undefined, isDev
 
   try {
     const parsed = new URL(frameUrl);
-    if (isDev) {
-      const devUrl = process.env['ELECTRON_RENDERER_URL'];
-      if (devUrl) {
-        try {
-          const parsedDev = new URL(devUrl);
-          return parsed.origin === parsedDev.origin;
-        } catch {
-          // ignore
-        }
+    // The window loads the Vite dev server only when ELECTRON_RENDERER_URL is set (dev); otherwise it always
+    // loads the bundled renderer from file:// (packaged app, or `electron .` after a build). Navigation and
+    // window.open are blocked, so no other page can be in this frame.
+    const devUrl = isDev ? process.env['ELECTRON_RENDERER_URL'] : undefined;
+    if (devUrl) {
+      try {
+        return parsed.origin === new URL(devUrl).origin;
+      } catch {
+        return false;
       }
-      return (
-        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
-      );
-    } else {
-      return parsed.protocol === 'file:';
     }
+    return parsed.protocol === 'file:';
   } catch {
     return false;
   }

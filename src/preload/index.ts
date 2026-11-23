@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { PodApi } from '../shared/ipc';
-import { IPC } from '../shared/ipc';
+import { IPC } from '../shared/ipc-channels';
 
 const api: PodApi = {
   app: {
