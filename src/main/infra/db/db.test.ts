@@ -411,6 +411,60 @@ describe('Database and Repositories', () => {
       db.close();
     });
 
+    it('(a) failing transaction followed by a normal insert -> close + reopen file db -> the insert is persisted', () => {
+      const dbPath = path.join(tmpDir, 'test_tx_rollback.db');
+      let db = openDatabase(dbPath);
+
+      // Failing transaction
+      expect(() => {
+        db.transaction(() => {
+          db.products.upsertBySku({ sku: 'FAIL-1', category: 't-shirt', productName: 'Failed' });
+          throw new Error('tx failed');
+        });
+      }).toThrow('tx failed');
+
+      // Normal insert outside transaction
+      db.products.upsertBySku({ sku: 'PERSIST-1', category: 't-shirt', productName: 'Persisted' });
+
+      // Close and reopen
+      db.close();
+      db = openDatabase(dbPath);
+
+      expect(db.products.getBySku('FAIL-1')).toBeNull();
+      const persisted = db.products.getBySku('PERSIST-1');
+      expect(persisted).not.toBeNull();
+      expect(persisted?.productName).toBe('Persisted');
+      db.close();
+    });
+
+    it('(b) nested transaction where inner throws and outer catches -> outer writes persist', () => {
+      const dbPath = path.join(tmpDir, 'test_tx_nested.db');
+      let db = openDatabase(dbPath);
+
+      db.transaction(() => {
+        db.products.upsertBySku({ sku: 'OUTER-1', category: 't-shirt', productName: 'Outer 1' });
+
+        try {
+          db.transaction(() => {
+            db.products.upsertBySku({ sku: 'INNER-FAIL', category: 't-shirt', productName: 'Inner' });
+            throw new Error('inner failure');
+          });
+        } catch {
+          // outer catches inner failure
+        }
+
+        db.products.upsertBySku({ sku: 'OUTER-2', category: 't-shirt', productName: 'Outer 2' });
+      });
+
+      db.close();
+      db = openDatabase(dbPath);
+
+      expect(db.products.getBySku('INNER-FAIL')).toBeNull();
+      expect(db.products.getBySku('OUTER-1')?.productName).toBe('Outer 1');
+      expect(db.products.getBySku('OUTER-2')?.productName).toBe('Outer 2');
+      db.close();
+    });
+
     it('backup and restore round trip preserves rows', async () => {
       const livePath = path.join(tmpDir, 'live.db');
       const backupPath = path.join(tmpDir, 'backup.db');

@@ -222,7 +222,7 @@ export async function validateImageHeader(
   try {
     stat = fs.statSync(absPath);
   } catch (err) {
-    throw new PodError('INVALID_IMAGE', `Could not access file: ${String(err)}`);
+    throw new PodError('INVALID_IMAGE', 'Could not access image file', { cause: err });
   }
 
   if (stat.size === 0) {
@@ -231,7 +231,7 @@ export async function validateImageHeader(
 
   // Enforce maxSourceBytes BEFORE reading file
   if (stat.size > maxSourceBytes) {
-    throw new PodError('IMAGE_TOO_LARGE', `Image size (${stat.size} bytes) exceeds limit (${maxSourceBytes} bytes)`);
+    throw new PodError('IMAGE_TOO_LARGE', 'Image file exceeds maximum byte size limit');
   }
 
   // Read only initial header bytes (up to 64KB for JPEG SOF marker or full file if smaller)
@@ -254,10 +254,7 @@ export async function validateImageHeader(
   // Enforce maxSourcePixels BEFORE reading the whole file (decompression bomb guard)
   const totalPixels = parsed.width * parsed.height;
   if (totalPixels > maxSourcePixels) {
-    throw new PodError(
-      'IMAGE_TOO_LARGE',
-      `Image pixel count (${parsed.width}x${parsed.height} = ${totalPixels}) exceeds limit (${maxSourcePixels})`,
-    );
+    throw new PodError('IMAGE_TOO_LARGE', 'Image dimensions exceed maximum pixel limit');
   }
 
   return {

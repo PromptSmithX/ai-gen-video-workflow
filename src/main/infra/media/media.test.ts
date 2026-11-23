@@ -392,6 +392,33 @@ describe('Media Library and Safe Storage', () => {
       const f3 = await media.importSourceImage(srcFile, 'TS-001');
       expect(f3.relPath).toBe('TS-001/source/TS-001-original-3.png');
     });
+
+    it('validates copied file and deletes copy if validation fails', async () => {
+      // Create a valid image file
+      const pngBuf = buildPngBuffer(100, 100);
+      const srcFile = path.join(tmpDir, 'valid.png');
+      fs.writeFileSync(srcFile, pngBuf);
+
+      // Spy on validateImage: succeed on initial call, fail on copy validation
+      let callCount = 0;
+      const originalValidate = media.validateImage.bind(media);
+      media.validateImage = async (p: string) => {
+        callCount++;
+        if (callCount === 2) {
+          throw new PodError('INVALID_IMAGE', 'Corrupted on copy');
+        }
+        return originalValidate(p);
+      };
+
+      await expect(media.importSourceImage(srcFile, 'TS-009')).rejects.toThrow(PodError);
+
+      // Verify that no copy remains in TS-009/source
+      const targetCopy = path.join(rootDir, 'TS-009', 'source', 'TS-009-original.png');
+      expect(fs.existsSync(targetCopy)).toBe(false);
+
+      // Restore validateImage
+      media.validateImage = originalValidate;
+    });
   });
 
   describe('storeVideo increments and cleanup', () => {
@@ -408,10 +435,40 @@ describe('Media Library and Safe Storage', () => {
       const v2 = await media.storeVideo(part2, 'TS-002');
       expect(v2.relPath).toBe('TS-002/videos/TS-002-video-002.mp4');
     });
+
+    it('pre-create video-002 with a gap (001 missing) -> next is 003', async () => {
+      const mp4Buf = buildMinimalMp4Buffer();
+      const skuVideosDir = path.join(rootDir, 'GAP-001', 'videos');
+      fs.mkdirSync(skuVideosDir, { recursive: true });
+
+      // Pre-create 002 with a gap (001 missing)
+      fs.writeFileSync(path.join(skuVideosDir, 'GAP-001-video-002.mp4'), mp4Buf);
+
+      const part = media.newTempPath();
+      fs.writeFileSync(part, mp4Buf);
+      const v = await media.storeVideo(part, 'GAP-001');
+      expect(v.relPath).toBe('GAP-001/videos/GAP-001-video-003.mp4');
+    });
+
+    it('pre-create 001 and an unrelated file -> 002', async () => {
+      const mp4Buf = buildMinimalMp4Buffer();
+      const skuVideosDir = path.join(rootDir, 'UNRELATED-001', 'videos');
+      fs.mkdirSync(skuVideosDir, { recursive: true });
+
+      // Pre-create 001 and an unrelated file
+      fs.writeFileSync(path.join(skuVideosDir, 'UNRELATED-001-video-001.mp4'), mp4Buf);
+      fs.writeFileSync(path.join(skuVideosDir, 'random-notes.txt'), 'notes');
+      fs.writeFileSync(path.join(skuVideosDir, 'UNRELATED-001-video-abc.mp4'), 'not numeric');
+
+      const part = media.newTempPath();
+      fs.writeFileSync(part, mp4Buf);
+      const v = await media.storeVideo(part, 'UNRELATED-001');
+      expect(v.relPath).toBe('UNRELATED-001/videos/UNRELATED-001-video-002.mp4');
+    });
   });
 
   describe('writeMetadata and writePromptSnapshot', () => {
-    it('writes pretty JSON metadata without auto-opening', async () => {
+    it('writes pretty JSON metadata atomically without auto-opening', async () => {
       const meta = { job: '123', status: 'done', tags: ['a', 'b'] };
       const stored = await media.writeMetadata('TS-001', 'TS-001-video-001', meta);
 
@@ -419,15 +476,37 @@ describe('Media Library and Safe Storage', () => {
       const text = fs.readFileSync(stored.absPath, 'utf8');
       expect(JSON.parse(text)).toEqual(meta);
       expect(text).toContain('\n  "job": "123"');
+
+      // Verify no leftover .tmp files
+      const metaDir = path.join(rootDir, 'TS-001', 'metadata');
+      const tmpFiles = fs.readdirSync(metaDir).filter((f) => f.endsWith('.tmp'));
+      expect(tmpFiles).toHaveLength(0);
     });
 
-    it('writes UTF-8 markdown prompt snapshot', async () => {
-      const prompt = '# Prompt\n\nA product review video for TS-001';
-      const stored = await media.writePromptSnapshot('TS-001', 'v2', prompt);
+    it('writes UTF-8 markdown prompt snapshot atomically and appends -2, -3 on duplicates', async () => {
+      const prompt1 = '# Prompt V1\n\nA product review video for TS-001';
+      const stored1 = await media.writePromptSnapshot('TS-001', 'v2', prompt1);
 
-      expect(stored.relPath).toBe('TS-001/prompts/TS-001-prompt-v2.md');
-      const text = fs.readFileSync(stored.absPath, 'utf8');
-      expect(text).toBe(prompt);
+      expect(stored1.relPath).toBe('TS-001/prompts/TS-001-prompt-v2.md');
+      expect(fs.readFileSync(stored1.absPath, 'utf8')).toBe(prompt1);
+
+      // Second write with same SKU and label -> appends -2 (never silently overwrites)
+      const prompt2 = '# Prompt V2 Revised\n\nUpdated prompt';
+      const stored2 = await media.writePromptSnapshot('TS-001', 'v2', prompt2);
+
+      expect(stored2.relPath).toBe('TS-001/prompts/TS-001-prompt-v2-2.md');
+      expect(fs.readFileSync(stored2.absPath, 'utf8')).toBe(prompt2);
+      expect(fs.readFileSync(stored1.absPath, 'utf8')).toBe(prompt1); // Original unchanged
+
+      // Third write -> appends -3
+      const prompt3 = '# Prompt V2 Third';
+      const stored3 = await media.writePromptSnapshot('TS-001', 'v2', prompt3);
+      expect(stored3.relPath).toBe('TS-001/prompts/TS-001-prompt-v2-3.md');
+
+      // Verify no leftover .tmp files
+      const promptsDir = path.join(rootDir, 'TS-001', 'prompts');
+      const tmpFiles = fs.readdirSync(promptsDir).filter((f) => f.endsWith('.tmp'));
+      expect(tmpFiles).toHaveLength(0);
     });
   });
 

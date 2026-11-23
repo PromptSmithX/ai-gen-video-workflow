@@ -75,7 +75,7 @@ export class SqliteJobRepository implements JobRepository {
     // Check if idempotency key already exists
     const existing = this.findByIdempotencyKey(job.idempotencyKey);
     if (existing) {
-      throw new PodError('INVALID_STATE', `Duplicate idempotency key: ${job.idempotencyKey}`);
+      throw new PodError('INVALID_STATE', 'Duplicate idempotency key');
     }
 
     const now = nowIso();
@@ -136,7 +136,7 @@ export class SqliteJobRepository implements JobRepository {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('UNIQUE constraint failed') && msg.includes('idempotency_key')) {
-        throw new PodError('INVALID_STATE', `Duplicate idempotency key: ${job.idempotencyKey}`);
+        throw new PodError('INVALID_STATE', 'Duplicate idempotency key');
       }
       throw err;
     }
@@ -241,7 +241,7 @@ export class SqliteJobRepository implements JobRepository {
   transition(id: string, to: JobState, patch?: JobPatch): Job {
     const current = this.getById(id);
     if (!current) {
-      throw new PodError('NOT_FOUND', `Job ${id} not found`);
+      throw new PodError('NOT_FOUND', 'Job not found');
     }
 
     if (!canTransition(current.state, to)) {
@@ -309,7 +309,7 @@ export class SqliteJobRepository implements JobRepository {
     if (result.changes !== 1) {
       throw new PodError(
         'INVALID_STATE',
-        `Job ${id} state changed concurrently or transition failed (expected state ${current.state})`,
+        `Job state changed concurrently or transition failed (expected state ${current.state})`,
       );
     }
 
@@ -319,7 +319,7 @@ export class SqliteJobRepository implements JobRepository {
   update(id: string, patch: JobPatch): Job {
     const current = this.getById(id);
     if (!current) {
-      throw new PodError('NOT_FOUND', `Job ${id} not found`);
+      throw new PodError('NOT_FOUND', 'Job not found');
     }
 
     const setClauses: string[] = ['updated_at = ?'];

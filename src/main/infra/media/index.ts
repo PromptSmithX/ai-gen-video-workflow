@@ -75,7 +75,7 @@ export class DefaultMediaLibrary implements MediaLibrary {
   async importSourceImage(absPath: string, sku: string): Promise<StoredFile> {
     const normalizedSku = normalizeSku(sku);
     if (!normalizedSku) {
-      throw new PodError('INVALID_SKU', `Invalid SKU format: ${String(sku)}`);
+      throw new PodError('INVALID_SKU', 'Invalid SKU format');
     }
 
     const info = await this.validateImage(absPath);
@@ -101,24 +101,37 @@ export class DefaultMediaLibrary implements MediaLibrary {
     // Byte-identical copy
     fs.copyFileSync(absPath, targetAbs);
 
+    // Validate the COPIED file (signature/size/pixels) to prevent TOCTOU file-swapping
+    let validatedCopyInfo: ImageInfo;
+    try {
+      validatedCopyInfo = await this.validateImage(targetAbs);
+    } catch (err) {
+      try {
+        fs.unlinkSync(targetAbs);
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+
     const sha256 = await hashFile(targetAbs);
     const relPath = path.relative(this.root, targetAbs).replace(/\\/g, '/');
 
     return {
       relPath,
       absPath: targetAbs,
-      mime: info.mime,
-      bytes: info.bytes,
+      mime: validatedCopyInfo.mime,
+      bytes: validatedCopyInfo.bytes,
       sha256,
-      width: info.width,
-      height: info.height,
+      width: validatedCopyInfo.width,
+      height: validatedCopyInfo.height,
     };
   }
 
   writePromptSnapshot(sku: string, label: string, text: string): Promise<StoredFile> {
     const normalizedSku = normalizeSku(sku);
     if (!normalizedSku) {
-      throw new PodError('INVALID_SKU', `Invalid SKU format: ${String(sku)}`);
+      throw new PodError('INVALID_SKU', 'Invalid SKU format');
     }
 
     const skuRoot = this.skuDir(normalizedSku);
@@ -127,11 +140,33 @@ export class DefaultMediaLibrary implements MediaLibrary {
 
     // Sanitize label
     const safeLabel = label.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const filename = `${normalizedSku}-prompt-${safeLabel}.md`;
-    const targetAbs = path.join(promptsDir, filename);
+    let filename = `${normalizedSku}-prompt-${safeLabel}.md`;
+    let targetAbs = path.join(promptsDir, filename);
+
+    if (fs.existsSync(targetAbs)) {
+      let counter = 2;
+      while (fs.existsSync(targetAbs)) {
+        filename = `${normalizedSku}-prompt-${safeLabel}-${counter}.md`;
+        targetAbs = path.join(promptsDir, filename);
+        counter++;
+      }
+    }
 
     const buf = Buffer.from(text, 'utf8');
-    fs.writeFileSync(targetAbs, buf);
+
+    // Atomic write: write to temp file in same folder, then rename
+    const tempFile = path.join(promptsDir, `.${normalizedSku}-prompt-${safeLabel}.${newId()}.tmp`);
+    try {
+      fs.writeFileSync(tempFile, buf);
+      fs.renameSync(tempFile, targetAbs);
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+      } catch {
+        // ignore
+      }
+      throw new PodError('INTERNAL', 'Failed to write prompt snapshot', { cause: err });
+    }
 
     const relPath = path.relative(this.root, targetAbs).replace(/\\/g, '/');
     const sha256 = hashBuffer(buf);
@@ -204,46 +239,71 @@ export class DefaultMediaLibrary implements MediaLibrary {
       // ignore
     }
 
-    const nextNum = maxNum + 1;
-    const filename = `${normalizedSku}-video-${String(nextNum).padStart(3, '0')}.mp4`;
-    const targetAbs = path.join(videosDir, filename);
+    let nextNum = maxNum + 1;
+    let filename = `${normalizedSku}-video-${String(nextNum).padStart(3, '0')}.mp4`;
+    let targetAbs = path.join(videosDir, filename);
 
-    // Atomic move via rename, or copy+fsync+rename when cross-volume (EXDEV)
-    try {
-      fs.renameSync(tempPartPath, targetAbs);
-    } catch (err: unknown) {
-      const code = (err as { code?: string })?.code;
-      if (code === 'EXDEV') {
-        try {
-          fs.copyFileSync(tempPartPath, targetAbs);
-          const fd = fs.openSync(targetAbs, 'r+');
+    // Bump nextNum if target already exists (never overwrite) and retry on concurrent creation
+    let moved = false;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      while (fs.existsSync(targetAbs)) {
+        nextNum++;
+        filename = `${normalizedSku}-video-${String(nextNum).padStart(3, '0')}.mp4`;
+        targetAbs = path.join(videosDir, filename);
+      }
+
+      try {
+        fs.renameSync(tempPartPath, targetAbs);
+        moved = true;
+        break;
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code;
+        if (code === 'EXDEV') {
           try {
-            fs.fsyncSync(fd);
-          } finally {
-            fs.closeSync(fd);
+            fs.copyFileSync(tempPartPath, targetAbs);
+            const fd = fs.openSync(targetAbs, 'r+');
+            try {
+              fs.fsyncSync(fd);
+            } finally {
+              fs.closeSync(fd);
+            }
+            fs.unlinkSync(tempPartPath);
+            moved = true;
+            break;
+          } catch (copyErr) {
+            try {
+              fs.unlinkSync(tempPartPath);
+            } catch {
+              // ignore
+            }
+            try {
+              if (fs.existsSync(targetAbs)) fs.unlinkSync(targetAbs);
+            } catch {
+              // ignore
+            }
+            throw new PodError('DOWNLOAD_FAILED', 'Failed to store video across devices', { cause: copyErr });
           }
-          fs.unlinkSync(tempPartPath);
-        } catch (copyErr) {
+        } else if (fs.existsSync(targetAbs)) {
+          // Target appeared between check and rename, bump and retry
+          continue;
+        } else {
           try {
             fs.unlinkSync(tempPartPath);
           } catch {
             // ignore
           }
-          try {
-            if (fs.existsSync(targetAbs)) fs.unlinkSync(targetAbs);
-          } catch {
-            // ignore
-          }
-          throw new PodError('DOWNLOAD_FAILED', 'Failed to store video across devices', { cause: copyErr });
+          throw new PodError('DOWNLOAD_FAILED', 'Failed to store video', { cause: err });
         }
-      } else {
-        try {
-          fs.unlinkSync(tempPartPath);
-        } catch {
-          // ignore
-        }
-        throw new PodError('DOWNLOAD_FAILED', 'Failed to store video', { cause: err });
       }
+    }
+
+    if (!moved) {
+      try {
+        fs.unlinkSync(tempPartPath);
+      } catch {
+        // ignore
+      }
+      throw new PodError('DOWNLOAD_FAILED', 'Failed to allocate available video filename');
     }
 
     const relPath = path.relative(this.root, targetAbs).replace(/\\/g, '/');
@@ -262,7 +322,7 @@ export class DefaultMediaLibrary implements MediaLibrary {
   writeMetadata(sku: string, baseName: string, data: Record<string, unknown>): Promise<StoredFile> {
     const normalizedSku = normalizeSku(sku);
     if (!normalizedSku) {
-      throw new PodError('INVALID_SKU', `Invalid SKU format: ${String(sku)}`);
+      throw new PodError('INVALID_SKU', 'Invalid SKU format');
     }
 
     const skuRoot = this.skuDir(normalizedSku);
@@ -275,7 +335,20 @@ export class DefaultMediaLibrary implements MediaLibrary {
 
     const jsonText = JSON.stringify(data, null, 2) + '\n';
     const buf = Buffer.from(jsonText, 'utf8');
-    fs.writeFileSync(targetAbs, buf);
+
+    // Atomic write: write to temp file in same folder, then rename
+    const tempFile = path.join(metadataDir, `.${cleanBase}.${newId()}.tmp`);
+    try {
+      fs.writeFileSync(tempFile, buf);
+      fs.renameSync(tempFile, targetAbs);
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+      } catch {
+        // ignore
+      }
+      throw new PodError('INTERNAL', 'Failed to write metadata', { cause: err });
+    }
 
     const relPath = path.relative(this.root, targetAbs).replace(/\\/g, '/');
     const sha256 = hashBuffer(buf);

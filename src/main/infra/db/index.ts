@@ -48,7 +48,7 @@ export function openDatabase(filePath: string): PodDatabase {
   const assetsRepo: AssetRepository = new SqliteAssetRepository(db);
   const settingsRepo: SettingsRepository = new SqliteSettingsRepository(db);
 
-  let txDepth = 0;
+  let savepointCounter = 0;
 
   return {
     get products(): ProductRepository {
@@ -64,17 +64,15 @@ export function openDatabase(filePath: string): PodDatabase {
       return settingsRepo;
     },
     transaction<T>(fn: () => T): T {
-      const sp = `tx_${txDepth++}`;
+      const sp = `tx_${++savepointCounter}`;
       db.exec(`SAVEPOINT ${sp}`);
       try {
         const result = fn();
         db.exec(`RELEASE SAVEPOINT ${sp}`);
         return result;
       } catch (err) {
-        db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+        db.exec(`ROLLBACK TO SAVEPOINT ${sp}; RELEASE SAVEPOINT ${sp};`);
         throw err;
-      } finally {
-        txDepth--;
       }
     },
     async backup(destPath: string): Promise<void> {

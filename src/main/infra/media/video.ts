@@ -12,7 +12,7 @@ export async function validateMp4Video(absPath: string, maxVideoBytes: number): 
   try {
     stat = fs.statSync(absPath);
   } catch (err) {
-    throw new PodError('DOWNLOAD_FAILED', `Could not access video file: ${String(err)}`);
+    throw new PodError('DOWNLOAD_FAILED', 'Could not access video file', { cause: err });
   }
 
   if (stat.size < 8) {
@@ -20,7 +20,7 @@ export async function validateMp4Video(absPath: string, maxVideoBytes: number): 
   }
 
   if (stat.size > maxVideoBytes) {
-    throw new PodError('DOWNLOAD_FAILED', `Video size (${stat.size}) exceeds limit (${maxVideoBytes})`);
+    throw new PodError('DOWNLOAD_FAILED', 'Video file exceeds maximum size limit');
   }
 
   // Open file to walk box headers

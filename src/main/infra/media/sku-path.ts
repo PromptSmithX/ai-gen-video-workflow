@@ -28,7 +28,7 @@ function isInside(parent: string, child: string): boolean {
 export function getSkuDir(root: string, sku: string): string {
   const normalized = normalizeSku(sku);
   if (!normalized) {
-    throw new PodError('INVALID_SKU', `Invalid SKU format: ${String(sku)}`);
+    throw new PodError('INVALID_SKU', 'Invalid SKU format');
   }
 
   const skuPath = path.join(root, normalized);
