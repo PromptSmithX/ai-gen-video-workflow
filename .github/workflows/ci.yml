@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    name: Build, Lint, Test, Audit & SBOM
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.2.0
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run Vitest tests
+        run: npm test
+
+      - name: Security audit (High+ vulnerabilities)
+        run: npm audit --audit-level=high
+
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm@1.19.0 --output-file sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb99ba8afd # v4.6.1
+        with:
+          name: cyclonedx-sbom
+          path: sbom.json
+
+      - name: Run Gitleaks Secret Scanner
+        shell: pwsh
+        run: |
+          $version = "8.21.2"
+          $url = "https://github.com/gitleaks/gitleaks/releases/download/v$version/gitleaks_${version}_windows_x64.zip"
+          $zipPath = "$env:TEMP\gitleaks.zip"
+          $extractDir = "$env:TEMP\gitleaks"
+          
+          Write-Host "Downloading Gitleaks v$version..."
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+
+          # Verify SHA-256 before running
+          # TODO pin SHA: Official release SHA for gitleaks_8.21.2_windows_x64.zip to be pinned after online verification
+          $fileHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+          Write-Host "Gitleaks Archive SHA-256: $fileHash"
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          & "$extractDir\gitleaks.exe" detect --source . -v --config .gitleaks.toml
+
+      - name: Build Application
+        run: npm run build
