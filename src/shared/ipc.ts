@@ -1,0 +1,259 @@
+/**
+ * Renderer <-> main contract. The renderer only sees `window.api: PodApi` (exposed by src/preload).
+ * Every call resolves to IpcResult<T>; main validates every payload with the zod schemas below.
+ * The renderer never receives absolute file paths, tokens, cookies or prompt digests of other users.
+ */
+import { z } from 'zod';
+import type { AdminSettings, ProviderMode } from './config';
+import type { Category, ImageInfo, Job, ReviewStatus } from './domain';
+import type { IpcResult } from './errors';
+import type { JobState } from './job-state';
+import type { AspectRatio, ProviderCapabilities, ProviderConnectionState } from './provider';
+import type { PromptTemplate, PromptTemplateSummary, RenderedPrompt } from './prompt';
+import { ASPECT_RATIOS } from './provider';
+
+/** Custom protocol for previews: pod-media://asset/<assetId> and pod-media://staged/<token>. */
+export const MEDIA_PROTOCOL = 'pod-media';
+
+export const IPC = {
+  appGetInfo: 'app:getInfo',
+  providerGetStatus: 'provider:getStatus',
+  providerTestConnection: 'provider:testConnection',
+  imagesPick: 'images:pick',
+  imagesStagePath: 'images:stagePath',
+  catalogListCategories: 'catalog:listCategories',
+  promptsListTemplates: 'prompts:listTemplates',
+  promptsGetTemplate: 'prompts:getTemplate',
+  promptsPreview: 'prompts:preview',
+  promptsValidate: 'prompts:validate',
+  promptsSaveVersion: 'prompts:saveVersion',
+  promptsSetDefault: 'prompts:setDefault',
+  jobsCreate: 'jobs:create',
+  jobsList: 'jobs:list',
+  jobsGet: 'jobs:get',
+  jobsRetry: 'jobs:retry',
+  jobsRegenerate: 'jobs:regenerate',
+  jobsResolveAmbiguous: 'jobs:resolveAmbiguous',
+  jobsRetryDownload: 'jobs:retryDownload',
+  jobsCancel: 'jobs:cancel',
+  jobsSetReview: 'jobs:setReview',
+  libraryOpenFolder: 'library:openFolder',
+  libraryCopyPath: 'library:copyPath',
+  adminGetSettings: 'admin:getSettings',
+  adminUpdateSettings: 'admin:updateSettings',
+  adminSetBridgeApiKey: 'admin:setBridgeApiKey',
+  adminClearBridgeApiKey: 'admin:clearBridgeApiKey',
+  adminDiagnosticsPreview: 'admin:diagnosticsPreview',
+  adminDiagnosticsExport: 'admin:diagnosticsExport',
+  adminRunCleanup: 'admin:runCleanup',
+  /** main -> renderer push event */
+  jobsUpdated: 'jobs:updated',
+} as const;
+
+export type IpcChannel = (typeof IPC)[keyof typeof IPC];
+
+// ------------------------------------------------- view models -------------------------------------------------
+
+export interface AppInfo {
+  version: string;
+  employeeId: string;
+  isAdmin: boolean;
+  providerMode: ProviderMode;
+  isDev: boolean;
+}
+
+export type PlatformCompatibility = 'compatible' | 'unverified' | 'not_compatible';
+
+export interface ProviderStatus {
+  mode: ProviderMode;
+  state: ProviderConnectionState;
+  capabilities: ProviderCapabilities | null;
+  /** Origin recorded in config; null = not yet recorded (compatibility gate pending). */
+  platformOrigin: string | null;
+  bridgeBaseUrl: string | null;
+  compatibility: PlatformCompatibility;
+  hasApiKey: boolean;
+  secretStoreAvailable: boolean;
+  checkedAt: string;
+}
+
+/** A validated image staged in main; the renderer only holds the opaque token. */
+export interface StagedImage {
+  token: string;
+  fileName: string;
+  info: ImageInfo;
+  /** pod-media://staged/<token> */
+  previewUrl: string;
+}
+
+export type JobNextAction =
+  | 'none'
+  | 'retry' // FAILED_RETRYABLE, or FAILED_PROVIDER with attempt < 2 (one manual retry)
+  | 'check_ambiguous' // AMBIGUOUS: reconcile or mark failed — never auto resubmit
+  | 'retry_download' // DOWNLOAD_FAILED
+  | 'regenerate' // terminal states: new job after explicit confirm
+  | 'cancel'; // only when provider canCancel and job is RUNNING/QUEUED
+
+export interface JobView {
+  job: Job;
+  stateLabel: string;
+  category: string;
+  productName: string | null;
+  /** pod-media://asset/<id> */
+  sourceUrl: string | null;
+  videoUrl: string | null;
+  videoAssetId: string | null;
+  elapsedMs: number;
+  /** Only when the provider genuinely reports it. */
+  progress: number | null;
+  nextActions: JobNextAction[];
+}
+
+export interface DiagnosticsPreview {
+  /** Redacted text exactly as it would be exported. */
+  content: string;
+  generatedAt: string;
+}
+
+// ------------------------------------------------- input schemas -------------------------------------------------
+
+const uuid = z.uuid();
+const sku = z.string().trim().min(1).max(64);
+
+export const PromptPreviewInput = z.object({
+  templateId: z.string().min(1).max(100),
+  templateVersion: z.string().min(1).max(50).optional(),
+  sku,
+  categoryId: z.string().min(1).max(64),
+  productName: z.string().trim().max(200).optional(),
+  fileName: z.string().max(255).optional(),
+  reviewStyle: z.string().trim().max(200).optional(),
+  durationSeconds: z.number().int().positive().max(600).optional(),
+  aspectRatio: z.enum(ASPECT_RATIOS).optional(),
+});
+export type PromptPreviewInput = z.infer<typeof PromptPreviewInput>;
+
+export const CreateJobInput = PromptPreviewInput.extend({
+  /** Generated by the renderer once per Generate click; becomes the job's idempotency key. */
+  clientRequestId: uuid,
+  sourceToken: z.string().min(1).max(100),
+  templateVersion: z.string().min(1).max(50),
+  /** Employee-edited prompt; validated by main. Omit = rendered template. */
+  promptOverride: z.string().max(20000).optional(),
+});
+export type CreateJobInput = z.infer<typeof CreateJobInput>;
+
+export const JobListInput = z.object({
+  sku: z.string().trim().max(64).optional(),
+  categoryId: z.string().max(64).optional(),
+  employeeId: z.string().max(200).optional(),
+  states: z.array(z.string()).max(20).optional(),
+  templateVersion: z.string().max(50).optional(),
+  reviewStatus: z.enum(['pending', 'approved', 'rejected']).optional(),
+  from: z.string().max(40).optional(),
+  to: z.string().max(40).optional(),
+  limit: z.number().int().positive().max(500).optional(),
+  offset: z.number().int().nonnegative().optional(),
+});
+export type JobListInput = z.infer<typeof JobListInput>;
+
+export const JobIdInput = z.object({ jobId: uuid });
+export const RetryJobInput = z.object({ jobId: uuid, acknowledged: z.literal(true) });
+export const RegenerateJobInput = z.object({ jobId: uuid, confirmed: z.literal(true), clientRequestId: uuid });
+export const ResolveAmbiguousInput = z.object({
+  jobId: uuid,
+  /** 'check_again' = reconcile with provider (no submit). 'mark_failed' = user confirmed nothing was generated. */
+  resolution: z.enum(['check_again', 'mark_failed']),
+});
+export const SetReviewInput = z.object({ jobId: uuid, status: z.enum(['pending', 'approved', 'rejected']) });
+export const StagePathInput = z.object({ path: z.string().min(1).max(4096) });
+export const GetTemplateInput = z.object({ id: z.string().min(1).max(100), version: z.string().max(50).optional() });
+export const SaveTemplateVersionInput = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  title: z.string().max(200).optional(),
+  body: z.string().min(1).max(20000),
+  note: z.string().max(500).optional(),
+});
+export const SetDefaultTemplateInput = z.object({ id: z.string().min(1).max(100), version: z.string().min(1).max(50) });
+export const ValidatePromptInput = z.object({ text: z.string().max(20000) });
+
+export const CategorySchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
+  label: z.string().min(1).max(100),
+  promptGroup: z.enum(['apparel', 'drinkware', 'home-decor', 'other']),
+});
+
+export const UpdateSettingsInput = z
+  .object({
+    bridgeBaseUrl: z.string().max(200).nullable(),
+    musePlatformOrigin: z.string().max(200).nullable(),
+    libraryRoot: z.string().min(1).max(1024),
+    logRetentionDays: z.number().int().min(1).max(365),
+    categories: z.array(CategorySchema).min(1).max(200),
+    adminUsers: z.array(z.string().min(1).max(200)).max(100),
+    defaultTemplateId: z.string().max(100).nullable(),
+    defaultTemplateVersion: z.string().max(50).nullable(),
+  })
+  .partial();
+export const SetApiKeyInput = z.object({ apiKey: z.string().min(1).max(1024) });
+
+// ------------------------------------------------- window.api -------------------------------------------------
+
+export interface PodApi {
+  app: {
+    getInfo(): Promise<IpcResult<AppInfo>>;
+  };
+  provider: {
+    getStatus(): Promise<IpcResult<ProviderStatus>>;
+    testConnection(): Promise<IpcResult<ProviderStatus>>;
+  };
+  images: {
+    /** Opens a native file dialog (PNG/JPEG/WEBP). null data = cancelled. */
+    pick(): Promise<IpcResult<StagedImage | null>>;
+    /** For drag & drop: preload resolves the File to a path via webUtils and stages it. */
+    stageFile(file: File): Promise<IpcResult<StagedImage>>;
+  };
+  catalog: {
+    listCategories(): Promise<IpcResult<Category[]>>;
+  };
+  prompts: {
+    listTemplates(): Promise<IpcResult<PromptTemplateSummary[]>>;
+    getTemplate(input: z.infer<typeof GetTemplateInput>): Promise<IpcResult<PromptTemplate>>;
+    preview(input: PromptPreviewInput): Promise<IpcResult<RenderedPrompt>>;
+    validate(input: z.infer<typeof ValidatePromptInput>): Promise<IpcResult<RenderedPrompt>>;
+    saveVersion(input: z.infer<typeof SaveTemplateVersionInput>): Promise<IpcResult<PromptTemplateSummary>>;
+    setDefault(input: z.infer<typeof SetDefaultTemplateInput>): Promise<IpcResult<void>>;
+  };
+  jobs: {
+    /** Idempotent per clientRequestId: a duplicate call returns the existing job. */
+    create(input: CreateJobInput): Promise<IpcResult<JobView>>;
+    list(input?: JobListInput): Promise<IpcResult<JobView[]>>;
+    get(input: z.infer<typeof JobIdInput>): Promise<IpcResult<JobView>>;
+    retry(input: z.infer<typeof RetryJobInput>): Promise<IpcResult<JobView>>;
+    regenerate(input: z.infer<typeof RegenerateJobInput>): Promise<IpcResult<JobView>>;
+    resolveAmbiguous(input: z.infer<typeof ResolveAmbiguousInput>): Promise<IpcResult<JobView>>;
+    retryDownload(input: z.infer<typeof JobIdInput>): Promise<IpcResult<JobView>>;
+    cancel(input: z.infer<typeof JobIdInput>): Promise<IpcResult<JobView>>;
+    setReview(input: z.infer<typeof SetReviewInput>): Promise<IpcResult<JobView>>;
+    /** Push updates; returns unsubscribe. */
+    onUpdated(listener: (view: JobView) => void): () => void;
+  };
+  library: {
+    /** Opens the SKU folder in Explorer (never opens/executes the media file itself). */
+    openFolder(input: z.infer<typeof JobIdInput>): Promise<IpcResult<void>>;
+    /** Copies the video's absolute path to the clipboard (path never returned to the renderer). */
+    copyPath(input: z.infer<typeof JobIdInput>): Promise<IpcResult<void>>;
+  };
+  admin: {
+    getSettings(): Promise<IpcResult<AdminSettings>>;
+    updateSettings(input: z.infer<typeof UpdateSettingsInput>): Promise<IpcResult<AdminSettings>>;
+    setBridgeApiKey(input: z.infer<typeof SetApiKeyInput>): Promise<IpcResult<void>>;
+    clearBridgeApiKey(): Promise<IpcResult<void>>;
+    diagnosticsPreview(): Promise<IpcResult<DiagnosticsPreview>>;
+    /** Shows a save dialog and writes the previewed, redacted diagnostics. */
+    diagnosticsExport(): Promise<IpcResult<{ saved: boolean }>>;
+    runCleanup(): Promise<IpcResult<{ removedLogFiles: number; removedTempFiles: number }>>;
+  };
+}
+
+export type { AspectRatio, JobState, ReviewStatus };
