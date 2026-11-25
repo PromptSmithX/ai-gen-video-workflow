@@ -105,7 +105,7 @@ export function assertDataDir(dataDir: string): void {
 const categorySchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
-  promptGroup: z.enum(['apparel', 'drinkware', 'home-decor', 'other']),
+  promptGroup: z.enum(['apparel', 'drinkware', 'home-decor', 'calendar', 'other']),
 });
 
 const numberBoundsSchema = z.object({

@@ -72,6 +72,11 @@ export class DefaultMediaLibrary implements MediaLibrary {
     return validateImageHeader(absPath, this.maxSourceBytes, this.maxSourcePixels);
   }
 
+  // TODO(CAL-1): implement — contract stub locked by lead.
+  async importInteriorArtwork(_absPath: string, _sku: string): Promise<StoredFile> {
+    throw new PodError('INTERNAL', 'Interior artwork import is not implemented yet');
+  }
+
   async importSourceImage(absPath: string, sku: string): Promise<StoredFile> {
     const normalizedSku = normalizeSku(sku);
     if (!normalizedSku) {

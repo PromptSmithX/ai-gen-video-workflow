@@ -140,6 +140,11 @@ export interface MediaLibrary {
   validateImage(absPath: string): Promise<ImageInfo>;
   /** Byte-identical copy into <SKU>/source/<SKU>-original[-N].<ext>. Never recompresses. */
   importSourceImage(absPath: string, sku: string): Promise<StoredFile>;
+  /**
+   * Calendar interior artwork: same validation and path safety as importSourceImage, byte-identical copy into
+   * <SKU>/source/<SKU>-interior-artwork[-N].<ext>, SHA-256 computed. Never resized/re-encoded.
+   */
+  importInteriorArtwork(absPath: string, sku: string): Promise<StoredFile>;
   /** Writes <SKU>/prompts/<SKU>-prompt-<label>.md */
   writePromptSnapshot(sku: string, label: string, text: string): Promise<StoredFile>;
   /** New unique temp file path (in the private temp dir) ending in `.part`. */
@@ -226,4 +231,44 @@ export type MuseProviderFactory = (deps: ProviderFactoryDeps) => MuseProvider;
 export interface JobFailure {
   code: ErrorCode;
   message: string;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Calendar artwork compositor (src/main/infra/compositor) — main-process only, never exposed over IPC.
+//   factory: `createCalendarCompositor(opts: { resourcesDir: string; tempDir: string; logger: Logger;
+//                                               timeoutMs?: number }): CalendarArtworkCompositor`
+// ---------------------------------------------------------------------------------------------------------------
+
+export interface CalendarCompositionInput {
+  /** Downloaded provider MP4 (temp file inside the private temp dir). */
+  inputVideoPath: string;
+  /** Resolved absolute path of the persisted interior_artwork asset (hash already verified by the caller). */
+  artworkPath: string;
+  /** Where the processed MP4 must be written (temp file inside the private temp dir). */
+  outputVideoPath: string;
+  sku: string;
+  jobId: string;
+}
+
+export interface CalendarCompositionReport {
+  /** true only when the artwork was composited and the quality gate passed. */
+  applied: boolean;
+  artworkSha256: string;
+  processedFrames: number;
+  /** Frames in which the artwork was drawn. */
+  visibleFrames: number;
+  /** visibleFrames / frames in which the page was expected to be open, 0..1. */
+  trackingCoverage: number;
+  lowConfidenceFrames: number;
+  compositorVersion: string;
+}
+
+export interface CalendarArtworkCompositor {
+  /**
+   * Composites the artwork onto the blank interior page and writes outputVideoPath (audio preserved).
+   * Throws PodError('CALENDAR_COMPOSITING_FAILED') when the page cannot be detected/tracked reliably,
+   * on timeout, or on worker failure. Never writes a "successful" output with misaligned artwork.
+   * Makes no network calls.
+   */
+  process(input: CalendarCompositionInput): Promise<CalendarCompositionReport>;
 }
