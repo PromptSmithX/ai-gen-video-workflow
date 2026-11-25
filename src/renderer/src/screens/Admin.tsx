@@ -762,6 +762,7 @@ function AdminContent({
                 <option value="apparel">Apparel</option>
                 <option value="drinkware">Drinkware</option>
                 <option value="home-decor">Home Decor</option>
+                <option value="calendar">Calendar</option>
                 <option value="other">Other</option>
               </select>
               <button type="button" className="btn-secondary" onClick={handleAddCategory}>

@@ -6,6 +6,17 @@ import type { ProviderStatus, StagedImage } from '@shared/ipc';
 import { normalizeSku } from '@shared/domain';
 import { getApi } from '../api';
 import { en } from '../i18n/en';
+import {
+  makeTemplateKey,
+  findCalendarTemplate,
+  findDefaultNonCalendarTemplate,
+  pickTemplateForCategory,
+  aspectWarning,
+  isGenerateEnabled,
+  buildCreateJobPayload,
+} from './create-video-logic';
+
+export { makeTemplateKey } from './create-video-logic';
 
 interface CreateVideoProps {
   providerStatus: ProviderStatus | null;
@@ -18,18 +29,19 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function makeTemplateKey(tpl: { id: string; version: string }): string {
-  return `${tpl.id}@@${tpl.version}`;
-}
-
 export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps): React.JSX.Element {
+  // Front cover image
   const [stagedImage, setStagedImage] = useState<StagedImage | null>(null);
+  // Interior artwork (Calendar only)
+  const [interiorArtworkStaged, setInteriorArtworkStaged] = useState<StagedImage | null>(null);
+
   const [rawSku, setRawSku] = useState('');
   const [productName, setProductName] = useState('');
   const [categories, setCategories] = useState<Category[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [templates, setTemplates] = useState<PromptTemplateSummary[]>([]);
   const [selectedTemplateKey, setSelectedTemplateKey] = useState('');
+  const [defaultNonCalendarTemplateKey, setDefaultNonCalendarTemplateKey] = useState('');
   const [duration, setDuration] = useState<number | undefined>(undefined);
   const [aspectRatio, setAspectRatio] = useState<string | undefined>(undefined);
 
@@ -44,9 +56,13 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const [renderedPrompt, setRenderedPrompt] = useState<RenderedPrompt | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
-  // Dragging state
+  // Dragging state & errors for front cover
   const [isDragging, setIsDragging] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
+
+  // Dragging state & errors for interior artwork
+  const [isDraggingArtwork, setIsDraggingArtwork] = useState(false);
+  const [artworkError, setArtworkError] = useState<string | null>(null);
 
   // Single-flight submission protection & clientRequestId tracking
   const clientRequestIdRef = useRef<string>(crypto.randomUUID());
@@ -58,26 +74,48 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const normalizedSku = normalizeSku(rawSku);
   const skuError = rawSku.trim().length > 0 && normalizedSku === null ? en.create.form.skuInvalid : null;
 
+  // Selected category & Calendar check
+  const selectedCategory = categories.find((c) => c.id === selectedCategoryId);
+  const isCalendar = selectedCategory?.promptGroup === 'calendar';
+
+  // Calendar template check
+  const calendarTemplate = findCalendarTemplate(templates);
+  const isCalendarTemplateMissing = isCalendar && !calendarTemplate;
+
+  // Aspect ratio soft warning check (> 15% difference)
+  const showAspectWarning =
+    isCalendar &&
+    stagedImage !== null &&
+    interiorArtworkStaged !== null &&
+    aspectWarning(stagedImage.info, interiorArtworkStaged.info);
+
   // Load categories and templates
   useEffect(() => {
     let active = true;
     const api = getApi();
     void Promise.all([api.catalog.listCategories(), api.prompts.listTemplates()]).then(([catRes, tplRes]) => {
       if (!active) return;
+      let firstCat: Category | null = null;
       if (catRes.ok && catRes.data.length > 0) {
         setCategories(catRes.data);
-        const firstCat = catRes.data[0];
+        firstCat = catRes.data[0] ?? null;
         if (firstCat) setSelectedCategoryId(firstCat.id);
       }
       if (tplRes.ok && tplRes.data.length > 0) {
         setTemplates(tplRes.data);
-        // Prefer a real (company/admin) default over the built-in placeholder, then any default, then first
-        const defaultTpl =
-          tplRes.data.find((t) => t.isDefault && !t.isPlaceholder) ??
-          tplRes.data.find((t) => t.isDefault) ??
-          tplRes.data[0];
-        if (defaultTpl) {
-          setSelectedTemplateKey(makeTemplateKey(defaultTpl));
+        const defNonCal = findDefaultNonCalendarTemplate(tplRes.data);
+        const defNonCalKey = defNonCal ? makeTemplateKey(defNonCal) : '';
+        setDefaultNonCalendarTemplateKey(defNonCalKey);
+
+        if (firstCat?.promptGroup === 'calendar') {
+          const calTpl = findCalendarTemplate(tplRes.data);
+          if (calTpl) {
+            setSelectedTemplateKey(makeTemplateKey(calTpl));
+          } else {
+            setSelectedTemplateKey('');
+          }
+        } else if (defNonCalKey) {
+          setSelectedTemplateKey(defNonCalKey);
         }
       }
     });
@@ -163,7 +201,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     effectiveAspectRatio,
   ]);
 
-  // Image drag & drop and browse
+  // Image drag & drop and browse for Front Cover (or single image)
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(true);
@@ -239,6 +277,98 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
     }
   };
 
+  // Interior Artwork handlers (Calendar only)
+  const stageArtworkFile = async (file: File) => {
+    setArtworkError(null);
+    try {
+      const api = getApi();
+      const res = await api.images.stageFile(file);
+      if (res.ok) {
+        setInteriorArtworkStaged(res.data);
+      } else {
+        setArtworkError(res.error.message);
+      }
+    } catch (err) {
+      setArtworkError(err instanceof Error ? err.message : en.errors.generic);
+    }
+  };
+
+  const handleArtworkBrowse = () => {
+    setArtworkError(null);
+    const api = getApi();
+    api.images
+      .pick()
+      .then((res) => {
+        if (res.ok && res.data) {
+          setInteriorArtworkStaged(res.data);
+        } else if (!res.ok) {
+          setArtworkError(res.error.message);
+        }
+      })
+      .catch((err) => {
+        setArtworkError(err instanceof Error ? err.message : en.errors.generic);
+      });
+  };
+
+  const handleArtworkDragOver = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingArtwork(true);
+  };
+
+  const handleArtworkDragLeave = () => {
+    setIsDraggingArtwork(false);
+  };
+
+  const handleArtworkDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingArtwork(false);
+    if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+    if (e.dataTransfer.files.length > 1) {
+      setArtworkError(en.create.dropzone.singleFileOnly);
+      return;
+    }
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      stageArtworkFile(file);
+    }
+  };
+
+  const handleArtworkDropzoneKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleArtworkBrowse();
+    }
+  };
+
+  const handleArtworkFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      if (e.target.files.length > 1) {
+        setArtworkError(en.create.dropzone.singleFileOnly);
+        return;
+      }
+      const file = e.target.files[0];
+      if (file) {
+        stageArtworkFile(file);
+      }
+    }
+  };
+
+  // Category change with template auto-select
+  const handleCategoryChange = (newCatId: string) => {
+    const prevCat = categories.find((c) => c.id === selectedCategoryId);
+    const newCat = categories.find((c) => c.id === newCatId);
+    setSelectedCategoryId(newCatId);
+
+    const nextTemplateKey = pickTemplateForCategory({
+      prevCategory: prevCat,
+      newCategory: newCat,
+      currentTemplateKey: selectedTemplateKey,
+      templates,
+      defaultNonCalendarKey: defaultNonCalendarTemplateKey,
+    });
+    setSelectedTemplateKey(nextTemplateKey);
+  };
+
   // Provider readiness
   const isProviderReady = providerStatus?.mode === 'mock' || providerStatus?.state === 'ready';
 
@@ -247,15 +377,18 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   const failedQualityChecks = renderedPrompt?.quality?.checks.filter((c) => !c.passed) ?? [];
 
   // Validation rules for Generate button
-  const isFormValid =
-    stagedImage !== null &&
-    normalizedSku !== null &&
-    selectedCategoryId !== '' &&
-    selectedTemplateKey !== '' &&
-    renderedPrompt !== null &&
-    renderedPrompt.errors.length === 0 &&
-    isQualityPassed &&
-    isProviderReady;
+  const isFormValid = isGenerateEnabled({
+    stagedImage,
+    interiorArtworkStaged,
+    isCalendar,
+    normalizedSku,
+    selectedCategoryId,
+    selectedTemplateKey,
+    renderedPrompt,
+    isQualityPassed,
+    isProviderReady,
+    isSubmitting,
+  });
 
   const handleStartEditing = () => {
     setIsEditingPrompt(true);
@@ -287,21 +420,24 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
 
     const clientRequestId = clientRequestIdRef.current;
 
+    const payload = buildCreateJobPayload({
+      clientRequestId,
+      stagedImage,
+      interiorArtworkStaged,
+      isCalendar,
+      normalizedSku,
+      selectedCategoryId,
+      templateId: selectedTemplate.id,
+      templateVersion: selectedTemplate.version,
+      productName: productName.trim() || undefined,
+      promptOverride: isEditingPrompt ? promptOverride : undefined,
+      durationSeconds: effectiveDuration,
+      aspectRatio: effectiveAspectRatio as AspectRatio | undefined,
+    });
+
     try {
       const api = getApi();
-      const res = await api.jobs.create({
-        clientRequestId,
-        sourceToken: stagedImage.token,
-        sku: normalizedSku,
-        categoryId: selectedCategoryId,
-        templateId: selectedTemplate.id,
-        templateVersion: selectedTemplate.version,
-        productName: productName.trim() || undefined,
-        fileName: stagedImage.fileName,
-        promptOverride: isEditingPrompt ? promptOverride : undefined,
-        durationSeconds: effectiveDuration,
-        aspectRatio: effectiveAspectRatio as AspectRatio | undefined,
-      });
+      const res = await api.jobs.create(payload);
 
       if (res.ok) {
         // RESET clientRequestIdRef to a new UUID ONLY after a successful create!
@@ -324,6 +460,8 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
   }, [
     isFormValid,
     stagedImage,
+    interiorArtworkStaged,
+    isCalendar,
     normalizedSku,
     selectedTemplate,
     selectedCategoryId,
@@ -348,6 +486,22 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
         </div>
       )}
 
+      {/* Calendar template missing notification */}
+      {isCalendarTemplateMissing && (
+        <div className="card" style={{ backgroundColor: 'var(--danger-bg)', borderColor: 'var(--danger)' }}>
+          <p className="error-text">{en.create.dropzone.calendarTemplateMissing}</p>
+        </div>
+      )}
+
+      {/* Soft aspect-ratio mismatch warning */}
+      {showAspectWarning && (
+        <div className="card" style={{ backgroundColor: 'var(--warning-bg)', borderColor: 'var(--warning)' }}>
+          <p style={{ color: '#92400e', fontWeight: 600, fontSize: '0.875rem' }}>
+            {en.create.dropzone.aspectRatioWarning}
+          </p>
+        </div>
+      )}
+
       {submitError && (
         <div className="card" style={{ backgroundColor: 'var(--danger-bg)', borderColor: 'var(--danger)' }}>
           <p className="error-text">{submitError}</p>
@@ -355,76 +509,248 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
       )}
 
       <div className="create-grid">
-        {/* Left Column: Image upload & Product details */}
+        {/* Left Column: Image upload(s) & Product details */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-          {/* Upload Dropzone */}
-          <div className="card">
-            <h3 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>Product Mockup</h3>
-            {!stagedImage ? (
-              <div
-                className={`dropzone-container ${isDragging ? 'dragging' : ''}`}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                onClick={handleBrowse}
-                onKeyDown={handleDropzoneKeyDown}
-                role="button"
-                tabIndex={0}
-                aria-label="Upload mockup image dropzone"
-              >
-                <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>🖼️</div>
-                <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{en.create.dropzone.prompt}</p>
-                <p className="info-text" style={{ marginBottom: '1rem' }}>
-                  {en.create.dropzone.acceptHint}
-                </p>
-                <button
-                  type="button"
-                  className="btn-secondary btn-sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleBrowse();
-                  }}
-                >
-                  {en.create.dropzone.browse}
-                </button>
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp"
-                  style={{ display: 'none' }}
-                  onChange={handleFileInputChange}
-                  aria-hidden="true"
-                />
-              </div>
-            ) : (
-              <div className="dropzone-preview">
-                <img
-                  src={stagedImage.previewUrl}
-                  alt={`Preview of ${stagedImage.fileName}`}
-                  style={{ width: '100%', height: 'auto', maxHeight: '240px', objectFit: 'contain' }}
-                />
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{stagedImage.fileName}</div>
-                    <span className="info-text">
-                      {en.create.dropzone.imageInfo
-                        .replace('{mime}', stagedImage.info.mime)
-                        .replace('{width}', String(stagedImage.info.width))
-                        .replace('{height}', String(stagedImage.info.height))
-                        .replace('{size}', formatBytes(stagedImage.info.bytes))}
-                    </span>
+          {/* Calendar dual dropzones vs Apparel single dropzone */}
+          {isCalendar ? (
+            <>
+              {/* Dropzone 1: Front Cover */}
+              <div className="card">
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
+                  {en.create.dropzone.frontCoverTitle}
+                </h3>
+                {!stagedImage ? (
+                  <div
+                    className={`dropzone-container ${isDragging ? 'dragging' : ''}`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={handleBrowse}
+                    onKeyDown={handleDropzoneKeyDown}
+                    role="button"
+                    tabIndex={0}
+                    aria-label="Upload front cover image dropzone"
+                  >
+                    <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>🖼️</div>
+                    <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+                      {en.create.dropzone.frontCoverPrompt}
+                    </p>
+                    <p className="info-text" style={{ marginBottom: '1rem' }}>
+                      {en.create.dropzone.acceptHint}
+                    </p>
+                    <button
+                      type="button"
+                      className="btn-secondary btn-sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleBrowse();
+                      }}
+                    >
+                      {en.create.dropzone.browse}
+                    </button>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      style={{ display: 'none' }}
+                      onChange={handleFileInputChange}
+                      aria-hidden="true"
+                    />
                   </div>
+                ) : (
+                  <div className="dropzone-preview">
+                    <img
+                      src={stagedImage.previewUrl}
+                      alt={`Preview of ${stagedImage.fileName}`}
+                      style={{ width: '100%', height: 'auto', maxHeight: '240px', objectFit: 'contain' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{stagedImage.fileName}</div>
+                        <span className="info-text">
+                          {en.create.dropzone.imageInfo
+                            .replace('{mime}', stagedImage.info.mime)
+                            .replace('{width}', String(stagedImage.info.width))
+                            .replace('{height}', String(stagedImage.info.height))
+                            .replace('{size}', formatBytes(stagedImage.info.bytes))}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button
+                          type="button"
+                          className="btn-secondary btn-sm"
+                          onClick={handleBrowse}
+                        >
+                          {en.create.dropzone.replaceImage}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary btn-sm"
+                          onClick={() => setStagedImage(null)}
+                        >
+                          {en.create.dropzone.clearImage}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {imageError && <p className="error-text" style={{ marginTop: '0.5rem' }}>{imageError}</p>}
+              </div>
+
+              {/* Dropzone 2: Interior Artwork */}
+              <div className="card">
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
+                  {en.create.dropzone.interiorArtworkTitle}
+                </h3>
+                {!interiorArtworkStaged ? (
+                  <div
+                    className={`dropzone-container ${isDraggingArtwork ? 'dragging' : ''}`}
+                    onDragOver={handleArtworkDragOver}
+                    onDragLeave={handleArtworkDragLeave}
+                    onDrop={handleArtworkDrop}
+                    onClick={handleArtworkBrowse}
+                    onKeyDown={handleArtworkDropzoneKeyDown}
+                    role="button"
+                    tabIndex={0}
+                    aria-label="Upload interior artwork image dropzone"
+                  >
+                    <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>📄</div>
+                    <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+                      {en.create.dropzone.interiorArtworkPrompt}
+                    </p>
+                    <p className="info-text" style={{ marginBottom: '0.5rem' }}>
+                      {en.create.dropzone.acceptHint}
+                    </p>
+                    <p className="info-text" style={{ marginBottom: '1rem', color: 'var(--primary)' }}>
+                      {en.create.dropzone.artworkRequiredNotice}
+                    </p>
+                    <button
+                      type="button"
+                      className="btn-secondary btn-sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleArtworkBrowse();
+                      }}
+                    >
+                      {en.create.dropzone.browse}
+                    </button>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      style={{ display: 'none' }}
+                      onChange={handleArtworkFileInputChange}
+                      aria-hidden="true"
+                    />
+                  </div>
+                ) : (
+                  <div className="dropzone-preview">
+                    <img
+                      src={interiorArtworkStaged.previewUrl}
+                      alt={`Preview of ${interiorArtworkStaged.fileName}`}
+                      style={{ width: '100%', height: 'auto', maxHeight: '240px', objectFit: 'contain' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{interiorArtworkStaged.fileName}</div>
+                        <span className="info-text">
+                          {en.create.dropzone.imageInfo
+                            .replace('{mime}', interiorArtworkStaged.info.mime)
+                            .replace('{width}', String(interiorArtworkStaged.info.width))
+                            .replace('{height}', String(interiorArtworkStaged.info.height))
+                            .replace('{size}', formatBytes(interiorArtworkStaged.info.bytes))}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button
+                          type="button"
+                          className="btn-secondary btn-sm"
+                          onClick={handleArtworkBrowse}
+                        >
+                          {en.create.dropzone.replaceArtwork}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary btn-sm"
+                          onClick={() => setInteriorArtworkStaged(null)}
+                        >
+                          {en.create.dropzone.removeArtwork}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {artworkError && <p className="error-text" style={{ marginTop: '0.5rem' }}>{artworkError}</p>}
+              </div>
+            </>
+          ) : (
+            /* Single dropzone for apparel / other categories (existing unchanged) */
+            <div className="card">
+              <h3 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>Product Mockup</h3>
+              {!stagedImage ? (
+                <div
+                  className={`dropzone-container ${isDragging ? 'dragging' : ''}`}
+                  onDragOver={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={handleDrop}
+                  onClick={handleBrowse}
+                  onKeyDown={handleDropzoneKeyDown}
+                  role="button"
+                  tabIndex={0}
+                  aria-label="Upload mockup image dropzone"
+                >
+                  <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>🖼️</div>
+                  <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{en.create.dropzone.prompt}</p>
+                  <p className="info-text" style={{ marginBottom: '1rem' }}>
+                    {en.create.dropzone.acceptHint}
+                  </p>
                   <button
                     type="button"
                     className="btn-secondary btn-sm"
-                    onClick={() => setStagedImage(null)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleBrowse();
+                    }}
                   >
-                    {en.create.dropzone.clearImage}
+                    {en.create.dropzone.browse}
                   </button>
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    style={{ display: 'none' }}
+                    onChange={handleFileInputChange}
+                    aria-hidden="true"
+                  />
                 </div>
-              </div>
-            )}
-            {imageError && <p className="error-text" style={{ marginTop: '0.5rem' }}>{imageError}</p>}
-          </div>
+              ) : (
+                <div className="dropzone-preview">
+                  <img
+                    src={stagedImage.previewUrl}
+                    alt={`Preview of ${stagedImage.fileName}`}
+                    style={{ width: '100%', height: 'auto', maxHeight: '240px', objectFit: 'contain' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{stagedImage.fileName}</div>
+                      <span className="info-text">
+                        {en.create.dropzone.imageInfo
+                          .replace('{mime}', stagedImage.info.mime)
+                          .replace('{width}', String(stagedImage.info.width))
+                          .replace('{height}', String(stagedImage.info.height))
+                          .replace('{size}', formatBytes(stagedImage.info.bytes))}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn-secondary btn-sm"
+                      onClick={() => setStagedImage(null)}
+                    >
+                      {en.create.dropzone.clearImage}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {imageError && <p className="error-text" style={{ marginTop: '0.5rem' }}>{imageError}</p>}
+            </div>
+          )}
 
           {/* Form inputs */}
           <div className="card">
@@ -467,7 +793,7 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
               <select
                 id="category-select"
                 value={selectedCategoryId}
-                onChange={(e) => setSelectedCategoryId(e.target.value)}
+                onChange={(e) => handleCategoryChange(e.target.value)}
               >
                 <option value="">{en.create.form.selectCategory}</option>
                 {categories.map((cat) => (

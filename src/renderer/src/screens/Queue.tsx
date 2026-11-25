@@ -252,13 +252,21 @@ export function Queue({ highlightJobId }: QueueProps): React.JSX.Element {
                       <strong>{job.skuSnapshot}</strong>
                       {job.safeErrorMessage && (
                         <div className="error-text" style={{ fontSize: '0.75rem', marginTop: '0.2rem' }}>
-                          {job.safeErrorMessage}
+                          {job.errorCode === 'CALENDAR_COMPOSITING_FAILED'
+                            ? (job.safeErrorMessage || en.errors.calendarCompositingFailed)
+                            : job.safeErrorMessage}
                         </div>
                       )}
                     </td>
 
                     {/* Category */}
-                    <td>{category}</td>
+                    <td>
+                      {category}
+                      {(Boolean(item.interiorArtworkUrl && item.interiorArtworkUrl.trim().length > 0) ||
+                        category.toLowerCase().includes('calendar')) && (
+                        <span className="badge-calendar">{en.queue.calendarBadge}</span>
+                      )}
+                    </td>
 
                     {/* Status */}
                     <td>
