@@ -13,6 +13,7 @@ import { openDatabase } from '../infra/db';
 import { buildDiagnostics } from '../infra/diagnostics';
 import { createLogger } from '../infra/logging';
 import { createMediaLibrary } from '../infra/media';
+import { createCalendarCompositor } from '../infra/compositor';
 import { createPromptService } from '../prompts';
 import { createMuseProvider } from '../providers/muse';
 import { createSecretStore, getBridgeApiKey, type SafeStorageLike } from '../infra/secrets';
@@ -192,9 +193,9 @@ export class AppContainer {
           })
         : null;
 
-    // 9c. Calendar Compositor
-    // TODO: When CAL-3 lands, switch to createCalendarCompositor from src/main/infra/compositor
-    this.compositor = opts.compositor ?? createUnavailableCompositor();
+    // 9c. Calendar Compositor (bundled sidecar, ADR-004). Missing sidecar => calendar jobs fail safely at
+    // post-process with CALENDAR_COMPOSITING_FAILED; apparel is unaffected.
+    this.compositor = opts.compositor ?? this.createCompositor(tempDir);
 
     // 10. Job Orchestrator
     this.orchestrator = new JobOrchestrator({
@@ -345,6 +346,23 @@ export class AppContainer {
       content,
       generatedAt: nowIso(),
     };
+  }
+
+  private createCompositor(tempDir: string): CalendarArtworkCompositor & { dispose?(): void } {
+    const resourcesDir = this.isPackaged
+      ? ((process as unknown as { resourcesPath?: string }).resourcesPath ?? this.appPath)
+      : path.join(this.appPath, 'vendor', 'calendar-compositor', 'dist');
+    const exe = path.join(resourcesDir, 'calendar-compositor', 'calendar-compositor.exe');
+    if (process.platform !== 'win32' || !fs.existsSync(exe)) {
+      this.logger.warn('calendar_compositor_unavailable');
+      return createUnavailableCompositor();
+    }
+    try {
+      return createCalendarCompositor({ resourcesDir, tempDir, logger: this.logger });
+    } catch {
+      this.logger.error('calendar_compositor_init_failed');
+      return createUnavailableCompositor();
+    }
   }
 
   close(): void {
