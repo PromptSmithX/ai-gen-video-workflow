@@ -32,3 +32,4 @@ tools/calendar-compositor/fixtures/*.jpg
 tools/calendar-compositor/fixtures/*.json
 __pycache__/
 *.pyc
+tools/calendar-compositor/comparison_grid.png
