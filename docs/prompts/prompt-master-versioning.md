@@ -162,7 +162,7 @@ In addition to apparel (`product-review`), POD Video Studio supports dedicated p
 - **Template Identifier**: `calendar-review`, with initial built-in version `v1` located at `prompts/master/calendar-review-v1.md`.
 - **Placeholder Guarantee**: The built-in calendar template is flagged with `isPlaceholder: true`. The placeholder flag is never stripped until an official company-approved prompt is reviewed and imported.
 - **Independent Default Scoping**: The built-in `calendar-review-v1` has `default: false` and does **not** displace the global default template (`product-review` or company master). In `listTemplates()`, `calendar-review-v1` is not the global default.
-- **Company Master Binding**: `companyMasterPath` (`PROMPT_MASTER_PATH`) remains bound exclusively to `product-review`. Custom company calendar prompts are versioned and managed through the Admin workflow (`<adminDir>/calendar-review/v<N>.md`).
+- **Company Master Loading**: `PROMPT_MASTER_PATH` imports the company-approved template under its specified frontmatter id (defaulting to `product-review` if omitted, such as `tshirt-review`). It does not register as `calendar-review` unless explicitly crafted as such. Custom calendar prompts are versioned and managed through Admin or dedicated files.
 - **Resolution Semantics**: Calling `getTemplate('calendar-review')` resolves to an admin-saved version if one exists (or the version selected via `setDefault('calendar-review', ...)`); otherwise it safely falls back to built-in `v1`.
 
 ### Category Snippet (`prompts/categories/calendar.md`)

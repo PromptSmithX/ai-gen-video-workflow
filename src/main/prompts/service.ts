@@ -104,8 +104,7 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           defaultPlaceholder: false,
         });
 
-        // The company master path (companyMasterPath) stays bound to product-review only
-        const targetId = 'product-review';
+        const targetId = parsed.metadata.id || 'product-review';
         let targetVersion = parsed.metadata.version || `company-${hash}`;
 
         // Ensure (id, version) is unique across sources; suffix with -company on collision
@@ -198,12 +197,19 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       for (const t of matching) {
         t.isDefault = t.version === persistedDefaultVer;
       }
-    } else if (companyLoaded && id === 'product-review' && matching.some((t) => t.source === 'company')) {
-      // Company template wins as default for product-review
+    } else if (companyLoaded && matching.some((t) => t.source === 'company')) {
+      // Company template wins as default
       for (const t of matching) {
         t.isDefault = t.source === 'company';
       }
-    } else if (id === 'product-review') {
+    } else if (id === 'calendar-review') {
+      // Only for calendar-review without a persisted admin default:
+      // isDefault only if explicitly marked in frontmatter (builtin v1 has default: false -> not default)
+      const explicitDefault = matching.find((t) => t.isDefault);
+      for (const t of matching) {
+        t.isDefault = explicitDefault ? t.version === explicitDefault.version : false;
+      }
+    } else {
       // Pick builtin template marked default, or v2, or latest version
       const explicitDefault = matching.find((t) => t.isDefault);
       const v2Default = matching.find((t) => t.version === 'v2');
@@ -211,13 +217,6 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
 
       for (const t of matching) {
         t.isDefault = targetDefault ? t.version === targetDefault.version : false;
-      }
-    } else {
-      // For other template ids (e.g. calendar-review):
-      // Only set isDefault = true if explicitly marked in frontmatter or persisted in admin defaults
-      const explicitDefault = matching.find((t) => t.isDefault);
-      for (const t of matching) {
-        t.isDefault = explicitDefault ? t.version === explicitDefault.version : false;
       }
     }
   }

@@ -704,6 +704,97 @@ No fake claims or ratings.
   });
 
   describe('6. Calendar category and prompt template (CAL-2)', () => {
+    it('company master file with id: tshirt-review -> listed as id tshirt-review, source company, isDefault true, not placeholder; product-review builtin default unchanged (v2)', () => {
+      const companyPath = path.join(tempBaseDir, 'company-tshirt.md');
+      fs.writeFileSync(
+        companyPath,
+        `---
+id: tshirt-review
+version: v2
+title: Company T-shirt Master
+placeholder: false
+default: true
+---
+Company T-shirt Master body for {{sku}}`,
+        'utf8',
+      );
+
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: companyPath });
+      const templates = service.listTemplates();
+
+      const tshirt = templates.find((t) => t.id === 'tshirt-review');
+      expect(tshirt).toBeDefined();
+      expect(tshirt?.source).toBe('company');
+      expect(tshirt?.version).toBe('v2');
+      expect(tshirt?.isPlaceholder).toBe(false);
+      expect(tshirt?.isDefault).toBe(true);
+
+      // product-review builtin default is unchanged (v2 placeholder)
+      const productDefault = service.getTemplate('product-review');
+      expect(productDefault.id).toBe('product-review');
+      expect(productDefault.version).toBe('v2');
+      expect(productDefault.isPlaceholder).toBe(true);
+      expect(productDefault.isDefault).toBe(true);
+
+      // calendar-review builtin v1 is still placeholder and not default
+      const calendarTmpl = service.getTemplate('calendar-review');
+      expect(calendarTmpl.id).toBe('calendar-review');
+      expect(calendarTmpl.version).toBe('v1');
+      expect(calendarTmpl.isPlaceholder).toBe(true);
+      expect(calendarTmpl.isDefault).toBe(false);
+    });
+
+    it('company master without id defaults to product-review, source company, isDefault true, not placeholder', () => {
+      const companyPath = path.join(tempBaseDir, 'company-untitled.md');
+      fs.writeFileSync(
+        companyPath,
+        `---
+version: v2.5
+title: Untitled Company Master
+---
+Untitled company master body for {{sku}}`,
+        'utf8',
+      );
+
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: companyPath });
+      const templates = service.listTemplates();
+
+      const companyTmpl = templates.find((t) => t.source === 'company');
+      expect(companyTmpl).toBeDefined();
+      expect(companyTmpl?.id).toBe('product-review');
+      expect(companyTmpl?.version).toBe('v2.5');
+      expect(companyTmpl?.isPlaceholder).toBe(false);
+      expect(companyTmpl?.isDefault).toBe(true);
+
+      const defaultTmpl = service.getTemplate('product-review');
+      expect(defaultTmpl.source).toBe('company');
+      expect(defaultTmpl.version).toBe('v2.5');
+    });
+
+    it('a non-calendar admin-created id still gets a default version', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+
+      // Save an admin version for a brand-new id without explicitly calling setDefault
+      service.saveTemplateVersion({
+        id: 'banner-promo',
+        title: 'Banner Promo V1',
+        body: 'Banner promo prompt for {{sku}}',
+      });
+
+      // Reloading templates should assign a default version to the new id (fallback to latest)
+      const reloadedService = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const templates = reloadedService.listTemplates();
+      const banner = templates.find((t) => t.id === 'banner-promo');
+
+      expect(banner).toBeDefined();
+      expect(banner?.version).toBe('v1');
+      expect(banner?.isDefault).toBe(true);
+
+      const bannerTmpl = reloadedService.getTemplate('banner-promo');
+      expect(bannerTmpl.version).toBe('v1');
+      expect(bannerTmpl.isDefault).toBe(true);
+    });
+
     it('calendar-review v1 listed, loads, isPlaceholder === true, not the default template; product-review / company default unchanged', () => {
       const companyPath = path.join(tempBaseDir, 'company-master.md');
       fs.writeFileSync(
