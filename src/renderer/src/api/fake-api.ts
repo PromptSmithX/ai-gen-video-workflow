@@ -62,6 +62,21 @@ Believable casual customer reaction and detailed close-up review.`,
     body: `PLACEHOLDER: Quick rotating showcase of {{sku}} ({{product_category}}).
 Show natural physical handling of the item. Maintain identical design, graphics, and text from the original product mockup.`,
   },
+  {
+    id: 'calendar-review',
+    version: 'v1',
+    title: 'Desk Calendar Review (Standard)',
+    isPlaceholder: false,
+    source: 'builtin',
+    isDefault: true,
+    createdAt: '2026-11-25T10:00:00.000Z',
+    note: 'Authentic desk calendar review with blank page turn and artwork preservation',
+    body: `A natural authentic product review video showcasing {{sku}} ({{product_category}}).
+The reviewer examines the desk calendar, holding and presenting the front cover mockup reference.
+The reviewer turns exactly one page around the top spiral binding, revealing a clean blank interior cream page.
+The open page is held facing the camera steadily, keeping the printed artwork surface free from hand obstruction.
+Original design and graphics are preserved accurately.`,
+  },
 ];
 
 export function computeJobNextActions(job: Job, canCancel = true): JobNextAction[] {
@@ -645,6 +660,9 @@ export class FakeApiStore {
             category,
             productName: input.productName ?? null,
             sourceUrl: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="%23e2e8f0"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="16" fill="%23475569">' + input.sku + '</text></svg>',
+            interiorArtworkUrl: input.interiorArtworkToken
+              ? 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="%23fef3c7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="14" fill="%2392400e">Artwork: ' + input.sku + '</text></svg>'
+              : null,
             videoUrl: null,
             videoAssetId: null,
             elapsedMs: 0,

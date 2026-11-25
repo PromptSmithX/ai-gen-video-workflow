@@ -222,6 +222,33 @@ describe('Queue Screen', () => {
     // CRITICAL: jobs.retry must NEVER be called
     expect(mockRetry).not.toHaveBeenCalled();
   });
+
+  it('renders small "Calendar" badge when job has interiorArtworkUrl or category is calendar', async () => {
+    const calendarJob: JobView = {
+      ...activeJobNoProgress,
+      job: {
+        ...activeJobNoProgress.job,
+        id: 'job-cal-1',
+        skuSnapshot: 'CAL-001',
+      },
+      category: 'Desk Calendar',
+      interiorArtworkUrl: 'pod-media://asset/art-1',
+    };
+
+    mockList.mockResolvedValueOnce({
+      ok: true,
+      data: [calendarJob],
+    });
+
+    render(<Queue />);
+
+    await waitFor(() => {
+      expect(screen.getByText('CAL-001')).toBeDefined();
+    });
+
+    // Calendar badge is rendered
+    expect(screen.getByText('Calendar')).toBeDefined();
+  });
 });
 
 function withinRow(row: HTMLElement, buttonText: string): HTMLElement | null {
