@@ -383,7 +383,24 @@ export function loadConfig(args: {
     if (!catResult.success) {
       throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: categories');
     }
-    categories = catResult.data;
+    const stored = catResult.data;
+    // We cannot distinguish an admin who deliberately deleted desk-calendar from a legacy
+    // install that predates the calendar category without an explicit marker. Therefore, we
+    // append the default desk-calendar category only when the stored list has no category
+    // with promptGroup === 'calendar' and no category with id 'desk-calendar'. Existing
+    // categories are preserved exactly (order, labels, prompt groups, and custom IDs).
+    const hasDeskCalendar = stored.some((c) => c.id === 'desk-calendar');
+    const hasCalendarGroup = stored.some((c) => c.promptGroup === 'calendar');
+    if (!hasDeskCalendar && !hasCalendarGroup) {
+      const defaultDeskCalendar = DEFAULT_CATEGORIES.find((c) => c.id === 'desk-calendar') ?? {
+        id: 'desk-calendar',
+        label: 'Desk Calendar',
+        promptGroup: 'calendar',
+      };
+      categories = [...stored, defaultDeskCalendar];
+    } else {
+      categories = stored;
+    }
   }
 
   return {

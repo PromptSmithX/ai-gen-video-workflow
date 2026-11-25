@@ -400,4 +400,122 @@ LOG_RETENTION_DAYS=14
       expect(isAdmin(config, null)).toBe(false);
     });
   });
+
+  describe('categories normalization and merge', () => {
+    it('fresh config has desk-calendar category by default', () => {
+      const config = loadConfig({
+        env: {},
+        settings: {},
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      const deskCal = config.categories.find((c) => c.id === 'desk-calendar');
+      expect(deskCal).toBeDefined();
+      expect(deskCal?.promptGroup).toBe('calendar');
+    });
+
+    it('legacy stored list without desk-calendar gets it appended at the end while custom categories remain untouched', () => {
+      const legacyList = [
+        { id: 't-shirt', label: 'Custom T-Shirt', promptGroup: 'apparel' as const },
+        { id: 'custom-hoodie', label: 'My Hoodie', promptGroup: 'apparel' as const },
+        { id: 'custom-mug', label: 'Coffee Mug', promptGroup: 'drinkware' as const },
+      ];
+
+      const config = loadConfig({
+        env: {},
+        settings: { categories: legacyList },
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      expect(config.categories).toHaveLength(4);
+      expect(config.categories[0]).toEqual(legacyList[0]);
+      expect(config.categories[1]).toEqual(legacyList[1]);
+      expect(config.categories[2]).toEqual(legacyList[2]);
+      expect(config.categories[3]).toEqual({
+        id: 'desk-calendar',
+        label: 'Desk Calendar',
+        promptGroup: 'calendar',
+      });
+    });
+
+    it('stored list already containing desk-calendar (even with edited label) is untouched', () => {
+      const storedWithDeskCal = [
+        { id: 'desk-calendar', label: 'Renamed Desk Calendar', promptGroup: 'calendar' as const },
+        { id: 't-shirt', label: 'T-shirt', promptGroup: 'apparel' as const },
+      ];
+
+      const config = loadConfig({
+        env: {},
+        settings: { categories: storedWithDeskCal },
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      expect(config.categories).toHaveLength(2);
+      expect(config.categories).toEqual(storedWithDeskCal);
+      expect(config.categories[0]?.label).toBe('Renamed Desk Calendar');
+    });
+
+    it('stored list with another calendar-group category does not get a second one', () => {
+      const customCalendar = [
+        { id: 'wall-calendar', label: 'Wall Calendar', promptGroup: 'calendar' as const },
+        { id: 't-shirt', label: 'T-shirt', promptGroup: 'apparel' as const },
+      ];
+
+      const config = loadConfig({
+        env: {},
+        settings: { categories: customCalendar },
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      expect(config.categories).toHaveLength(2);
+      expect(config.categories).toEqual(customCalendar);
+      expect(config.categories.some((c) => c.id === 'desk-calendar')).toBe(false);
+    });
+
+    it('invalid promptGroup is still rejected', () => {
+      const invalidList = [
+        { id: 'custom', label: 'Custom', promptGroup: 'books' as unknown as 'apparel' },
+      ];
+
+      expect(() =>
+        loadConfig({
+          env: {},
+          settings: { categories: invalidList },
+          paths: dummyPaths,
+          isDev: false,
+        })
+      ).toThrow(PodError);
+
+      try {
+        loadConfig({
+          env: {},
+          settings: { categories: invalidList },
+          paths: dummyPaths,
+          isDev: false,
+        });
+      } catch (err) {
+        expect((err as PodError).code).toBe('CONFIG_INVALID');
+        expect((err as PodError).message).toContain('categories');
+      }
+    });
+
+    it('valid calendar promptGroup is accepted', () => {
+      const validCalendar = [
+        { id: 'desk-calendar', label: 'Desk Calendar', promptGroup: 'calendar' as const },
+      ];
+
+      const config = loadConfig({
+        env: {},
+        settings: { categories: validCalendar },
+        paths: dummyPaths,
+        isDev: false,
+      });
+
+      expect(config.categories).toEqual(validCalendar);
+    });
+  });
 });

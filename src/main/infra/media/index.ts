@@ -72,12 +72,15 @@ export class DefaultMediaLibrary implements MediaLibrary {
     return validateImageHeader(absPath, this.maxSourceBytes, this.maxSourcePixels);
   }
 
-  // TODO(CAL-1): implement — contract stub locked by lead.
-  async importInteriorArtwork(_absPath: string, _sku: string): Promise<StoredFile> {
-    throw new PodError('INTERNAL', 'Interior artwork import is not implemented yet');
+  async importInteriorArtwork(absPath: string, sku: string): Promise<StoredFile> {
+    return this.importImageWithSuffix(absPath, sku, 'interior-artwork');
   }
 
   async importSourceImage(absPath: string, sku: string): Promise<StoredFile> {
+    return this.importImageWithSuffix(absPath, sku, 'original');
+  }
+
+  private async importImageWithSuffix(absPath: string, sku: string, suffix: string): Promise<StoredFile> {
     const normalizedSku = normalizeSku(sku);
     if (!normalizedSku) {
       throw new PodError('INVALID_SKU', 'Invalid SKU format');
@@ -90,14 +93,14 @@ export class DefaultMediaLibrary implements MediaLibrary {
 
     const ext = info.mime === 'image/jpeg' ? 'jpg' : info.mime === 'image/webp' ? 'webp' : 'png';
 
-    // First candidate: <SKU>-original.<ext>
-    let filename = `${normalizedSku}-original.${ext}`;
+    // First candidate: <SKU>-<suffix>.<ext>
+    let filename = `${normalizedSku}-${suffix}.${ext}`;
     let targetAbs = path.join(sourceDir, filename);
 
     if (fs.existsSync(targetAbs)) {
       let counter = 2;
       while (fs.existsSync(targetAbs)) {
-        filename = `${normalizedSku}-original-${counter}.${ext}`;
+        filename = `${normalizedSku}-${suffix}-${counter}.${ext}`;
         targetAbs = path.join(sourceDir, filename);
         counter++;
       }

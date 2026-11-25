@@ -421,6 +421,106 @@ describe('Media Library and Safe Storage', () => {
     });
   });
 
+  describe('importInteriorArtwork', () => {
+    it('is byte-identical with correct SHA-256 and dimensions, and subsequent imports get -interior-artwork-2, -interior-artwork-3', async () => {
+      const pngBuf = buildPngBuffer(320, 240);
+      const srcFile = path.join(tmpDir, 'artwork.png');
+      fs.writeFileSync(srcFile, pngBuf);
+
+      const expectedHash = createHash('sha256').update(pngBuf).digest('hex');
+
+      // First import
+      const f1 = await media.importInteriorArtwork(srcFile, 'CAL-001');
+      expect(f1.relPath).toBe('CAL-001/source/CAL-001-interior-artwork.png');
+      expect(f1.sha256).toBe(expectedHash);
+      expect(f1.width).toBe(320);
+      expect(f1.height).toBe(240);
+      expect(f1.bytes).toBe(pngBuf.length);
+      expect(f1.mime).toBe('image/png');
+      expect(fs.readFileSync(f1.absPath)).toEqual(pngBuf);
+
+      // Second import
+      const f2 = await media.importInteriorArtwork(srcFile, 'CAL-001');
+      expect(f2.relPath).toBe('CAL-001/source/CAL-001-interior-artwork-2.png');
+      expect(f2.sha256).toBe(expectedHash);
+      expect(f2.width).toBe(320);
+      expect(f2.height).toBe(240);
+      expect(fs.readFileSync(f2.absPath)).toEqual(pngBuf);
+
+      // Third import
+      const f3 = await media.importInteriorArtwork(srcFile, 'CAL-001');
+      expect(f3.relPath).toBe('CAL-001/source/CAL-001-interior-artwork-3.png');
+      expect(f3.sha256).toBe(expectedHash);
+      expect(fs.readFileSync(f3.absPath)).toEqual(pngBuf);
+    });
+
+    it('rejects bad signature with .png extension', async () => {
+      const badFile = path.join(tmpDir, 'bad-art.png');
+      fs.writeFileSync(badFile, 'This is fake artwork text, not a PNG image');
+
+      await expect(media.importInteriorArtwork(badFile, 'CAL-001')).rejects.toThrow(PodError);
+      try {
+        await media.importInteriorArtwork(badFile, 'CAL-001');
+      } catch (err) {
+        expect((err as PodError).code).toBe('INVALID_IMAGE');
+      }
+    });
+
+    it('rejects oversize bytes before reading full file', async () => {
+      const hugeFile = path.join(tmpDir, 'huge-art.png');
+      const size = MAX_SOURCE_BYTES + 1024;
+      const fd = fs.openSync(hugeFile, 'w');
+      fs.writeSync(fd, Buffer.from('x'), 0, 1, size - 1);
+      fs.closeSync(fd);
+
+      await expect(media.importInteriorArtwork(hugeFile, 'CAL-001')).rejects.toThrow(PodError);
+      try {
+        await media.importInteriorArtwork(hugeFile, 'CAL-001');
+      } catch (err) {
+        expect((err as PodError).code).toBe('IMAGE_TOO_LARGE');
+      }
+    });
+
+    it('rejects oversize pixels (decompression bomb guard)', async () => {
+      const bombFile = path.join(tmpDir, 'bomb-art.png');
+      fs.writeFileSync(bombFile, buildPngBuffer(5000, 5000));
+
+      await expect(media.importInteriorArtwork(bombFile, 'CAL-001')).rejects.toThrow(PodError);
+      try {
+        await media.importInteriorArtwork(bombFile, 'CAL-001');
+      } catch (err) {
+        expect((err as PodError).code).toBe('IMAGE_TOO_LARGE');
+      }
+    });
+
+    it('rejects invalid SKU', async () => {
+      const pngBuf = buildPngBuffer(100, 100);
+      const srcFile = path.join(tmpDir, 'valid-sku-test.png');
+      fs.writeFileSync(srcFile, pngBuf);
+
+      const invalidSkus = ['', '   ', 'CON', 'PRN', '-leadingdash', '.leadingdot', 'bad/sku', 'bad\0sku'];
+      for (const sku of invalidSkus) {
+        await expect(media.importInteriorArtwork(srcFile, sku)).rejects.toThrow(PodError);
+        try {
+          await media.importInteriorArtwork(srcFile, sku);
+        } catch (err) {
+          expect((err as PodError).code).toBe('INVALID_SKU');
+        }
+      }
+    });
+
+    it('rejects path traversal attempts in SKU', async () => {
+      const pngBuf = buildPngBuffer(100, 100);
+      const srcFile = path.join(tmpDir, 'traversal-test.png');
+      fs.writeFileSync(srcFile, pngBuf);
+
+      const traversalSkus = ['../escaped', '..\\escaped', 'sub/../../escaped'];
+      for (const sku of traversalSkus) {
+        await expect(media.importInteriorArtwork(srcFile, sku)).rejects.toThrow(PodError);
+      }
+    });
+  });
+
   describe('storeVideo increments and cleanup', () => {
     it('increments numbering from 001 to 002', async () => {
       const mp4Buf = buildMinimalMp4Buffer();
