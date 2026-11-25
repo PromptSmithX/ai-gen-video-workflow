@@ -1,0 +1,21 @@
+appId: com.company.podvideostudio
+productName: POD Video Studio
+directories:
+  output: release
+files:
+  - "out/**"
+extraResources:
+  - from: "prompts"
+    to: "prompts"
+  - from: "vendor/muse4ai/dist"
+    to: "muse4ai"
+asar: true
+publish: null
+win:
+  target: nsis
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false

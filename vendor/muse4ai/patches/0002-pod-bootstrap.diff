@@ -1,0 +1,485 @@
+diff --git a/desktop/src/main/api/server.ts b/desktop/src/main/api/server.ts
+index 4987200..b0c1250 100644
+--- a/desktop/src/main/api/server.ts
++++ b/desktop/src/main/api/server.ts
+@@ -6,6 +6,7 @@ import path from "node:path";
+ import { BRAND } from "../../shared/brand";
+ import { originOf } from "../../shared/api/oauth";
+ import { isOAuthPath, type OAuthHttp } from "./oauth/http";
++import { POD_BUILD } from "../podBootstrap";
+ import { API_CHAT_JSON_MAX_BYTES,
+   API_AUTH_FAIL_DELAY_MS,
+   API_HEADERS_TIMEOUT_MS,
+@@ -269,7 +270,7 @@ export class ApiServer {
+         // The app's own tunnel/domain checks run every minute — not agent calls, so they stay out of the log.
+         const self = req.headers[SELFCHECK_HEADER];
+         if (this.d.selfCheckToken && typeof self === "string" && sameSecret(self, this.d.selfCheckToken)) (c as Ctx & { logged?: boolean }).logged = true;
+-        return this.json(res, 200, { ok: true, service: BRAND.id, instance: this.d.instanceId }, method === "HEAD");
++        return this.json(res, 200, { ok: true, service: BRAND.id, instance: this.d.instanceId, pod: POD_BUILD }, method === "HEAD");
+       }
+       case "/v1/openapi.json":
+         return this.json(res, 200, this.d.openapi());
+diff --git a/desktop/src/main/main.ts b/desktop/src/main/main.ts
+index f6dfdee..aa0a1e6 100644
+--- a/desktop/src/main/main.ts
++++ b/desktop/src/main/main.ts
+@@ -40,6 +40,7 @@ import { buildToastXml, launchArgument, resolveNoticeRoute, routeFromActivation,
+ import { parseReducedMotion, parseTransparency } from "./winDisplay";
+ import { loadFixtures } from "./fixtures";
+ import { detectInstall, Updater } from "./updater";
++import { podLoginRoute, podProvision, readBootstrapArg, readPodSettings, startLoopbackProxy, writePodSettings, POD_BUILD, type PodBootstrapFile } from "./podBootstrap";
+ import { UPDATE_MANIFEST_PATH } from "../shared/updates";
+ import { SITE_URL } from "@content/site";
+ 
+@@ -148,6 +149,16 @@ async function boot(): Promise<void> {
+   const local = TEST && process.env.MUSE4AI_DATA ? path.join(process.env.MUSE4AI_DATA, "local") : path.dirname(app.getPath("sessionData"));
+   const pictures = TEST && process.env.MUSE4AI_DATA ? path.join(process.env.MUSE4AI_DATA, "pictures") : app.getPath("pictures");
+   const paths: AppPaths = makePaths(roaming, local, pictures);
++  // POD Video Studio (local patch): read the bootstrap request and keep the loopback proxy running on every start.
++  let podBoot: PodBootstrapFile | null = null;
++  try {
++    podBoot = readBootstrapArg(process.argv);
++  } catch (e) {
++    console.error(String(e));
++  }
++  const podPort = podBoot?.proxyPort ?? readPodSettings(roaming)?.proxyPort ?? null;
++  let podProxyPort: number | null = podPort;
++  let podProxyReady = podPort ? startLoopbackProxy(podPort, (l, msg, d) => console.log(l, msg, d ?? "")) : Promise.resolve(null);
+   // R120: the UI language is a setting in the store, mirrored in a tiny file so dialogs shown before the store opens
+   // (corrupt store, failed migration) already use it.
+   const localeFile = path.join(roaming, "ui-locale");
+@@ -537,7 +548,7 @@ async function boot(): Promise<void> {
+     updatesDir: path.join(paths.local, "updates"),
+     roamingDir: paths.roaming,
+     layout: detectInstall(process.execPath, app.getVersion()),
+-    autoCheck: () => coord.settings().updateCheck,
++    autoCheck: () => (POD_BUILD ? false : coord.settings().updateCheck),
+     locale: () => getLocale(),
+     diskFree,
+     inFlight: () => coord.inFlightCount(),
+@@ -929,9 +940,59 @@ async function boot(): Promise<void> {
+     updater,
+   });
+ 
++  // POD Video Studio (local patch): first-run provisioning, also when POD asks a copy that is already running.
++  const runPodBootstrap = async (boot: PodBootstrapFile): Promise<void> => {
++    const podLog = (l: "info" | "warn" | "error", msg: string, d?: Record<string, unknown>) => logger.log(l, "pod", msg, d);
++    writePodSettings(paths.roaming, { proxyPort: boot.proxyPort });
++    if (podProxyPort !== boot.proxyPort) {
++      podProxyPort = boot.proxyPort;
++      podProxyReady = startLoopbackProxy(boot.proxyPort, podLog);
++    }
++    await podProxyReady;
++    try {
++      const r = await podProvision(
++        boot,
++        {
++          listProxies: () => coord.repo.listProxies(),
++          importProxies: (text) => coord.importProxies(text),
++          testProxy: (id) => coord.testProxy(id),
++          listAccounts: () => coord.repo.listAccounts(),
++          addAccount: (input) => coord.addAccount(input),
++          setAccountProxy: (id, pid) => coord.setAccountProxy(id, pid),
++          apiEnable: async () => {
++            await api.setAccess("local", false);
++            await api.setEnabled(true);
++          },
++          listKeys: () => api.status().keys,
++          revokeKey: (id) => void api.revokeKey(id),
++          createKey: (name) => api.createKey(name, "generate"),
++        },
++        podLog,
++      );
++      podLog("info", "pod bootstrap done", { keyWritten: r.keyWritten });
++    } catch (e) {
++      podLog("error", "pod bootstrap failed", { error: String(e) });
++    }
++  };
++
+   // Windows without a working COM activator relaunches the exe with the toast's launch argument; the
+   // single-instance lock hands that argv to this process (AC-APP-06).
+   app.on("second-instance", (_e, argv) => {
++    if (argv.includes("--pod-bootstrap")) {
++      try {
++        const boot = readBootstrapArg(argv);
++        if (boot) void runPodBootstrap(boot);
++      } catch (e) {
++        logger.log("error", "pod", "pod bootstrap file invalid", { error: String(e) });
++      }
++      return;
++    }
++    if (argv.includes("--pod-login")) {
++      const r = podLoginRoute(coord.repo.listAccounts());
++      logger.log("info", "app", "pod login requested", { found: !!r });
++      showWindow(r ?? "/accounts");
++      return;
++    }
+     if (argv.includes("--quit")) {
+       // Same path as tray → Quit: asks first when jobs are still running, never drops them silently.
+       logger.log("info", "app", "quit requested", { via: "--quit" });
+@@ -966,6 +1027,8 @@ async function boot(): Promise<void> {
+     logger.log("error", "api", "init failed", { error: String(e) });
+   }
+   mark("api");
++  if (podBoot) await runPodBootstrap(podBoot);
++
+   // Data and API are ready: answer the renderer's waiting commands and let the window show.
+   coreReady = true;
+   resolveCore(dispatcher);
+diff --git a/desktop/src/main/podBootstrap.ts b/desktop/src/main/podBootstrap.ts
+new file mode 100644
+index 0000000..f3c69d1
+--- /dev/null
++++ b/desktop/src/main/podBootstrap.ts
+@@ -0,0 +1,188 @@
++// POD Video Studio integration (local patch, not upstream).
++// POD launches this bundled copy with `--pod-bootstrap <file.json>`; this module then prepares everything a first
++// run needs so the user only signs in to Muse: the loopback proxy, the API on "this machine only", one account and
++// an API key for POD. Every step is idempotent: running it again creates nothing twice.
++import fs from "node:fs";
++import http from "node:http";
++import net from "node:net";
++import path from "node:path";
++
++export const POD_BUILD = true;
++export const POD_KEY_NAME = "POD Video Studio";
++const POD_ACCOUNT_ALIAS = "Muse";
++const PROXY_HOST = "127.0.0.1";
++
++export interface PodBootstrapFile {
++  /** Where to write a newly created API key (inside POD's own data folder). */
++  keyOut: string;
++  /** Loopback port of the forward proxy Muse uses for this machine's own connection. */
++  proxyPort: number;
++  /** POD has no working key: revoke the old POD key (token lost) and issue a new one. */
++  rotateKey: boolean;
++}
++
++export interface PodSettingsFile {
++  proxyPort: number;
++}
++
++type Log = (level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) => void;
++
++export function readBootstrapArg(argv: readonly string[]): PodBootstrapFile | null {
++  const i = argv.indexOf("--pod-bootstrap");
++  if (i < 0 || !argv[i + 1]) return null;
++  return parseBootstrap(fs.readFileSync(argv[i + 1], "utf8"));
++}
++
++export function parseBootstrap(text: string): PodBootstrapFile {
++  const o = JSON.parse(text) as Record<string, unknown>;
++  const keyOut = typeof o.keyOut === "string" ? o.keyOut : "";
++  const proxyPort = Number(o.proxyPort);
++  if (!path.isAbsolute(keyOut) || !keyOut.endsWith(".key")) throw new Error("pod bootstrap: keyOut must be an absolute .key path");
++  if (!fs.existsSync(path.dirname(keyOut))) throw new Error("pod bootstrap: keyOut folder does not exist");
++  if (!Number.isInteger(proxyPort) || proxyPort < 1024 || proxyPort > 65535) throw new Error("pod bootstrap: invalid proxyPort");
++  return { keyOut, proxyPort, rotateKey: o.rotateKey === true };
++}
++
++const settingsPath = (roaming: string) => path.join(roaming, "pod.json");
++
++export function readPodSettings(roaming: string): PodSettingsFile | null {
++  try {
++    const o = JSON.parse(fs.readFileSync(settingsPath(roaming), "utf8")) as Record<string, unknown>;
++    const port = Number(o.proxyPort);
++    return Number.isInteger(port) && port >= 1024 && port <= 65535 ? { proxyPort: port } : null;
++  } catch {
++    return null;
++  }
++}
++
++export function writePodSettings(roaming: string, s: PodSettingsFile): void {
++  fs.writeFileSync(settingsPath(roaming), JSON.stringify(s));
++}
++
++// ------------------------------------------------------------------ loopback forward proxy
++const HOP_BY_HOP = new Set(["proxy-connection", "proxy-authorization", "proxy-authenticate", "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade"]);
++
++/** HTTP + CONNECT forward proxy on 127.0.0.1 only. Logs nothing about requests (no URLs, headers or bodies). */
++export function startLoopbackProxy(port: number, log: Log): Promise<http.Server | null> {
++  const server = http.createServer((req, res) => {
++    let target: URL;
++    try {
++      target = new URL(req.url ?? "");
++    } catch {
++      res.writeHead(400).end();
++      return;
++    }
++    if (target.protocol !== "http:") {
++      res.writeHead(400).end();
++      return;
++    }
++    const headers: http.OutgoingHttpHeaders = {};
++    for (const [k, v] of Object.entries(req.headers)) if (!HOP_BY_HOP.has(k.toLowerCase())) headers[k] = v;
++    const up = http.request({ hostname: target.hostname, port: target.port || 80, path: target.pathname + target.search, method: req.method, headers }, (u) => {
++      const out: http.OutgoingHttpHeaders = {};
++      for (const [k, v] of Object.entries(u.headers)) if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v;
++      res.writeHead(u.statusCode ?? 502, out);
++      u.pipe(res);
++    });
++    up.on("error", () => {
++      if (!res.headersSent) res.writeHead(502);
++      res.end();
++    });
++    req.pipe(up);
++  });
++  server.on("connect", (req: http.IncomingMessage, client: net.Socket, head: Buffer) => {
++    const [host, portStr] = String(req.url).split(/:(?=\d+$)/);
++    const p = Number(portStr || 443);
++    if (!host || !Number.isInteger(p) || p < 1 || p > 65535) {
++      client.end("HTTP/1.1 400 Bad Request\r\n\r\n");
++      return;
++    }
++    const up = net.connect(p, host, () => {
++      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
++      if (head?.length) up.write(head);
++      up.pipe(client);
++      client.pipe(up);
++    });
++    up.on("error", () => {
++      if (!client.destroyed) client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
++      up.destroy();
++    });
++    client.on("error", () => up.destroy());
++  });
++  server.on("clientError", (_e, socket) => {
++    if (!socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
++  });
++  return new Promise((resolve) => {
++    server.once("error", (e: NodeJS.ErrnoException) => {
++      // Another copy (or the old `npm run local-proxy`) already serves this port: Muse still reaches it.
++      log(e.code === "EADDRINUSE" ? "info" : "warn", "pod proxy not started", { port, code: e.code });
++      resolve(null);
++    });
++    server.listen(port, PROXY_HOST, () => {
++      log("info", "pod proxy listening", { port });
++      resolve(server);
++    });
++  });
++}
++
++// ------------------------------------------------------------------ provisioning
++/** The parts of Muse4AI the bootstrap drives (kept narrow so it can be tested without Electron). */
++export interface PodTarget {
++  listProxies(): Array<{ id: string; host: string; port: number; health: string }>;
++  importProxies(text: string): unknown;
++  testProxy(id: string): Promise<void>;
++  listAccounts(): Array<{ id: string; proxyId: string | null }>;
++  addAccount(input: { alias: string; avatar: number; proxyId: string }): { id: string };
++  setAccountProxy(id: string, proxyId: string): unknown;
++  apiEnable(): Promise<void>;
++  listKeys(): Array<{ id: string; name: string; revokedAt: number | null }>;
++  revokeKey(id: string): void;
++  createKey(name: string): { token: string };
++}
++
++export interface PodProvisionResult {
++  proxyId: string;
++  accountId: string;
++  keyWritten: boolean;
++}
++
++export async function podProvision(cfg: PodBootstrapFile, t: PodTarget, log: Log): Promise<PodProvisionResult> {
++  // 1. API on this machine only (default port 47821).
++  await t.apiEnable();
++
++  // 2. Proxy entry for the loopback proxy.
++  const find = () => t.listProxies().find((p) => p.host === PROXY_HOST && p.port === cfg.proxyPort);
++  if (!find()) t.importProxies(`${PROXY_HOST}:${cfg.proxyPort}`);
++  const proxy = find();
++  if (!proxy) throw new Error("pod bootstrap: proxy entry was not created");
++  if (proxy.health !== "healthy") await t.testProxy(proxy.id);
++
++  // 3. One account. An existing one is kept (already signed in); it moves to the loopback proxy only when its own
++  //    proxy is another loopback port that nothing serves anymore.
++  let accounts = t.listAccounts();
++  if (accounts.length === 0) {
++    t.addAccount({ alias: POD_ACCOUNT_ALIAS, avatar: 0, proxyId: proxy.id });
++    accounts = t.listAccounts();
++    log("info", "pod account added");
++  }
++  const account = accounts[0];
++  if (!account.proxyId) t.setAccountProxy(account.id, proxy.id);
++
++  // 4. API key for POD: only when POD asks for one, and only one active key with this name.
++  let keyWritten = false;
++  const active = t.listKeys().filter((k) => k.revokedAt === null && k.name === POD_KEY_NAME);
++  if (cfg.rotateKey || active.length === 0) {
++    for (const k of active) t.revokeKey(k.id);
++    const { token } = t.createKey(POD_KEY_NAME);
++    fs.writeFileSync(cfg.keyOut, token, { mode: 0o600 });
++    keyWritten = true;
++    log("info", "pod key issued");
++  }
++  return { proxyId: proxy.id, accountId: account.id, keyWritten };
++}
++
++/** `--pod-login`: route of the sign-in screen for the account that needs it (or the first one). */
++export function podLoginRoute(accounts: Array<{ id: string; state: string }>): string | null {
++  const a = accounts.find((x) => x.state === "needs_login") ?? accounts[0];
++  return a ? `/accounts/${a.id}/login` : null;
++}
+diff --git a/desktop/test/api-server.test.ts b/desktop/test/api-server.test.ts
+index 897b202..a2a2f2b 100644
+--- a/desktop/test/api-server.test.ts
++++ b/desktop/test/api-server.test.ts
+@@ -457,7 +457,7 @@ describe("browser and Host protection (R33)", () => {
+     h = makeHarness();
+     rig = await makeApi(h);
+     const health = await rig.req("GET", "/v1/health");
+-    expect(health.json).toEqual({ ok: true, service: "muse4ai", instance: rig.api.instanceId });
++    expect(health.json).toEqual({ ok: true, service: "muse4ai", instance: rig.api.instanceId, pod: true });
+     const doc = await rig.req("GET", "/v1/openapi.json");
+     expect(doc.json.openapi).toBe("3.1.0");
+     expect(Object.keys(doc.json.paths)).toContain("/v1/jobs/{id}");
+diff --git a/desktop/test/podBootstrap.test.ts b/desktop/test/podBootstrap.test.ts
+new file mode 100644
+index 0000000..9a82904
+--- /dev/null
++++ b/desktop/test/podBootstrap.test.ts
+@@ -0,0 +1,144 @@
++import fs from "node:fs";
++import http from "node:http";
++import net from "node:net";
++import os from "node:os";
++import path from "node:path";
++import { describe, expect, it } from "vitest";
++import { parseBootstrap, podLoginRoute, podProvision, POD_KEY_NAME, startLoopbackProxy, type PodTarget } from "../src/main/podBootstrap";
++
++function fakeTarget() {
++  const proxies: Array<{ id: string; host: string; port: number; health: string }> = [];
++  const accounts: Array<{ id: string; proxyId: string | null }> = [];
++  const keys: Array<{ id: string; name: string; revokedAt: number | null }> = [];
++  const calls = { apiEnable: 0, created: 0, revoked: [] as string[], imported: 0, tested: 0 };
++  const t: PodTarget = {
++    listProxies: () => proxies.map((p) => ({ ...p })),
++    importProxies: (text) => {
++      calls.imported++;
++      const [host, port] = text.split(":");
++      proxies.push({ id: `p${proxies.length + 1}`, host, port: Number(port), health: "unchecked" });
++    },
++    testProxy: async (id) => {
++      calls.tested++;
++      proxies.find((p) => p.id === id)!.health = "healthy";
++    },
++    listAccounts: () => accounts.map((a) => ({ ...a })),
++    addAccount: (input) => {
++      const p = proxies.find((x) => x.id === input.proxyId);
++      if (p?.health !== "healthy") throw new Error("proxy not healthy");
++      const a = { id: `a${accounts.length + 1}`, proxyId: input.proxyId };
++      accounts.push(a);
++      return a;
++    },
++    setAccountProxy: (id, pid) => {
++      accounts.find((a) => a.id === id)!.proxyId = pid;
++    },
++    apiEnable: async () => {
++      calls.apiEnable++;
++    },
++    listKeys: () => keys.map((k) => ({ ...k })),
++    revokeKey: (id) => {
++      calls.revoked.push(id);
++      keys.find((k) => k.id === id)!.revokedAt = 1;
++    },
++    createKey: (name) => {
++      calls.created++;
++      keys.push({ id: `k${keys.length + 1}`, name, revokedAt: null });
++      return { token: `msk_test_${keys.length}` };
++    },
++  };
++  return { t, proxies, accounts, keys, calls };
++}
++
++const noLog = () => undefined;
++
++function tmpKey(): string {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "podboot-"));
++  return path.join(dir, "muse.key");
++}
++
++describe("POD bootstrap", () => {
++  it("first run creates proxy, account and key once; a second run creates nothing", async () => {
++    const f = fakeTarget();
++    const keyOut = tmpKey();
++    const r1 = await podProvision({ keyOut, proxyPort: 8080, rotateKey: false }, f.t, noLog);
++    expect(r1.keyWritten).toBe(true);
++    expect(fs.readFileSync(keyOut, "utf8")).toBe("msk_test_1");
++    expect(f.proxies).toHaveLength(1);
++    expect(f.accounts).toHaveLength(1);
++    expect(f.keys.filter((k) => k.name === POD_KEY_NAME)).toHaveLength(1);
++
++    fs.unlinkSync(keyOut);
++    const r2 = await podProvision({ keyOut, proxyPort: 8080, rotateKey: false }, f.t, noLog);
++    expect(r2.keyWritten).toBe(false);
++    expect(fs.existsSync(keyOut)).toBe(false);
++    expect(f.calls.imported).toBe(1);
++    expect(f.accounts).toHaveLength(1);
++    expect(f.calls.created).toBe(1);
++  });
++
++  it("keeps an existing signed-in account and its proxy", async () => {
++    const f = fakeTarget();
++    f.proxies.push({ id: "old", host: "127.0.0.1", port: 8080, health: "healthy" });
++    f.accounts.push({ id: "may", proxyId: "old" });
++    const r = await podProvision({ keyOut: tmpKey(), proxyPort: 8080, rotateKey: false }, f.t, noLog);
++    expect(r.accountId).toBe("may");
++    expect(f.calls.imported).toBe(0);
++    expect(f.calls.tested).toBe(0);
++    expect(f.accounts).toEqual([{ id: "may", proxyId: "old" }]);
++  });
++
++  it("rotateKey revokes the old POD key and issues a new one", async () => {
++    const f = fakeTarget();
++    f.keys.push({ id: "k0", name: POD_KEY_NAME, revokedAt: null }, { id: "other", name: "Agent n8n", revokedAt: null });
++    const keyOut = tmpKey();
++    const r = await podProvision({ keyOut, proxyPort: 8080, rotateKey: true }, f.t, noLog);
++    expect(r.keyWritten).toBe(true);
++    expect(f.calls.revoked).toEqual(["k0"]);
++    expect(f.keys.find((k) => k.id === "other")!.revokedAt).toBeNull();
++  });
++
++  it("validates the bootstrap file", () => {
++    const keyOut = tmpKey();
++    expect(parseBootstrap(JSON.stringify({ keyOut, proxyPort: 8080 }))).toEqual({ keyOut, proxyPort: 8080, rotateKey: false });
++    expect(() => parseBootstrap(JSON.stringify({ keyOut: "relative.key", proxyPort: 8080 }))).toThrow();
++    expect(() => parseBootstrap(JSON.stringify({ keyOut: keyOut.replace(".key", ".txt"), proxyPort: 8080 }))).toThrow();
++    expect(() => parseBootstrap(JSON.stringify({ keyOut, proxyPort: 80 }))).toThrow();
++  });
++
++  it("login route prefers the account that needs a sign-in", () => {
++    expect(podLoginRoute([])).toBeNull();
++    expect(podLoginRoute([{ id: "a", state: "ready" }, { id: "b", state: "needs_login" }])).toBe("/accounts/b/login");
++    expect(podLoginRoute([{ id: "a", state: "ready" }])).toBe("/accounts/a/login");
++  });
++
++  it("loopback proxy forwards CONNECT and stays on 127.0.0.1", async () => {
++    const echo = net.createServer((s) => s.pipe(s));
++    await new Promise<void>((r) => echo.listen(0, "127.0.0.1", r));
++    const echoPort = (echo.address() as net.AddressInfo).port;
++    const probe = net.createServer();
++    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
++    const port = (probe.address() as net.AddressInfo).port;
++    await new Promise<void>((r) => probe.close(() => r()));
++
++    const server = (await startLoopbackProxy(port, noLog)) as http.Server;
++    expect((server.address() as net.AddressInfo).address).toBe("127.0.0.1");
++    const reply = await new Promise<string>((resolve, reject) => {
++      const req = http.request({ host: "127.0.0.1", port, method: "CONNECT", path: `127.0.0.1:${echoPort}` });
++      req.on("connect", (_res, socket) => {
++        socket.write("ping");
++        socket.once("data", (d) => {
++          resolve(String(d));
++          socket.destroy();
++        });
++      });
++      req.on("error", reject);
++      req.end();
++    });
++    expect(reply).toBe("ping");
++    // Port already taken: does not throw, reports null.
++    expect(await startLoopbackProxy(port, noLog)).toBeNull();
++    await new Promise<void>((r) => server.close(() => r()));
++    await new Promise<void>((r) => echo.close(() => r()));
++  });
++});
