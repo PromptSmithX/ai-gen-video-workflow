@@ -1,0 +1,4 @@
+repo=https://github.com/andrew-babo/muse4ai
+commit=c661f83b8e7883e6fb1f16e1b584284818b26b29
+version=2.0.0-beta.35
+license=MIT (LICENSE and desktop/LICENSES/* ship with the bundled app)

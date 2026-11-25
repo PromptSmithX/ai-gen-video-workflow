@@ -410,6 +410,7 @@ export class FakeApiStore {
             data: { ...this.providerStatus },
           };
         },
+        setupAction: async () => ({ ok: true, data: { ...this.providerStatus } }),
       },
 
       images: {

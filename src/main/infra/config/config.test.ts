@@ -141,6 +141,36 @@ describe('Config Infrastructure', () => {
   });
 
   describe('loadConfig', () => {
+    it('MUSE_SUBMIT_MODE: chat (default) | video, anything else rejected', () => {
+      const load = (v: string | undefined) =>
+        loadConfig({ env: v === undefined ? {} : { MUSE_SUBMIT_MODE: v }, settings: {}, paths: dummyPaths, isDev: false });
+      expect(load(undefined).museSubmitMode).toBe('chat');
+      expect(load('video').museSubmitMode).toBe('video');
+      expect(load('CHAT').museSubmitMode).toBe('chat');
+      expect(() => load('browser')).toThrow(PodError);
+    });
+
+    it('bundled Muse4AI: installed app defaults to the real bridge; env overrides; dev keeps .env behaviour', () => {
+      const bundle = { muse4aiExePath: 'C:/app/resources/muse4ai/Muse4AI.exe', promptMasterPath: 'C:/app/resources/prompts/company/m.md' };
+      const installed = loadConfig({ env: {}, settings: {}, paths: dummyPaths, isDev: false, bundle });
+      expect(installed.providerMode).toBe('bridge');
+      expect(installed.bridgeBaseUrl).toBe('http://127.0.0.1:47821');
+      expect(installed.musePlatformOrigin).toBe('https://muse.ai');
+      expect(installed.promptMasterPath).toBe(bundle.promptMasterPath);
+      expect(installed.muse4aiExePath).toBe(bundle.muse4aiExePath);
+      expect(installed.muse4aiProxyPort).toBe(8080);
+
+      const overridden = loadConfig({ env: { PROVIDER_MODE: 'mock', MUSE4AI_PROXY_PORT: '18080' }, settings: {}, paths: dummyPaths, isDev: false, bundle });
+      expect(overridden.providerMode).toBe('mock');
+      expect(overridden.muse4aiProxyPort).toBe(18080);
+
+      const emptyEnv = path.join(mkdtempSync(path.join(os.tmpdir(), 'pod-cfg-')), '.env');
+      writeFileSync(emptyEnv, '');
+      const dev = loadConfig({ env: {}, settings: {}, paths: dummyPaths, isDev: true, envFilePath: emptyEnv, bundle: { muse4aiExePath: bundle.muse4aiExePath, promptMasterPath: null } });
+      expect(dev.providerMode).toBe('mock');
+      expect(() => loadConfig({ env: { MUSE4AI_PROXY_PORT: '80' }, settings: {}, paths: dummyPaths, isDev: false })).toThrow(PodError);
+    });
+
     it('loads defaults correctly', () => {
       const config = loadConfig({
         env: {},
@@ -150,9 +180,10 @@ describe('Config Infrastructure', () => {
       });
 
       expect(config.providerMode).toBe('mock');
+      expect(config.museSubmitMode).toBe('chat');
       expect(config.bridgeBaseUrl).toBeNull();
       expect(config.musePlatformOrigin).toBeNull();
-      expect(config.promptMaxChars).toBe(4000);
+      expect(config.promptMaxChars).toBe(20000);
       expect(config.pollIntervalMs).toBe(3000);
       expect(config.pollMaxIntervalMs).toBe(15000);
       expect(config.maxSourceBytes).toBe(15 * 1024 * 1024);
@@ -197,7 +228,7 @@ CSC_KEY_PASSWORD=
       expect(config.bridgeBaseUrl).toBeNull();
       expect(config.musePlatformOrigin).toBeNull();
       expect(config.promptMasterPath).toBeNull();
-      expect(config.promptMaxChars).toBe(4000);
+      expect(config.promptMaxChars).toBe(20000);
       expect(config.pollIntervalMs).toBe(3000);
       expect(config.pollMaxIntervalMs).toBe(15000);
       expect(config.maxSourceBytes).toBe(15 * 1024 * 1024);

@@ -14,6 +14,7 @@ import {
   RetryJobInput,
   SaveTemplateVersionInput,
   SetApiKeyInput,
+  SetupActionInput,
   SetDefaultTemplateInput,
   SetReviewInput,
   StagePathInput,
@@ -58,7 +59,26 @@ export function registerAllIpcHandlers(container: AppContainer): void {
     channel: IPC.providerTestConnection,
     logger,
     isDev,
-    handler: () => container.getProviderStatus(),
+    handler: async () => {
+      // Bundled Muse4AI: "Test connection" also re-runs setup when it is not running.
+      if (container.muse4ai && container.muse4ai.status().muse4ai !== 'running') await container.muse4ai.ensure();
+      return container.getProviderStatus();
+    },
+  });
+
+  registerIpcHandler(ipcMain, {
+    channel: IPC.providerSetupAction,
+    schema: SetupActionInput,
+    logger,
+    isDev,
+    handler: async (input) => {
+      const sup = container.muse4ai;
+      if (!sup) throw new PodError('INVALID_STATE', 'Muse4AI is not bundled with this installation');
+      if (input.action === 'login') sup.login();
+      else if (input.action === 'useBundled') await sup.useBundled();
+      else await sup.ensure();
+      return container.getProviderStatus();
+    },
   });
 
   // 3. Images: Pick & Stage

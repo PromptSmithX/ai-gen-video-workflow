@@ -4,7 +4,7 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
 export default tseslint.config(
-  { ignores: ['out/**', 'dist/**', 'release/**', 'node_modules/**', 'coverage/**'] },
+  { ignores: ['out/**', 'dist/**', 'release/**', 'node_modules/**', 'coverage/**', 'vendor/muse4ai/.work/**', 'vendor/muse4ai/dist/**', 'vendor/muse4ai/.tmp/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

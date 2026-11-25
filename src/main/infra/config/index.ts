@@ -4,7 +4,12 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { PodError } from '@shared/errors';
 import { DEFAULT_CATEGORIES, type Category } from '@shared/domain';
-import type { AdminSettings, AppConfig, ProviderMode } from '@shared/config';
+import type { AdminSettings, AppConfig, BundledResources, MuseSubmitMode, ProviderMode } from '@shared/config';
+
+/** Port the bundled Muse4AI serves its agent API on (its default, "this machine only"). */
+export const BUNDLED_BRIDGE_BASE_URL = 'http://127.0.0.1:47821';
+/** 8080 matches a proxy entry created by hand earlier, so an existing Muse4AI setup is reused as is. */
+export const DEFAULT_MUSE4AI_PROXY_PORT = 8080;
 
 /**
  * Validates that a given URL string points strictly to a loopback address
@@ -222,6 +227,8 @@ export function loadConfig(args: {
   paths: { userData: string; documents: string };
   isDev: boolean;
   envFilePath?: string;
+  /** Installer-shipped Muse4AI / Prompt Master: make the real bridge the default (env still overrides). */
+  bundle?: BundledResources;
 }): AppConfig {
   const effectiveEnv = readEffectiveEnv({
     env: args.env,
@@ -230,12 +237,38 @@ export function loadConfig(args: {
     envFilePath: args.envFilePath,
   });
 
+  const muse4aiExePath = args.bundle?.muse4aiExePath ?? null;
+  const bundledBridge = Boolean(muse4aiExePath) && !args.isDev;
+  if (bundledBridge) {
+    effectiveEnv['PROVIDER_MODE'] ??= 'bridge';
+    effectiveEnv['MUSE_BRIDGE_BASE_URL'] ??= BUNDLED_BRIDGE_BASE_URL;
+    effectiveEnv['MUSE_PLATFORM_ORIGIN'] ??= 'https://muse.ai';
+  }
+  if (args.bundle?.promptMasterPath) effectiveEnv['PROMPT_MASTER_PATH'] ??= args.bundle.promptMasterPath;
+
+  const proxyPortParsed = z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .max(65535)
+    .safeParse(effectiveEnv['MUSE4AI_PROXY_PORT'] ?? DEFAULT_MUSE4AI_PROXY_PORT);
+  if (!proxyPortParsed.success) {
+    throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: muse4aiProxyPort');
+  }
+
   // Provider mode
   const rawProviderMode = effectiveEnv['PROVIDER_MODE'] || 'mock';
   if (rawProviderMode !== 'mock' && rawProviderMode !== 'bridge') {
     throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: providerMode');
   }
   const providerMode = rawProviderMode as ProviderMode;
+
+  // Bridge submit mode: chat (full prompt, ≤ 32000 chars) or video (≤ 4000 chars)
+  const rawSubmitMode = (effectiveEnv['MUSE_SUBMIT_MODE'] || 'chat').trim().toLowerCase();
+  if (rawSubmitMode !== 'chat' && rawSubmitMode !== 'video') {
+    throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: museSubmitMode');
+  }
+  const museSubmitMode = rawSubmitMode as MuseSubmitMode;
 
   // Bridge base URL (normalize by stripping trailing slashes for clean URL concatenation)
   let bridgeBaseUrl: string | null = null;
@@ -282,7 +315,7 @@ export function loadConfig(args: {
   assertDataDir(dataDir);
 
   // Numbers & Bounds validation (empty values fall back to defaults)
-  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? 4000;
+  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? 20000;
   const pollIntervalMsRaw = effectiveEnv['POLL_INTERVAL_MS'] ?? 3000;
   const pollMaxIntervalMsRaw = effectiveEnv['POLL_MAX_INTERVAL_MS'] ?? 15000;
 
@@ -355,6 +388,7 @@ export function loadConfig(args: {
 
   return {
     providerMode,
+    museSubmitMode,
     musePlatformOrigin,
     bridgeBaseUrl,
     promptMasterPath,
@@ -370,5 +404,7 @@ export function loadConfig(args: {
     adminUsers,
     categories,
     isDev: args.isDev,
+    muse4aiExePath,
+    muse4aiProxyPort: proxyPortParsed.data,
   };
 }

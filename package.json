@@ -14,7 +14,11 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dist": "npm run build && electron-builder --win --config electron-builder.yml"
+    "build:muse4ai": "node vendor/muse4ai/build.mjs",
+    "build:muse4ai:fast": "node vendor/muse4ai/build.mjs --skip-tests",
+    "dist:dir": "node vendor/muse4ai/ensure.mjs && npm run build && electron-builder --win --dir --config electron-builder.yml",
+    "dist": "node vendor/muse4ai/ensure.mjs && npm run build && electron-builder --win --config electron-builder.yml",
+    "local-proxy": "node tools/local-proxy.mjs"
   },
   "dependencies": {
     "dotenv": "18.0.10",

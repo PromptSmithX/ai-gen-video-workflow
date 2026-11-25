@@ -38,6 +38,7 @@ describe('App Component', () => {
           },
         }),
         testConnection: vi.fn(),
+        setupAction: vi.fn(),
       },
       images: {
         pick: vi.fn(),

@@ -9,4 +9,11 @@ node_modules/
 *.part
 POD_VIDEO_LIBRARY/
 .vitest-tmp/
+vendor/muse4ai/.work/
+vendor/muse4ai/dist/
 *.tsbuildinfo
+vendor/muse4ai/.tmp/
+# Company Prompt Master is proprietary: never in the public repo (shipped from the build machine only)
+prompts/company/
+# Muse4AI library output (generated videos) when it is started from the repo folder
+/output/

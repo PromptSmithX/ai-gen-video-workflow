@@ -578,6 +578,26 @@ No fake claims.
       expect(physicsCheck?.passed).toBe(false);
     });
 
+    it('accepts comma-list and "invent" phrasings, and the company T-shirt Master V2 passes all 8 rules', () => {
+      const designCheck = checkQuality(
+        'Do not redesign, replace, simplify, mirror, duplicate or reinterpret any part of the original printed artwork.'
+      ).checks.find((c) => c.rule === 'no_design_changes');
+      expect(designCheck?.passed).toBe(true);
+
+      const claimsCheck = checkQuality('Do not invent product claims or spoken descriptions.').checks.find(
+        (c) => c.rule === 'no_fake_claims'
+      );
+      expect(claimsCheck?.passed).toBe(true);
+
+      // The company Prompt Master is kept out of the public repo; check it only where it exists locally.
+      const masterPath = path.resolve(__dirname, '../../../prompts/company/tshirt-review-v2.md');
+      if (fs.existsSync(masterPath)) {
+        const report = checkQuality(fs.readFileSync(masterPath, 'utf8'));
+        expect(report.checks.filter((c) => !c.passed).map((c) => c.rule)).toEqual([]);
+        expect(report.passed).toBe(true);
+      }
+    });
+
     it('validatePrompt detects unresolved template placeholders and validates length and quality', () => {
       const validText = `
 Human product review action where the reviewer presents and examines the product.

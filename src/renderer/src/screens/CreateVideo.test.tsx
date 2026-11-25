@@ -89,6 +89,7 @@ describe('CreateVideo Screen', () => {
       provider: {
         getStatus: vi.fn(),
         testConnection: vi.fn(),
+        setupAction: vi.fn(),
       },
       images: {
         pick: vi.fn().mockResolvedValue({
@@ -248,6 +249,39 @@ describe('CreateVideo Screen', () => {
 
     expect(screen.getByLabelText(/Duration/i)).toBeDefined();
     expect(screen.getByLabelText(/Aspect Ratio/i)).toBeDefined();
+  });
+
+  it('Template default: a company default is preselected over the built-in placeholder default', async () => {
+    mockApi.prompts.listTemplates = vi.fn().mockResolvedValue({
+      ok: true,
+      data: [
+        {
+          id: 'product-review',
+          version: 'v2',
+          title: 'Product review (PLACEHOLDER)',
+          isPlaceholder: true,
+          source: 'builtin',
+          isDefault: true,
+          createdAt: null,
+          note: null,
+        },
+        {
+          id: 'tshirt-review',
+          version: 'v2',
+          title: 'Authentic UGC T-shirt review',
+          isPlaceholder: false,
+          source: 'company',
+          isDefault: true,
+          createdAt: null,
+          note: null,
+        },
+      ],
+    });
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+    await waitFor(() => {
+      const select = screen.getByLabelText(/Prompt Template/i) as HTMLSelectElement;
+      expect(select.value).toBe('tshirt-review@@v2');
+    });
   });
 
   it('Template selection: fake list [v1, v2(isDefault)] -> preview and jobs.create receive templateVersion "v2"', async () => {

@@ -23,7 +23,7 @@ describe('Admin Screen', () => {
   beforeEach(() => {
     mockApi = {
       app: { getInfo: vi.fn() },
-      provider: { getStatus: vi.fn(), testConnection: vi.fn() },
+      provider: { getStatus: vi.fn(), testConnection: vi.fn(), setupAction: vi.fn() },
       images: { pick: vi.fn(), stageFile: vi.fn() },
       catalog: { listCategories: vi.fn() },
       prompts: {

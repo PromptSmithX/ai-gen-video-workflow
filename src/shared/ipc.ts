@@ -37,6 +37,17 @@ export interface ProviderStatus {
   hasApiKey: boolean;
   secretStoreAvailable: boolean;
   checkedAt: string;
+  /** First-run setup of the bundled Muse4AI; absent when the bridge is managed by hand (dev / no bundle). */
+  setup?: SetupStatus;
+}
+
+/** State of the Muse4AI copy POD starts and provisions itself. */
+export interface SetupStatus {
+  managed: true;
+  /** starting = being launched/provisioned; outdated = another (unpatched) Muse4AI is running. */
+  muse4ai: 'starting' | 'running' | 'outdated' | 'failed';
+  /** Safe, user-facing detail for 'outdated' / 'failed'. */
+  message: string | null;
 }
 
 /** A validated image staged in main; the renderer only holds the opaque token. */
@@ -158,6 +169,8 @@ export const UpdateSettingsInput = z
   })
   .partial();
 export const SetApiKeyInput = z.object({ apiKey: z.string().min(1).max(1024) });
+/** login = open Muse4AI's Muse sign-in window; useBundled = close another Muse4AI and start the bundled one; retry = run setup again. */
+export const SetupActionInput = z.object({ action: z.enum(['login', 'useBundled', 'retry']) });
 
 // ------------------------------------------------- window.api -------------------------------------------------
 
@@ -168,6 +181,7 @@ export interface PodApi {
   provider: {
     getStatus(): Promise<IpcResult<ProviderStatus>>;
     testConnection(): Promise<IpcResult<ProviderStatus>>;
+    setupAction(input: z.infer<typeof SetupActionInput>): Promise<IpcResult<ProviderStatus>>;
   };
   images: {
     /** Opens a native file dialog (PNG/JPEG/WEBP). null data = cancelled. */

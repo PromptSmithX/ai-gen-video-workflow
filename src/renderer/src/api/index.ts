@@ -20,6 +20,7 @@ const devProxy: PodApi = {
   provider: {
     getStatus: async () => (await getDevFakeApi()).provider.getStatus(),
     testConnection: async () => (await getDevFakeApi()).provider.testConnection(),
+    setupAction: async (input) => (await getDevFakeApi()).provider.setupAction(input),
   },
   images: {
     pick: async () => (await getDevFakeApi()).images.pick(),

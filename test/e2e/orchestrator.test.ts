@@ -109,6 +109,8 @@ describe('JobOrchestrator E2E', () => {
     media?: MediaLibrary;
     prompts?: PromptService;
     submitTimeoutMs?: number;
+    companyMasterPath?: string;
+    promptMaxChars?: number;
     pollIntervalMs?: number;
   }): Promise<TestStack> {
     const db = opts?.db ?? openDatabase(path.join(tempRoot, 'test.db'));
@@ -128,7 +130,7 @@ describe('JobOrchestrator E2E', () => {
       createPromptService({
         builtinDir: path.resolve('prompts'),
         adminDir: path.join(tempRoot, 'admin-prompts'),
-        companyMasterPath: null,
+        companyMasterPath: opts?.companyMasterPath ?? null,
       });
 
     const config: AppConfig = {
@@ -138,7 +140,7 @@ describe('JobOrchestrator E2E', () => {
       promptMasterPath: null,
       libraryRoot,
       dataDir: tempRoot,
-      promptMaxChars: 4000,
+      promptMaxChars: opts?.promptMaxChars ?? 4000,
       pollIntervalMs: opts?.pollIntervalMs ?? 100,
       pollMaxIntervalMs: 250,
       maxSourceBytes: 15 * 1024 * 1024,
@@ -195,6 +197,42 @@ describe('JobOrchestrator E2E', () => {
   }
 
   // 1. Happy path: create -> QUEUED -> SUBMITTING -> RUNNING -> DOWNLOADING -> SUCCEEDED
+  // The company Prompt Master is not in the public repo: this runs only where prompts/company/ exists locally.
+  it.skipIf(!fs.existsSync(path.resolve('prompts/company/tshirt-review-v2.md')))('company T-shirt Master V2 (~10k chars) goes verbatim through Muse4AI chat with the mockup attached -> SUCCEEDED', async () => {
+    server.setBehavior('healthy');
+    server.clearRequests();
+    const masterPath = path.resolve('prompts/company/tshirt-review-v2.md');
+    const stack = await createTestStack({ companyMasterPath: masterPath, promptMaxChars: 20000 });
+    const token = await stack.stageImage('TS-MASTER.png');
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'tshirt-review',
+        templateVersion: 'v2',
+        sku: 'TS-MASTER',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+
+    const done = await waitForJobState(stack.db, view.job.id, 'SUCCEEDED');
+    expect(done.state).toBe('SUCCEEDED');
+
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(1);
+    const body = posts[0]?.jsonBody as Record<string, unknown>;
+    expect(body['kind']).toBe('chat');
+    expect(Array.isArray(body['attachments'])).toBe(true);
+    const sent = String(body['prompt']);
+    expect(sent.length).toBeGreaterThan(10000);
+    expect(sent).toContain('AUTHENTIC UGC T-SHIRT PRODUCT REVIEW');
+    expect(sent).toContain('## 15. FINAL VIDEO OBJECTIVE');
+    expect(sent).not.toContain('PLACEHOLDER');
+    stack.orchestrator.stop();
+  });
+
   it('happy path: create -> QUEUED -> SUBMITTING -> RUNNING -> DOWNLOADING -> SUCCEEDED', async () => {
     server.setBehavior('healthy');
     const stack = await createTestStack();
@@ -550,9 +588,12 @@ describe('JobOrchestrator E2E', () => {
         'employee-1'
       );
 
-      const job = await waitForJobState(stack.db, view.job.id, 'DOWNLOAD_FAILED');
-      expect(job.state).toBe('DOWNLOAD_FAILED');
+      // Default submit mode is chat: a chat turn that succeeds without a video output is terminal (no download
+      // loop) and is never resent.
+      const job = await waitForJobState(stack.db, view.job.id, 'FAILED_PROVIDER');
+      expect(job.state).toBe('FAILED_PROVIDER');
       expect(job.errorCode).toBe('OUTPUT_MISSING');
+      expect(server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs').length).toBe(1);
       stack.orchestrator.stop();
     }
 
@@ -585,6 +626,9 @@ describe('JobOrchestrator E2E', () => {
   // 7. Retry of FAILED_RETRYABLE reuses the idempotency key; PROVIDER_ERROR retry allowed once only
   it('retry of FAILED_RETRYABLE reuses the idempotency key; PROVIDER_ERROR retry allowed once only', async () => {
     const stack = await createTestStack();
+    // Bookkeeping only: keep the background queue from picking up the re-queued jobs (their source files do not
+    // exist) and racing the manual state transitions below.
+    stack.orchestrator.stop();
 
     // 7a: FAILED_RETRYABLE retry
     const reqId1 = newId();
@@ -707,6 +751,61 @@ describe('JobOrchestrator E2E', () => {
     expect(regeneratedView.job.idempotencyKey).toBe(newClientRequestId);
     expect(regeneratedView.job.regeneratedFromJobId).toBe(completed.id);
     expect(regeneratedView.job.sourceAssetId).toBe(completed.sourceAssetId);
+
+    // The regenerated job is actually submitted with the same prompt and completes
+    const regenDone = await waitForJobState(stack.db, regeneratedView.job.id, 'SUCCEEDED');
+    expect(regenDone.safeErrorMessage).toBeNull();
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(2);
+    const prompt1 = (posts[0]?.jsonBody as Record<string, unknown>)['prompt'];
+    const prompt2 = (posts[1]?.jsonBody as Record<string, unknown>)['prompt'];
+    expect(prompt2).toBe(prompt1);
+
+    stack.orchestrator.stop();
+  });
+
+  // 8b. Legacy regenerated job without its own prompt snapshot row -> retry falls back to the original's snapshot
+  it('retry of a regenerated job without its own snapshot uses the original snapshot', async () => {
+    server.setBehavior('healthy');
+    const stack = await createTestStack();
+    const token = await stack.stageImage('TS-008B.png');
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-008B',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+    const completed = await waitForJobState(stack.db, view.job.id, 'SUCCEEDED');
+
+    // Same shape as rows created by the old regenerate(): no prompt_snapshot asset of its own
+    const legacyId = newId();
+    stack.db.jobs.insert({
+      id: legacyId,
+      productId: completed.productId,
+      skuSnapshot: completed.skuSnapshot,
+      employeeId: completed.employeeId,
+      provider: 'muse',
+      sourceAssetId: completed.sourceAssetId,
+      promptTemplateId: completed.promptTemplateId,
+      promptTemplateVersion: completed.promptTemplateVersion,
+      promptSha256: completed.promptSha256,
+      promptOverridden: completed.promptOverridden,
+      durationSeconds: null,
+      aspectRatio: null,
+      idempotencyKey: newId(),
+      regeneratedFromJobId: completed.id,
+      state: 'FAILED_RETRYABLE',
+    });
+    expect(stack.db.assets.listByJob(legacyId)).toHaveLength(0);
+
+    await stack.orchestrator.retry(legacyId, true);
+    const done = await waitForJobState(stack.db, legacyId, 'SUCCEEDED');
+    expect(done.safeErrorMessage).toBeNull();
 
     stack.orchestrator.stop();
   });
@@ -835,6 +934,51 @@ describe('JobOrchestrator E2E', () => {
     const getsAfter = server.getRequests().filter((r) => r.method === 'GET' && r.url.startsWith('/v1/jobs/')).length;
     expect(getsAfter).toBe(getsBefore);
 
+    const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(posts.length).toBe(1);
+    server.setCustomGetJobResponse(null);
+    stack.orchestrator.stop();
+  });
+
+  it('Muse4AI needs_review while polling -> AMBIGUOUS (no spin); check_again re-reads the job and completes, 1 POST', async () => {
+    server.setBehavior('needs_review');
+    const stack = await createTestStack({ pollIntervalMs: 50 });
+    const token = await stack.stageImage('TS-REVIEW.png');
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: token,
+        templateId: 'product-review',
+        templateVersion: 'v2',
+        sku: 'TS-REVIEW',
+        categoryId: 't-shirt',
+      },
+      'employee-1'
+    );
+
+    const ambiguous = await waitForJobState(stack.db, view.job.id, 'AMBIGUOUS');
+    expect(ambiguous.errorCode).toBe('SUBMIT_AMBIGUOUS');
+    expect(ambiguous.providerJobId).toBeTruthy();
+
+    const getsBefore = server.getRequests().filter((r) => r.method === 'GET' && r.url.startsWith('/v1/jobs/')).length;
+    await new Promise((r) => setTimeout(r, 300));
+    const getsAfter = server.getRequests().filter((r) => r.method === 'GET' && r.url.startsWith('/v1/jobs/')).length;
+    expect(getsAfter).toBe(getsBefore);
+
+    // A person resolves it in Muse4AI ("Import from Muse history") -> bridge now reports succeeded.
+    server.setCustomGetJobResponse({
+      statusCode: 200,
+      body: {
+        id: ambiguous.providerJobId,
+        status: 'succeeded',
+        outputs: [{ asset_id: `asset-${ambiguous.providerJobId}`, kind: 'video', mime: 'video/mp4', available: true }],
+      },
+    });
+    const reconciled = await stack.orchestrator.resolveAmbiguous(view.job.id, 'check_again');
+    expect(reconciled.job.state).toBe('RUNNING');
+
+    const done = await waitForJobState(stack.db, view.job.id, 'SUCCEEDED');
+    expect(done.state).toBe('SUCCEEDED');
     const posts = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
     expect(posts.length).toBe(1);
     server.setCustomGetJobResponse(null);

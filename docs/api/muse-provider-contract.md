@@ -2,6 +2,19 @@
 
 _Specification date: 2026-11-23. Implemented in `src/main/providers/muse`._
 
+> **2026-11-24 — verified against the live bridge (Muse4AI agent API 2.0.0-beta.35, snapshot
+> `docs/api/bridge-openapi.json`).** Where the payload examples below differ, the verified contract wins:
+> - Submit `POST /v1/jobs` body: only `kind:"video"`, `mode:"reference"`, `prompt`, `reference_id`, `repeat:1`,
+>   `account:"auto"` (schema is `additionalProperties:false`; no duration/aspect). Response `202 {jobs:[Job]}`.
+> - Job: public `status` (`queued|running|needs_review|succeeded|failed|cancelled`) — `state` is internal and ignored;
+>   failure reason in `error.code`; video in `outputs[]` (`asset_id`, `kind:"video"`, `available`). No progress field.
+> - Download: `GET /v1/assets/{asset_id}/content` with the bearer key (not `/download`, signed links unused).
+> - Errors: RFC 9457 problem+json with `code` (`invalid_api_key`, `invalid_request`, `capability_unavailable`, …).
+> - `X-File-Name` is percent-encoded. No lookup by Idempotency-Key.
+> - Mapping tables: `docs/integration/platform-compatibility.md` §4–5.
+> - **Default submit mode is chat** (`MUSE_SUBMIT_MODE=chat`): body `{kind:"chat", prompt (≤ 32000), attachments:[reference_id],
+>   account:"auto"}`. A chat job that succeeds without a video output maps to `failed` / `OUTPUT_MISSING`.
+
 ## 1. Overview and Boundary
 
 Per **ADR-001** and Brief §3.3, all Muse-specific knowledge is strictly isolated behind the `MuseProvider` interface (`src/shared/provider.ts`). The application UI and orchestrator communicate exclusively with this interface and have no awareness of network endpoints, HTTP status codes, or bridge payloads.

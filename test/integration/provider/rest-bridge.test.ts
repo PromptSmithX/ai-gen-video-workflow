@@ -35,8 +35,12 @@ describe('RestBridgeMuseProvider Integration', () => {
     child: () => mockLogger,
   };
 
-  const createConfig = (baseUrl: string | null = serverBaseUrl): AppConfig => ({
+  const createConfig = (
+    baseUrl: string | null = serverBaseUrl,
+    museSubmitMode: 'chat' | 'video' = 'chat'
+  ): AppConfig => ({
     providerMode: 'bridge',
+    museSubmitMode,
     musePlatformOrigin: 'https://muse.ai',
     bridgeBaseUrl: baseUrl,
     promptMasterPath: null,
@@ -162,7 +166,7 @@ describe('RestBridgeMuseProvider Integration', () => {
 
   it('uploads source reference then submits exactly one job with Idempotency-Key = requestId', async () => {
     const provider = new RestBridgeMuseProvider({
-      config: createConfig(),
+      config: createConfig(serverBaseUrl, 'video'),
       getApiKey: () => testApiKey,
       logger: mockLogger,
     });
@@ -201,11 +205,135 @@ describe('RestBridgeMuseProvider Integration', () => {
 
     const poll1 = await provider.getJob(job.providerJobId);
     expect(poll1.state).toBe('running');
-    expect(poll1.progress).toBe(0.5);
+    // Muse4AI reports no progress percentage; never fabricated.
+    expect(poll1.progress).toBeUndefined();
 
     const poll2 = await provider.getJob(job.providerJobId);
     expect(poll2.state).toBe('succeeded');
-    expect(poll2.progress).toBe(1.0);
+    expect(poll2.providerAssetId).toBe(`asset-${job.providerJobId}`);
+  });
+
+  it('sends only Muse4AI CreateJob fields (no duration/aspect) and a percent-encoded X-File-Name', async () => {
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(serverBaseUrl, 'video'),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+    const input = { ...createInput('req-fields'), sourceFileName: 'áo thun.png', durationSeconds: 10, aspectRatio: '9:16' as const };
+    const job = await provider.generateVideo(input);
+    expect(job.state).toBe('queued');
+
+    const ref = server.getRequests().find((r) => r.url === '/v1/references');
+    expect(ref?.headers['x-file-name']).toBe(encodeURIComponent('áo thun.png'));
+    const post = server.getRequests().find((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(Object.keys(post?.jsonBody as Record<string, unknown>).sort()).toEqual(
+      ['account', 'kind', 'mode', 'prompt', 'reference_id', 'repeat'].sort()
+    );
+  });
+
+  it('maps Muse4AI needs_review to ambiguous and failed error codes to safe codes', async () => {
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+
+    server.setCustomGetJobResponse({ statusCode: 200, body: { id: 'job-x', status: 'needs_review', state: 'needs_review' } });
+    const review = await provider.getJob('job-x');
+    expect(review.state).toBe('ambiguous');
+    expect(review.errorCode).toBe('SUBMIT_AMBIGUOUS');
+
+    const cases: Array<[string, string]> = [
+      ['QUOTA_LIMIT', 'QUOTA_LIMITED'],
+      ['CONTENT_REFUSED', 'CONTENT_REFUSED'],
+      ['SESSION_EXPIRED', 'NEEDS_LOGIN'],
+      ['PROVIDER_ERROR', 'PROVIDER_ERROR'],
+      ['UI_CHANGED', 'PROVIDER_ERROR'],
+    ];
+    for (const [bridgeCode, expected] of cases) {
+      server.setCustomGetJobResponse({
+        statusCode: 200,
+        body: { id: 'job-x', status: 'failed', error: { code: bridgeCode, message: 'x' }, outputs: [] },
+      });
+      const failed = await provider.getJob('job-x');
+      expect(failed.state).toBe('failed');
+      expect(failed.errorCode).toBe(expected);
+    }
+
+    // Unknown public status -> ambiguous (stop and ask a human), never guessed as success/failure
+    server.setCustomGetJobResponse({ statusCode: 200, body: { id: 'job-x', status: 'something_new' } });
+    expect((await provider.getJob('job-x')).state).toBe('ambiguous');
+    server.setCustomGetJobResponse(null);
+  });
+
+  it('derives connection state and capabilities from Muse4AI /v1/status (chat default: 32000 chars)', async () => {
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+    expect(await provider.getConnectionState()).toBe('ready');
+    const caps = await provider.getCapabilities();
+    expect(caps).toMatchObject({
+      canCancel: true,
+      reportsProgress: false,
+      supportedDurations: [],
+      supportedAspectRatios: [],
+      maxPromptChars: 32000,
+      maxUploadBytes: 20 * 1024 * 1024,
+    });
+
+    const videoProvider = new RestBridgeMuseProvider({
+      config: createConfig(serverBaseUrl, 'video'),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+    expect((await videoProvider.getCapabilities()).maxPromptChars).toBe(4000);
+  });
+
+  it('chat mode sends the full long prompt verbatim with the mockup attached, and downloads the video', async () => {
+    server.clearRequests();
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+    const longPrompt = 'Preserve the exact artwork. '.repeat(400); // ~11 200 chars, > 4000 video limit
+    const job = await provider.generateVideo(createInput('req-chat-long', longPrompt));
+    expect(job.state).toBe('queued');
+
+    const post = server.getRequests().find((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    const body = post?.jsonBody as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(['account', 'attachments', 'kind', 'prompt']);
+    expect(body['kind']).toBe('chat');
+    expect(body['prompt']).toBe(longPrompt);
+    expect(body['attachments']).toEqual([job.providerReferenceId]);
+    expect(post?.headers['idempotency-key']).toBe('req-chat-long');
+
+    await provider.getJob(job.providerJobId); // running
+    const done = await provider.getJob(job.providerJobId);
+    expect(done.state).toBe('succeeded');
+    const destPath = path.join(tempDir, 'chat-video.mp4');
+    const result = await provider.downloadOutput(job.providerJobId, destPath, 10 * 1024 * 1024);
+    expect(result.bytes).toBeGreaterThan(0);
+  });
+
+  it('chat mode: Muse answers with text only -> failed OUTPUT_MISSING (terminal, nothing resent)', async () => {
+    server.setBehavior('chat_no_video');
+    server.clearRequests();
+    const provider = new RestBridgeMuseProvider({
+      config: createConfig(),
+      getApiKey: () => testApiKey,
+      logger: mockLogger,
+    });
+    const job = await provider.generateVideo(createInput('req-chat-text'));
+    await provider.getJob(job.providerJobId); // running
+    const done = await provider.getJob(job.providerJobId);
+    expect(done.state).toBe('failed');
+    expect(done.errorCode).toBe('OUTPUT_MISSING');
+    expect(done.providerAssetId).toBeUndefined();
+    expect(server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs').length).toBe(1);
+    server.setBehavior('healthy');
   });
 
   it('maps submitJob 4xx responses per explicit review table', async () => {
@@ -237,17 +365,18 @@ describe('RestBridgeMuseProvider Integration', () => {
       });
     }
 
-    // Row 3: 429 -> QUOTA_LIMITED, phase before_submit unless body says submitted:true
-    server.setCustomJobResponse({ statusCode: 429, body: { submitted: false } });
+    // Row 3: 429 (rate limited / queue full; Muse4AI creates nothing) -> QUOTA_LIMITED, before_submit
+    server.setCustomJobResponse({ statusCode: 429, body: { status: 429, code: 'rate_limited' } });
     await expect(provider.generateVideo(createInput('req-429-before'))).rejects.toMatchObject({
       code: 'QUOTA_LIMITED',
       phase: 'before_submit',
     });
 
-    server.setCustomJobResponse({ statusCode: 429, body: { submitted: true } });
-    await expect(provider.generateVideo(createInput('req-429-after'))).rejects.toMatchObject({
-      code: 'QUOTA_LIMITED',
-      phase: 'after_submit',
+    // Muse4AI problem+json: invalid_api_key -> NEEDS_LOGIN
+    server.setCustomJobResponse({ statusCode: 401, body: { status: 401, code: 'invalid_api_key' } });
+    await expect(provider.generateVideo(createInput('req-badkey'))).rejects.toMatchObject({
+      code: 'NEEDS_LOGIN',
+      phase: 'before_submit',
     });
 
     // Row 4: Explicit refusal code -> CONTENT_REFUSED, phase after_submit
@@ -257,13 +386,13 @@ describe('RestBridgeMuseProvider Integration', () => {
       phase: 'after_submit',
     });
 
-    server.setCustomJobResponse({ statusCode: 400, body: { error: 'refused' } });
+    server.setCustomJobResponse({ statusCode: 400, body: { code: 'refused' } });
     await expect(provider.generateVideo(createInput('req-refused-2'))).rejects.toMatchObject({
       code: 'CONTENT_REFUSED',
       phase: 'after_submit',
     });
 
-    server.setCustomJobResponse({ statusCode: 400, body: { error: { code: 'safety' } } });
+    server.setCustomJobResponse({ statusCode: 400, body: { code: 'safety' } });
     await expect(provider.generateVideo(createInput('req-refused-3'))).rejects.toMatchObject({
       code: 'CONTENT_REFUSED',
       phase: 'after_submit',
@@ -276,11 +405,6 @@ describe('RestBridgeMuseProvider Integration', () => {
       phase: 'before_submit',
     });
 
-    server.setCustomJobResponse({ statusCode: 400, body: { code: 'credits', submitted: true } });
-    await expect(provider.generateVideo(createInput('req-code-credits'))).rejects.toMatchObject({
-      code: 'QUOTA_LIMITED',
-      phase: 'after_submit',
-    });
 
     server.setCustomJobResponse({ statusCode: 400, body: { code: 'login_required' } });
     await expect(provider.generateVideo(createInput('req-code-login'))).rejects.toMatchObject({

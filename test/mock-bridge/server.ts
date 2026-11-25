@@ -1,5 +1,5 @@
 /**
- * Mock bridge HTTP server implementing the approved local Muse REST bridge.
+ * Mock of the Muse4AI local agent API (2.0.0-beta.35 shapes; see docs/api/bridge-openapi.json).
  * Binds strictly to 127.0.0.1 on a dynamic port (port 0).
  * Supports switchable behaviors for testing happy paths, failures, quotas,
  * timeouts, and security edge cases.
@@ -20,7 +20,10 @@ export type MockBridgeBehavior =
   | 'oversized_download'
   | 'redirect_to_foreign_host'
   | 'asset_url_foreign_host'
-  | 'auth_error';
+  | 'auth_error'
+  | 'needs_review'
+  /** Chat turn succeeds but Muse only answers with text (no video output). */
+  | 'chat_no_video';
 
 export interface RecordedRequest {
   method: string;
@@ -33,8 +36,9 @@ export interface RecordedRequest {
 interface MockServerJob {
   id: string;
   idempotencyKey: string;
-  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  state: 'queued' | 'running' | 'needs_review' | 'succeeded' | 'failed' | 'cancelled';
   polls: number;
+  kind: 'video' | 'chat';
 }
 
 export interface CustomResponse {
@@ -128,6 +132,47 @@ export class MockBridgeServer {
     return `http://127.0.0.1:${this.port}`;
   }
 
+  /** Muse4AI public Job view. */
+  private jobView(job: MockServerJob): Record<string, unknown> {
+    const outputs: unknown[] = [];
+    const textOnly = job.kind === 'chat' && this.behavior === 'chat_no_video';
+    if (job.state === 'succeeded' && this.behavior !== 'success_no_asset' && !textOnly) {
+      const assetId = `asset-${job.id}`;
+      outputs.push({
+        asset_id: assetId,
+        kind: 'video',
+        mime: 'video/mp4',
+        available: true,
+        download_url:
+          this.behavior === 'asset_url_foreign_host'
+            ? 'http://example.com/videos/foreign.mp4'
+            : `http://127.0.0.1:${this.port}/v1/assets/${assetId}/content?exp=1&kid=k&sig=s`,
+      });
+    }
+    let error: unknown = null;
+    if (job.state === 'failed') {
+      error =
+        this.behavior === 'quota'
+          ? { code: 'QUOTA_LIMIT', message: 'Usage limit reached' }
+          : this.behavior === 'refused'
+            ? { code: 'CONTENT_REFUSED', message: 'Muse refused' }
+            : { code: 'PROVIDER_ERROR', message: 'Muse failed' };
+    }
+    return {
+      id: job.id,
+      kind: job.kind,
+      mode: job.kind === 'video' ? 'reference' : undefined,
+      conversation_id: job.kind === 'chat' ? `mc_${job.id}` : null,
+      result: job.kind === 'chat' && job.state === 'succeeded' ? { text: 'Here is your video.' } : null,
+      status: job.state,
+      state: job.state === 'running' ? 'generating' : job.state,
+      needs_human: job.state === 'needs_review',
+      error,
+      outputs,
+      version: job.polls + 1,
+    };
+  }
+
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
@@ -159,92 +204,82 @@ export class MockBridgeServer {
     const checkAuth = (): boolean => {
       if (this.behavior === 'auth_error') {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'UNAUTHORIZED', message: 'Authentication failed.' }));
+        res.end(JSON.stringify({ status: 401, code: 'invalid_api_key', detail: 'Authentication failed.' }));
         return false;
       }
       if (!authHeader || authHeader !== `Bearer ${this.expectedToken}`) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'UNAUTHORIZED', message: 'Missing or invalid token.' }));
+        res.end(JSON.stringify({ status: 401, code: 'invalid_api_key', detail: 'Missing or invalid token.' }));
         return false;
       }
       return true;
     };
 
+    const json = (status: number, payload: unknown, type = 'application/json'): void => {
+      res.writeHead(status, { 'Content-Type': type });
+      res.end(JSON.stringify(payload));
+    };
+    const problem = (status: number, code: string, detail = code): void =>
+      json(
+        status,
+        { type: 'about:blank', title: code, status, detail, code, request_id: `req-${this.idCounter++}` },
+        'application/problem+json'
+      );
+
     // 1. Health check (unauthenticated)
     if (pathname === '/v1/health') {
-      if (this.behavior === 'provider_5xx') {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'INTERNAL_ERROR' }));
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', healthy: true }));
-      return;
+      if (this.behavior === 'provider_5xx') return problem(500, 'internal_error');
+      return json(200, { ok: true, service: 'muse4ai', instance: 'mock-instance' });
     }
 
-    // 2. Status check (authenticated)
+    // 2. Status check (authenticated) — Muse4AI shape: capabilities, accounts, key, limits
     if (pathname === '/v1/status') {
       if (!checkAuth()) return;
+      if (this.behavior === 'provider_5xx') return problem(500, 'internal_error');
 
+      let accounts: Record<string, unknown> = {
+        total: 1,
+        ready: 1,
+        busy: 0,
+        waiting: 0,
+        needs_user: 0,
+        paused: 0,
+        items: [{ alias: 'mock', group: 'ready', quota: { tier: 'ok' } }],
+      };
       if (this.behavior === 'needs_login') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'needs_login', needs_login: true }));
-        return;
+        accounts = {
+          total: 1,
+          ready: 0,
+          busy: 0,
+          waiting: 0,
+          needs_user: 1,
+          paused: 0,
+          items: [{ alias: 'mock', group: 'needs_user', quota: null }],
+        };
       }
-      if (this.behavior === 'quota') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'quota_limited', quota_limited: true }));
-        return;
-      }
-      if (this.behavior === 'provider_5xx') {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'INTERNAL_ERROR' }));
-        return;
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          status: 'ready',
-          authenticated: true,
-          capabilities: {
-            can_cancel: true,
-            reports_progress: true,
-            supported_durations: [5, 10],
-            supported_aspect_ratios: ['9:16', '16:9', '1:1'],
-            max_prompt_chars: 4000,
-            max_upload_bytes: 20 * 1024 * 1024,
-            can_lookup_by_request_id: true,
-          },
-        })
-      );
-      return;
+      return json(200, {
+        service: 'muse4ai',
+        version: '2.0.0-beta.35',
+        capabilities: { video_from_image: true, video_from_text: true, image_from_text: true, chat: true },
+        accounts,
+        key: { name: 'mock', scope: 'generate', unfinished_jobs: 0 },
+        limits: { prompt_max_chars: 4000, chat_prompt_max_chars: 32000, upload_max_bytes: 20 * 1024 * 1024 },
+      });
     }
 
-    // 3. Upload reference image (authenticated)
+    // 3. Upload reference image (authenticated, raw bytes) -> 201
     if (pathname === '/v1/references' && req.method === 'POST') {
       if (!checkAuth()) return;
-
-      if (rawBody.length > 20 * 1024 * 1024) {
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'PAYLOAD_TOO_LARGE' }));
-        return;
-      }
-
-      const referenceId = `ref-${this.idCounter++}`;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          reference_id: referenceId,
-          kind: 'image',
-          mime: req.headers['content-type'] ?? 'image/png',
-          bytes: rawBody.length,
-        })
-      );
-      return;
+      if (rawBody.length > 20 * 1024 * 1024) return problem(413, 'payload_too_large');
+      return json(201, {
+        reference_id: `ref-${this.idCounter++}`,
+        kind: 'image',
+        mime: req.headers['content-type'] ?? 'image/png',
+        bytes: rawBody.length,
+      });
     }
 
-    // 4. Submit video job (authenticated)
+    // 4. Submit video job (authenticated) -> 202 { jobs: [Job] }
     if (pathname === '/v1/jobs' && req.method === 'POST') {
       if (!checkAuth()) return;
 
@@ -261,97 +296,62 @@ export class MockBridgeServer {
         return;
       }
 
-      if (this.behavior === 'hang_after_request_body') {
-        // Hang indefinitely without responding (triggers client timeout)
-        return;
-      }
-
-      if (this.behavior === 'refused') {
-        res.writeHead(422, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: 'CONTENT_REFUSED',
-            message: 'Artwork content was refused by policy.',
-            submitted: false,
-          })
-        );
-        return;
-      }
-
-      if (this.behavior === 'quota') {
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: 'QUOTA_LIMITED',
-            message: 'Generation quota exceeded.',
-            submitted: false,
-          })
-        );
-        return;
-      }
-
-      if (this.behavior === 'provider_5xx') {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'INTERNAL_SERVER_ERROR' }));
-        return;
-      }
-
+      if (this.behavior === 'hang_after_request_body') return; // never answers (client timeout)
+      if (this.behavior === 'provider_5xx') return problem(500, 'internal_error');
       if (this.behavior === 'redirect_to_foreign_host') {
         res.writeHead(302, { Location: 'http://example.com/foreign-submit' });
         res.end();
         return;
       }
 
-      const idempotencyKey = (req.headers['idempotency-key'] as string) || `auto-${this.idCounter++}`;
-      const existing = this.jobsByIdempotencyKey.get(idempotencyKey);
-      if (existing) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ id: existing.id, state: existing.state }));
-        return;
+      // Muse4AI CreateJob / CreateChat schemas are additionalProperties:false
+      const body = (jsonBody ?? {}) as Record<string, unknown>;
+      const kind = body['kind'];
+      const allowed =
+        kind === 'chat'
+          ? new Set(['kind', 'prompt', 'attachments', 'conversation_id', 'account'])
+          : new Set([
+              'kind',
+              'prompt',
+              'mode',
+              'reference_id',
+              'reference_asset_id',
+              'reference_ids',
+              'repeat',
+              'account',
+              'site',
+            ]);
+      const maxPrompt = kind === 'chat' ? 32000 : 4000;
+      if (
+        Object.keys(body).some((k) => !allowed.has(k)) ||
+        (kind !== 'video' && kind !== 'chat') ||
+        typeof body['prompt'] !== 'string' ||
+        body['prompt'].length < 1 ||
+        body['prompt'].length > maxPrompt
+      ) {
+        return problem(400, 'invalid_request');
       }
 
-      const jobId = `job-${this.idCounter++}`;
+      const idempotencyKey = (req.headers['idempotency-key'] as string) || `auto-${this.idCounter++}`;
+      const existing = this.jobsByIdempotencyKey.get(idempotencyKey);
+      if (existing) return json(202, { jobs: [this.jobView(existing)] });
+
       const newJob: MockServerJob = {
-        id: jobId,
+        id: `job-${this.idCounter++}`,
         idempotencyKey,
         state: 'queued',
         polls: 0,
+        kind: kind === 'chat' ? 'chat' : 'video',
       };
-
-      this.jobs.set(jobId, newJob);
+      this.jobs.set(newJob.id, newJob);
       this.jobsByIdempotencyKey.set(idempotencyKey, newJob);
-
-      res.writeHead(202, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ id: jobId, state: 'queued' }));
-      return;
+      return json(202, { jobs: [this.jobView(newJob)] });
     }
 
-    // 5. Query jobs by query parameter (idempotency key lookup)
+    // 5. List jobs (Muse4AI has no lookup by idempotency key)
     if (pathname === '/v1/jobs' && req.method === 'GET') {
       if (!checkAuth()) return;
-      const idempotencyKey = parsedUrl.searchParams.get('idempotency_key');
-      if (idempotencyKey) {
-        const job = this.jobsByIdempotencyKey.get(idempotencyKey);
-        if (!job) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'NOT_FOUND' }));
-          return;
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify([
-            {
-              id: job.id,
-              state: job.state,
-              asset_id: `asset-${job.id}`,
-            },
-          ])
-        );
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify([]));
-      return;
+      return json(200, { jobs: [...this.jobs.values()].map((j) => this.jobView(j)), next_cursor: null });
     }
 
     // 6. Query job by ID
@@ -372,72 +372,33 @@ export class MockBridgeServer {
         return;
       }
 
-      const jobId = decodeURIComponent(jobMatch[1] ?? '');
-      const job = this.jobs.get(jobId);
-      if (!job) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'NOT_FOUND' }));
-        return;
-      }
+      const job = this.jobs.get(decodeURIComponent(jobMatch[1] ?? ''));
+      if (!job) return problem(404, 'not_found');
 
+      // Refusal / quota surface as a failed job while polling (Muse4AI accepts first, Muse answers later).
       job.polls++;
-      if (job.state !== 'cancelled' && job.state !== 'failed') {
-        if (job.polls === 1) {
-          job.state = 'running';
-        } else {
-          job.state = 'succeeded';
-        }
+      if (job.state === 'queued' || job.state === 'running') {
+        if (job.polls === 1) job.state = 'running';
+        else if (this.behavior === 'refused' || this.behavior === 'quota') job.state = 'failed';
+        else if (this.behavior === 'needs_review') job.state = 'needs_review';
+        else job.state = 'succeeded';
       }
-
-      const progress = job.state === 'running' ? 0.5 : job.state === 'succeeded' ? 1.0 : 0.0;
-
-      let assetUrl: string | undefined;
-      let assetId: string | undefined;
-
-      if (job.state === 'succeeded') {
-        if (this.behavior === 'success_no_asset') {
-          // Omit asset_id and asset_url
-        } else if (this.behavior === 'asset_url_foreign_host') {
-          assetId = `asset-${job.id}`;
-          assetUrl = 'http://example.com/videos/foreign.mp4';
-        } else {
-          assetId = `asset-${job.id}`;
-          assetUrl = `http://127.0.0.1:${this.port}/v1/assets/${assetId}/download`;
-        }
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          id: job.id,
-          state: job.state,
-          progress,
-          asset_id: assetId,
-          asset_url: assetUrl,
-        })
-      );
-      return;
+      return json(200, this.jobView(job));
     }
 
     // 7. Cancel job
     const cancelMatch = pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
     if (cancelMatch && req.method === 'POST') {
       if (!checkAuth()) return;
-      if (this.behavior === 'hang_after_request_body') {
-        return;
-      }
-      const jobId = decodeURIComponent(cancelMatch[1] ?? '');
-      const job = this.jobs.get(jobId);
-      if (job) {
-        job.state = 'cancelled';
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'cancelled' }));
-      return;
+      if (this.behavior === 'hang_after_request_body') return;
+      const job = this.jobs.get(decodeURIComponent(cancelMatch[1] ?? ''));
+      if (!job) return problem(404, 'not_found');
+      job.state = 'cancelled';
+      return json(200, this.jobView(job));
     }
 
-    // 8. Download asset
-    const assetMatch = pathname.match(/^\/v1\/assets\/([^/]+)\/download$/);
+    // 8. Download asset (bearer)
+    const assetMatch = pathname.match(/^\/v1\/assets\/([^/]+)\/content$/);
     if (assetMatch && req.method === 'GET') {
       if (!checkAuth()) return;
 
@@ -448,10 +409,7 @@ export class MockBridgeServer {
       }
 
       if (this.behavior === 'truncated_download') {
-        res.writeHead(200, {
-          'Content-Type': 'video/mp4',
-          'Content-Length': '1000',
-        });
+        res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': '1000' });
         res.write(Buffer.from('truncated'));
         res.destroy(); // Abruptly disconnect
         return;
@@ -461,24 +419,19 @@ export class MockBridgeServer {
         // Stream 25 MiB of dummy bytes (exceeds default 20 MiB limit)
         res.writeHead(200, { 'Content-Type': 'video/mp4' });
         const chunk = Buffer.alloc(1024 * 1024, 0x55);
-        for (let i = 0; i < 25; i++) {
-          res.write(chunk);
-        }
+        for (let i = 0; i < 25; i++) res.write(chunk);
         res.end();
         return;
       }
 
       const validMp4 = createMinimalValidMp4();
-      res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Content-Length': validMp4.length.toString(),
-      });
+      res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': validMp4.length.toString() });
       res.end(validMp4);
       return;
     }
 
     // 404 fallback
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+    res.end(JSON.stringify({ status: 404, code: 'not_found' }));
   }
 }

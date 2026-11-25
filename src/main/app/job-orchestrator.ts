@@ -3,12 +3,12 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { AppConfig } from '@shared/config';
-import type { Job, ReviewStatus } from '@shared/domain';
+import type { Asset, Job, ReviewStatus } from '@shared/domain';
 import { normalizeSku } from '@shared/domain';
 import { PodError, SAFE_ERROR_MESSAGES } from '@shared/errors';
 import type { CreateJobInput, JobView } from '@shared/ipc';
 import { JOB_STATE_LABELS } from '@shared/job-state';
-import type { MuseProvider, ProviderCapabilities } from '@shared/provider';
+import type { MuseProvider, ProviderCapabilities, ProviderJob } from '@shared/provider';
 import { ProviderError } from '@shared/provider';
 import type { JobFilter, Logger, MediaLibrary, PodDatabase, PromptService, StoredFile } from '@shared/services';
 import { newId, nowIso } from '../domain/ids';
@@ -347,9 +347,14 @@ export class JobOrchestrator extends EventEmitter {
       throw new PodError('INVALID_STATE', 'Cannot regenerate a non-terminal job');
     }
 
+    const originalSnapshot = this.findPromptSnapshotAsset(original);
+    if (!originalSnapshot) {
+      throw new PodError('INVALID_STATE', 'Original prompt snapshot missing');
+    }
+
     const newJobId = newId();
     const newJob = this.db.transaction(() => {
-      return this.db.jobs.insert({
+      const inserted = this.db.jobs.insert({
         id: newJobId,
         productId: original.productId,
         skuSnapshot: original.skuSnapshot,
@@ -365,6 +370,20 @@ export class JobOrchestrator extends EventEmitter {
         idempotencyKey: clientRequestId,
         regeneratedFromJobId: original.id,
       });
+      // The regenerated job reuses the original prompt snapshot file (same text, same sha256).
+      this.db.assets.insert({
+        productId: originalSnapshot.productId,
+        jobId: inserted.id,
+        role: 'prompt_snapshot',
+        path: originalSnapshot.path,
+        mime: originalSnapshot.mime,
+        bytes: originalSnapshot.bytes,
+        width: null,
+        height: null,
+        durationMs: null,
+        sha256: originalSnapshot.sha256,
+      });
+      return inserted;
     });
 
     this.logger.info('job_regenerated', {
@@ -389,41 +408,46 @@ export class JobOrchestrator extends EventEmitter {
     }
 
     if (resolution === 'check_again') {
-      if (this.provider.findJobByRequestId) {
-        try {
-          const found = await this.provider.findJobByRequestId(job.idempotencyKey);
-          if (found && (found.state === 'running' || found.state === 'queued')) {
-            const updated = this.db.jobs.transition(job.id, 'RUNNING', {
-              providerJobId: found.providerJobId,
-              providerReferenceId: found.providerReferenceId ?? null,
-              acceptedAt: nowIso(),
-              errorCode: null,
-              safeErrorMessage: null,
-            });
-            this.logger.info('job_ambiguous_reconciled', {
-              jobId: updated.id,
-              providerJobId: found.providerJobId,
-            });
-            this.scheduleProcessQueue();
-            await this.emitJobUpdated(updated.id);
-            return this.toJobView(updated);
-          } else if (found && found.state === 'succeeded') {
-            const updated = this.db.jobs.transition(job.id, 'RUNNING', {
-              providerJobId: found.providerJobId,
-              providerReferenceId: found.providerReferenceId ?? null,
-              acceptedAt: nowIso(),
-              errorCode: null,
-              safeErrorMessage: null,
-            });
-            this.scheduleProcessQueue();
-            await this.emitJobUpdated(updated.id);
-            return this.toJobView(updated);
-          }
-        } catch {
-          // Stay in AMBIGUOUS if provider query fails
+      // Never resubmits. With a provider job id we can simply re-read the job (e.g. Muse4AI "needs_review"
+      // that a person resolved in Muse4AI); without one, only an id lookup could reconcile it.
+      let found: ProviderJob | null = null;
+      try {
+        if (job.providerJobId) {
+          found = await this.provider.getJob(job.providerJobId);
+        } else if (this.provider.findJobByRequestId) {
+          found = await this.provider.findJobByRequestId(job.idempotencyKey);
         }
+      } catch {
+        found = null; // Stay in AMBIGUOUS if provider query fails
       }
-      // Unknown or findJobByRequestId returned null -> stays in AMBIGUOUS
+      if (found && (found.state === 'running' || found.state === 'queued' || found.state === 'succeeded')) {
+        const updated = this.db.jobs.transition(job.id, 'RUNNING', {
+          providerJobId: found.providerJobId || job.providerJobId,
+          providerReferenceId: found.providerReferenceId ?? job.providerReferenceId ?? null,
+          acceptedAt: job.acceptedAt ?? nowIso(),
+          errorCode: null,
+          safeErrorMessage: null,
+        });
+        this.logger.info('job_ambiguous_reconciled', {
+          jobId: updated.id,
+          providerJobId: updated.providerJobId,
+        });
+        this.scheduleProcessQueue();
+        await this.emitJobUpdated(updated.id);
+        return this.toJobView(updated);
+      }
+      if (found && (found.state === 'failed' || found.state === 'cancelled')) {
+        const updated =
+          found.state === 'cancelled'
+            ? this.db.jobs.transition(job.id, 'CANCELLED')
+            : this.db.jobs.transition(job.id, 'FAILED_PROVIDER', {
+                errorCode: found.errorCode ?? 'PROVIDER_ERROR',
+                safeErrorMessage: found.safeMessage ?? SAFE_ERROR_MESSAGES.PROVIDER_ERROR,
+              });
+        await this.emitJobUpdated(updated.id);
+        return this.toJobView(updated);
+      }
+      // Still unknown -> stays in AMBIGUOUS
       return this.toJobView(job);
     } else {
       // resolution === 'mark_failed'
@@ -673,6 +697,21 @@ export class JobOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * Prompt snapshot for a job. Regenerated jobs created before the snapshot row was copied have none of
+   * their own, so walk back through `regeneratedFromJobId` (bounded). The caller still verifies sha256.
+   */
+  private findPromptSnapshotAsset(job: Job): Asset | undefined {
+    let current: Job | undefined = job;
+    for (let depth = 0; current && depth < 10; depth++) {
+      const found = this.db.assets.listByJob(current.id).find((a) => a.role === 'prompt_snapshot');
+      if (found) return found;
+      if (!current.regeneratedFromJobId) return undefined;
+      current = this.db.jobs.getById(current.regeneratedFromJobId) ?? undefined;
+    }
+    return undefined;
+  }
+
   private async handleSubmit(job: Job): Promise<void> {
     // 1. Resolve source asset file BEFORE transitioning to SUBMITTING
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
@@ -693,8 +732,7 @@ export class JobOrchestrator extends EventEmitter {
     }
 
     // 2. Resolve and verify prompt snapshot text BEFORE transitioning to SUBMITTING
-    const assets = this.db.assets.listByJob(job.id);
-    const promptAsset = assets.find((a) => a.role === 'prompt_snapshot');
+    const promptAsset = this.findPromptSnapshotAsset(job);
     let promptText: string | null = null;
     if (promptAsset) {
       const promptAbsPath = this.media.resolve(promptAsset.path);
@@ -913,6 +951,15 @@ export class JobOrchestrator extends EventEmitter {
         await this.emitJobUpdated(job.id);
       } else if (providerJob.state === 'cancelled') {
         this.db.jobs.transition(job.id, 'CANCELLED');
+        await this.emitJobUpdated(job.id);
+      } else {
+        // 'ambiguous' (e.g. Muse4AI needs_review) or any state we cannot interpret: stop polling and let a
+        // person check — never resubmit.
+        this.db.jobs.transition(job.id, 'AMBIGUOUS', {
+          errorCode: providerJob.errorCode ?? 'SUBMIT_AMBIGUOUS',
+          safeErrorMessage: providerJob.safeMessage ?? SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS,
+        });
+        this.logger.warn('job_poll_ambiguous', { jobId: job.id, sku: job.skuSnapshot });
         await this.emitJobUpdated(job.id);
       }
     } catch (err: unknown) {

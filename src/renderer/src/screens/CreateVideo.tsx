@@ -71,8 +71,11 @@ export function CreateVideo({ providerStatus, onJobCreated }: CreateVideoProps):
       }
       if (tplRes.ok && tplRes.data.length > 0) {
         setTemplates(tplRes.data);
-        // Default to the template entry with isDefault === true, or first
-        const defaultTpl = tplRes.data.find((t) => t.isDefault) ?? tplRes.data[0];
+        // Prefer a real (company/admin) default over the built-in placeholder, then any default, then first
+        const defaultTpl =
+          tplRes.data.find((t) => t.isDefault && !t.isPlaceholder) ??
+          tplRes.data.find((t) => t.isDefault) ??
+          tplRes.data[0];
         if (defaultTpl) {
           setSelectedTemplateKey(makeTemplateKey(defaultTpl));
         }

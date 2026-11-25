@@ -1,149 +1,129 @@
 /**
- * Endpoints and Zod schemas for the approved local Muse REST bridge.
- * Centralized here so adjustments can be made after inspecting live /v1/openapi.json.
+ * Endpoints and Zod schemas for the local Muse4AI bridge.
+ * Verified against the live contract: Muse4AI agent API 2.0.0-beta.35 (`GET /v1/openapi.json`,
+ * snapshot in docs/api/bridge-openapi.json). Re-check this file when Muse4AI's major/minor version changes.
+ *
+ * Schemas are lenient (`passthrough`, optional fields) so additive bridge changes do not break parsing;
+ * only fields the provider actually reads are declared.
  */
 import { z } from 'zod';
 
-// ASSUMPTION (verify against live /v1/openapi.json): Health endpoint path
+/** Unauthenticated liveness: `{ ok, service: "muse4ai", instance }`. */
 export const HEALTH_ENDPOINT = '/v1/health';
-
-// ASSUMPTION (verify against live /v1/openapi.json): Status endpoint path
+/** Capabilities, accounts (+quota), key scope, limits. */
 export const STATUS_ENDPOINT = '/v1/status';
-
-// ASSUMPTION (verify against live /v1/openapi.json): Reference image upload endpoint path
+/** Raw-bytes upload (PNG/JPEG/WEBP ≤ 20 MiB, ≤ 8192 px/edge) → 201 `{ reference_id, … }`. */
 export const REFERENCES_ENDPOINT = '/v1/references';
-
-// ASSUMPTION (verify against live /v1/openapi.json): Job submission endpoint path
+/** POST → 202 `{ jobs: Job[] }`. Honors `Idempotency-Key` (same key + same body → same jobs). */
 export const JOBS_ENDPOINT = '/v1/jobs';
-
-// ASSUMPTION (verify against live /v1/openapi.json): Job query by ID path
 export const jobEndpoint = (id: string): string => `/v1/jobs/${encodeURIComponent(id)}`;
-
-// ASSUMPTION (verify against live /v1/openapi.json): Job cancel endpoint path
 export const jobCancelEndpoint = (id: string): string => `/v1/jobs/${encodeURIComponent(id)}/cancel`;
+/** Bearer-authenticated download of an output (`outputs[].asset_id`). */
+export const assetDownloadEndpoint = (id: string): string => `/v1/assets/${encodeURIComponent(id)}/content`;
 
-// ASSUMPTION (verify against live /v1/openapi.json): Asset download endpoint path
-export const assetDownloadEndpoint = (id: string): string => `/v1/assets/${encodeURIComponent(id)}/download`;
-
-// ASSUMPTION (verify against live /v1/openapi.json): Unauthenticated health response
 export const HealthResponseSchema = z
   .object({
-    status: z.string().optional(),
     ok: z.boolean().optional(),
-    healthy: z.boolean().optional(),
+    service: z.string().optional(),
   })
   .passthrough();
-
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
-// ASSUMPTION (verify against live /v1/openapi.json): Bridge capabilities schema
 export const BridgeCapabilitiesSchema = z
   .object({
-    can_cancel: z.boolean().optional(),
-    canCancel: z.boolean().optional(),
-    reports_progress: z.boolean().optional(),
-    reportsProgress: z.boolean().optional(),
-    supported_durations: z.array(z.number()).optional(),
-    supportedDurations: z.array(z.number()).optional(),
-    supported_aspect_ratios: z.array(z.string()).optional(),
-    supportedAspectRatios: z.array(z.string()).optional(),
-    max_prompt_chars: z.number().optional(),
-    maxPromptChars: z.number().optional(),
-    max_upload_bytes: z.number().optional(),
-    maxUploadBytes: z.number().optional(),
-    can_lookup_by_request_id: z.boolean().optional(),
-    canLookupByRequestId: z.boolean().optional(),
+    video_from_image: z.boolean().optional(),
+    video_from_text: z.boolean().optional(),
+    chat: z.boolean().optional(),
   })
   .passthrough();
 
-// ASSUMPTION (verify against live /v1/openapi.json): Status endpoint response
+const AccountItemSchema = z
+  .object({
+    group: z.string().optional(),
+    quota: z.object({ tier: z.string().optional() }).passthrough().nullable().optional(),
+  })
+  .passthrough();
+
 export const StatusResponseSchema = z
   .object({
-    status: z.string().optional(),
-    authenticated: z.boolean().optional(),
-    needs_login: z.boolean().optional(),
-    login_required: z.boolean().optional(),
-    quota_limited: z.boolean().optional(),
-    quota_exhausted: z.boolean().optional(),
-    busy: z.boolean().optional(),
+    service: z.string().optional(),
+    version: z.string().optional(),
     capabilities: BridgeCapabilitiesSchema.optional(),
+    accounts: z
+      .object({
+        total: z.number().optional(),
+        ready: z.number().optional(),
+        busy: z.number().optional(),
+        waiting: z.number().optional(),
+        needs_user: z.number().optional(),
+        paused: z.number().optional(),
+        items: z.array(AccountItemSchema).optional(),
+      })
+      .passthrough()
+      .optional(),
+    key: z.object({ scope: z.string().optional() }).passthrough().optional(),
+    limits: z
+      .object({
+        prompt_max_chars: z.number().optional(),
+        chat_prompt_max_chars: z.number().optional(),
+        upload_max_bytes: z.number().optional(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
-
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;
 
-// ASSUMPTION (verify against live /v1/openapi.json): Reference upload response
 export const ReferenceUploadResponseSchema = z
   .object({
-    reference_id: z.string().optional(),
-    id: z.string().optional(),
+    reference_id: z.string(),
     kind: z.string().optional(),
     mime: z.string().optional(),
     bytes: z.number().optional(),
     sha256: z.string().optional(),
   })
   .passthrough();
-
 export type ReferenceUploadResponse = z.infer<typeof ReferenceUploadResponseSchema>;
 
-// ASSUMPTION (verify against live /v1/openapi.json): Item in jobs submit response array
-const JobItemSchema = z
+export const OutputSchema = z
   .object({
-    id: z.string().optional(),
-    job_id: z.string().optional(),
+    asset_id: z.string(),
+    kind: z.string().optional(),
+    mime: z.string().optional(),
+    bytes: z.number().optional(),
+    available: z.boolean().optional(),
   })
   .passthrough();
 
-// ASSUMPTION (verify against live /v1/openapi.json): Job submission response
-export const JobSubmitResponseSchema = z
+/** Public job status (use this in code; `state` is Muse4AI-internal and may grow new values). */
+export const BRIDGE_JOB_STATUSES = ['queued', 'running', 'needs_review', 'succeeded', 'failed', 'cancelled'] as const;
+
+export const JobSchema = z
   .object({
-    id: z.string().optional(),
-    job_id: z.string().optional(),
+    id: z.string(),
+    kind: z.string().optional(),
+    status: z.string(),
     state: z.string().optional(),
-    jobs: z.array(JobItemSchema).optional(),
+    needs_human: z.boolean().optional(),
+    error: z
+      .object({ code: z.string().optional(), message: z.string().optional() })
+      .passthrough()
+      .nullable()
+      .optional(),
+    outputs: z.array(OutputSchema).optional(),
   })
   .passthrough();
+export type BridgeJob = z.infer<typeof JobSchema>;
 
+export const JobSubmitResponseSchema = z.object({ jobs: z.array(JobSchema).min(1) }).passthrough();
 export type JobSubmitResponse = z.infer<typeof JobSubmitResponseSchema>;
 
-// ASSUMPTION (verify against live /v1/openapi.json): Job query response
-export const JobStatusResponseSchema = z
-  .object({
-    id: z.string().optional(),
-    job_id: z.string().optional(),
-    state: z.string(),
-    progress: z.number().nullable().optional(),
-    asset_id: z.string().nullable().optional(),
-    asset_url: z.string().nullable().optional(),
-    output_url: z.string().nullable().optional(),
-    reference_id: z.string().nullable().optional(),
-    error_code: z.string().nullable().optional(),
-    error: z.string().nullable().optional(),
-    safe_message: z.string().nullable().optional(),
-    message: z.string().nullable().optional(),
-  })
-  .passthrough();
-
-export type JobStatusResponse = z.infer<typeof JobStatusResponseSchema>;
-
-// ASSUMPTION (verify against live /v1/openapi.json): Bridge error payload shape
+/** RFC 9457 problem+json with a stable `code` (e.g. invalid_api_key, invalid_request, capability_unavailable). */
 export const BridgeErrorResponseSchema = z
   .object({
-    error: z
-      .union([
-        z.string(),
-        z
-          .object({
-            code: z.string().optional(),
-            message: z.string().optional(),
-          })
-          .passthrough(),
-      ])
-      .optional(),
     code: z.string().optional(),
-    message: z.string().optional(),
-    submitted: z.boolean().optional(),
+    status: z.number().optional(),
+    retry_after: z.number().optional(),
   })
   .passthrough();
-
 export type BridgeErrorResponse = z.infer<typeof BridgeErrorResponseSchema>;

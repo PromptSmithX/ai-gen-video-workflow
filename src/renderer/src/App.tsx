@@ -10,6 +10,7 @@ import { CreateVideo } from './screens/CreateVideo';
 import { Queue } from './screens/Queue';
 import { Library } from './screens/Library';
 import { Admin } from './screens/Admin';
+import { Setup, needsSetup } from './screens/Setup';
 import './styles.css';
 
 export function App(): React.JSX.Element {
@@ -119,7 +120,11 @@ function AppContent(): React.JSX.Element {
     setCurrentScreen(screen);
   };
 
+  // Bundled Muse4AI not ready yet: the Setup screen replaces the work screens (Admin stays reachable).
+  const showSetup = needsSetup(providerStatus) && currentScreen !== 'admin';
+
   const getScreenTitle = () => {
+    if (showSetup) return en.setup.title;
     switch (currentScreen) {
       case 'create':
         return en.nav.create;
@@ -150,16 +155,20 @@ function AppContent(): React.JSX.Element {
         />
 
         <main className="content-area">
-          {currentScreen === 'create' && (
+          {showSetup && providerStatus && (
+            <Setup status={providerStatus} onStatusChange={setProviderStatus} />
+          )}
+
+          {!showSetup && currentScreen === 'create' && (
             <CreateVideo
               providerStatus={providerStatus}
               onJobCreated={handleJobCreated}
             />
           )}
 
-          {currentScreen === 'queue' && <Queue highlightJobId={highlightJobId} />}
+          {!showSetup && currentScreen === 'queue' && <Queue highlightJobId={highlightJobId} />}
 
-          {currentScreen === 'library' && <Library />}
+          {!showSetup && currentScreen === 'library' && <Library />}
 
           {currentScreen === 'admin' && (
             <Admin

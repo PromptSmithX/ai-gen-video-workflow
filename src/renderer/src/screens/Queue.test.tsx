@@ -114,6 +114,7 @@ describe('Queue Screen', () => {
       provider: {
         getStatus: vi.fn(),
         testConnection: vi.fn(),
+        setupAction: vi.fn(),
       },
       images: {
         pick: vi.fn(),

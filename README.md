@@ -23,6 +23,40 @@ The application allows employees to drag and drop product mockups, select SKUs a
    `src/main/providers/muse/endpoints.ts` (all assumed field names are marked `ASSUMPTION`).
 4. Installer: `npm run dist` → `release/POD Video Studio Setup <version>.exe` (unsigned until `CSC_LINK` is set).
 
+## First run (installed app)
+
+The installer ships a patched Muse4AI (`resources/muse4ai`, MIT licence files included) and the company
+T-shirt Prompt Master. On start POD Video Studio launches Muse4AI hidden and provisions it: API on this machine
+only, a loopback proxy inside Muse4AI (`127.0.0.1:8080`, `MUSE4AI_PROXY_PORT` to change), one Muse account and an
+API key stored with DPAPI. The employee only:
+
+1. Installs and opens POD Video Studio → the **Set up Muse** screen appears.
+2. Clicks **Sign in to Muse** and signs in to muse.ai with their own account in the window that opens.
+3. The screen closes by itself; **Create video** works from then on (also after a restart).
+
+If another, unpatched Muse4AI is already running, the screen offers **Use the bundled version** (quits it and starts
+the bundled one; accounts, proxy and keys in `%APPDATA%MuseStudio` are kept).
+
+### Bundled Muse4AI (build machine)
+
+`npm run build:muse4ai` clones the pinned upstream commit (`vendor/muse4ai/UPSTREAM`), applies
+`vendor/muse4ai/patches/*.diff`, runs Muse4AI's typecheck and tests, packages it and copies it to
+`vendor/muse4ai/dist` (gitignored). `npm run dist` runs it automatically when `dist` is missing.
+
+- `0001-vm-state-unknown.diff` — Muse now reports `vm_state: "UNKNOWN"` for a usable machine; upstream treated it as
+  asleep, retried a wake for 20 s and paused the account after 3 tries. Also logs background session-check failures.
+- `0002-pod-bootstrap.diff` — `--pod-bootstrap <json>` (API local, loopback proxy, account, key hand-over to a file in
+  POD's data folder), `--pod-login` (opens the Muse sign-in window), `pod: true` in `/v1/health`, auto-update off.
+
+To move to a newer Muse4AI: change `commit` in `UPSTREAM`, re-run `npm run build:muse4ai` and fix any patch that no
+longer applies (drop 0001 once upstream handles `UNKNOWN`).
+
+### Dev against a hand-run Muse4AI
+
+`.env`: `PROVIDER_MODE=bridge`, `MUSE_PLATFORM_ORIGIN=https://muse.ai`, `MUSE_BRIDGE_BASE_URL=http://127.0.0.1:47821`,
+`MUSE_BRIDGE_API_KEY=msk_…` (Muse4AI → Settings → API & agent). In dev POD also manages
+`vendor/muse4ai/dist/Muse4AI.exe` when it has been built; delete that folder to manage Muse4AI by hand.
+
 ## MVP Definition of Done status (brief §12)
 
 | Item | Status |
@@ -38,7 +72,7 @@ The application allows employees to drag and drop product mockups, select SKUs a
 | Metadata survives restart | Done (SQLite + restart recovery) |
 | Safe, understandable states/errors | Done |
 | No plaintext secrets / secrets in logs | Done (DPAPI fail-closed, log redaction) |
-| Loopback-only, authenticated network | Done (app opens no listener; bridge URL must be loopback) |
+| Loopback-only, authenticated network | Done (POD opens no listener; the bundled Muse4AI's API and proxy listen on 127.0.0.1 only) |
 | Tests + SBOM/security scan on release commit | Tests pass locally; CI workflow with audit, SBOM, Gitleaks ready (`.github/workflows/ci.yml`) |
 | Signed installer and executable | **Pending company certificate** |
 | Pilot on one isolated Windows PC | **Pending** |
@@ -76,13 +110,15 @@ All URLs and keys are company-supplied and must use placeholders:
 
 | Variable | Default / Format | Description |
 |---|---|---|
-| `PROVIDER_MODE` | `mock` | `mock` (offline, no network) or `bridge` (approved local Muse bridge) |
+| `PROVIDER_MODE` | `mock` (`bridge` in an installed app with the bundled Muse4AI) | `mock` (offline, no network) or `bridge` (approved local Muse bridge) |
+| `MUSE4AI_PROXY_PORT` | `8080` | Loopback port of the proxy the bundled Muse4AI runs for this machine. |
+| `MUSE_SUBMIT_MODE` | `chat` | `chat` = full prompt sent verbatim to Muse via Muse4AI chat (≤ 32000 chars) with the mockup attached; `video` = Muse4AI video job (≤ 4000 chars) |
 | `MUSE_PLATFORM_ORIGIN` | `PLACEHOLDER` | Exact HTTPS origin of Muse product (e.g. `https://muse.ai`) |
 | `MUSE_BRIDGE_BASE_URL` | `PLACEHOLDER` | Loopback-only bridge base URL (e.g. `http://127.0.0.1:47821`). Trailing slashes are automatically stripped. |
 | `MUSE_BRIDGE_API_KEY` | `PLACEHOLDER` | Convenience API key fallback. Admin screen (DPAPI) is recommended for production. |
 | `PROMPT_MASTER_PATH` | `PLACEHOLDER` | Optional absolute path to company Prompt Master markdown file. |
 | `POD_LIBRARY_ROOT` | `<Documents>/POD_VIDEO_LIBRARY` | Destination folder for SKU video library. |
-| `PROMPT_MAX_CHARS` | `4000` | Maximum character length for prompts. |
+| `PROMPT_MAX_CHARS` | `20000` | Maximum prompt length enforced by the app (the bridge limit also applies: 32000 in chat mode, 4000 in video mode). |
 | `POLL_INTERVAL_MS` | `3000` | Initial job polling interval in milliseconds. |
 | `POLL_MAX_INTERVAL_MS` | `15000` | Maximum backoff polling interval in milliseconds. |
 | `MAX_SOURCE_MB` | `15` | Maximum upload size for source mockups (in MB). |
@@ -96,6 +132,21 @@ All URLs and keys are company-supplied and must use placeholders:
 ---
 
 ## Development Commands
+
+### Which command when
+
+| Task | Command | Time |
+|---|---|---|
+| Day-to-day UI / logic changes | `npm run dev` (keep it running; renderer reloads instantly, main restarts on save) | seconds |
+| Tests | `npm test` / `npm run test:watch` | seconds |
+| Try it exactly like the installed app, without installing | `npm run dist:dir` → run `releasewin-unpackedPOD Video Studio.exe` | ~1–2 min |
+| Change a Muse4AI patch | `npm run build:muse4ai` (`build:muse4ai:fast` skips its tests) | minutes, rare |
+| Release for employees | `npm run dist` | slowest, only for a new version |
+
+Muse4AI is built **once** into `vendor/muse4ai/dist`; `npm run dev` then manages it like the installed app.
+Dev `.env`: `PROVIDER_MODE=bridge`, `MUSE_PLATFORM_ORIGIN=https://muse.ai`, `MUSE_BRIDGE_BASE_URL=http://127.0.0.1:47821`
+(`MUSE_BRIDGE_API_KEY` optional — POD asks the bundled Muse4AI for one). Use `PROVIDER_MODE=mock` for offline UI work
+(no Muse calls, no quota used).
 
 All dependencies are pinned and pre-installed in the repository.
 

@@ -1,8 +1,9 @@
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { safeStorage } from 'electron';
-import type { AdminSettings, AppConfig } from '@shared/config';
+import type { AdminSettings, AppConfig, BundledResources } from '@shared/config';
 import type { DiagnosticsPreview, PlatformCompatibility, ProviderStatus } from '@shared/ipc';
 import type { MuseProvider, ProviderCapabilities } from '@shared/provider';
 import type { Logger, MediaLibrary, PodDatabase, PromptService, SecretStore } from '@shared/services';
@@ -15,6 +16,7 @@ import { createMediaLibrary } from '../infra/media';
 import { createPromptService } from '../prompts';
 import { createMuseProvider } from '../providers/muse';
 import { createSecretStore, getBridgeApiKey, type SafeStorageLike } from '../infra/secrets';
+import { Muse4aiSupervisor } from '../infra/muse4ai/supervisor';
 import { ImageStagingService } from './image-staging';
 import { JobOrchestrator } from './job-orchestrator';
 
@@ -27,6 +29,23 @@ export interface CreateContainerOpts {
   safeStorage?: SafeStorageLike;
   env?: NodeJS.ProcessEnv;
   envFilePath?: string;
+  /** Override bundled-resource discovery (tests). */
+  bundle?: BundledResources;
+}
+
+/** Installer-shipped Muse4AI + company Prompt Master (dev: vendor/muse4ai/dist when it was built). */
+export function findBundledResources(appPath: string, isPackaged: boolean): BundledResources {
+  const resources = isPackaged
+    ? ((process as unknown as { resourcesPath?: string }).resourcesPath ?? appPath)
+    : appPath;
+  const exe = isPackaged
+    ? path.join(resources, 'muse4ai', 'Muse4AI.exe')
+    : path.join(appPath, 'vendor', 'muse4ai', 'dist', 'Muse4AI.exe');
+  const master = path.join(resources, 'prompts', 'company', 'tshirt-review-v2.md');
+  return {
+    muse4aiExePath: process.platform === 'win32' && fs.existsSync(exe) ? exe : null,
+    promptMasterPath: isPackaged && fs.existsSync(master) ? master : null,
+  };
 }
 
 export class AppContainer {
@@ -47,6 +66,9 @@ export class AppContainer {
   readonly imageStaging: ImageStagingService;
   provider: MuseProvider;
   readonly orchestrator: JobOrchestrator;
+  /** Present when POD starts and provisions the bundled Muse4AI itself. */
+  readonly muse4ai: Muse4aiSupervisor | null;
+  private readonly bundle: BundledResources;
 
   constructor(opts: CreateContainerOpts) {
     this.appVersion = opts.appVersion ?? '0.1.0';
@@ -80,6 +102,7 @@ export class AppContainer {
       envFilePath: opts.envFilePath,
     });
 
+    this.bundle = opts.bundle ?? findBundledResources(this.appPath, this.isPackaged);
     this.config = loadConfig({
       env: processEnv,
       settings: adminSettings,
@@ -89,6 +112,7 @@ export class AppContainer {
       },
       isDev: !opts.isPackaged,
       envFilePath: opts.envFilePath,
+      bundle: this.bundle,
     });
 
     // 4. Logger
@@ -139,6 +163,31 @@ export class AppContainer {
     // 9. Image Staging
     this.imageStaging = new ImageStagingService();
 
+    // 9b. Bundled Muse4AI (only in bridge mode with a loopback bridge URL)
+    const exePath = this.config.muse4aiExePath ?? null;
+    const bridgeBaseUrl = this.config.bridgeBaseUrl;
+    this.muse4ai =
+      exePath && bridgeBaseUrl && this.config.providerMode === 'bridge'
+        ? new Muse4aiSupervisor({
+            exePath,
+            bridgeBaseUrl,
+            proxyPort: this.config.muse4aiProxyPort ?? 8080,
+            workDir: path.join(this.userData, 'muse4ai'),
+            secrets: this.secretStore,
+            getApiKey: () => this.getApiKey(),
+            logger: this.logger,
+            spawn: (exe, args) => {
+              const child = spawn(exe, args, { detached: true, stdio: 'ignore', windowsHide: false });
+              child.on('error', () => this.logger.error('muse4ai.spawn_failed'));
+              child.unref();
+            },
+            fetch: (url, init) =>
+              fetch(url, { headers: init?.headers, redirect: 'manual', signal: AbortSignal.timeout(5000) }),
+            sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+            now: () => Date.now(),
+          })
+        : null;
+
     // 10. Job Orchestrator
     this.orchestrator = new JobOrchestrator({
       db: this.db,
@@ -187,6 +236,7 @@ export class AppContainer {
       hasApiKey: Boolean(this.getApiKey()),
       secretStoreAvailable: this.secretStore.isAvailable(),
       checkedAt: nowIso(),
+      ...(this.muse4ai ? { setup: this.muse4ai.status() } : {}),
     };
   }
 
@@ -228,6 +278,7 @@ export class AppContainer {
         documents: this.documents,
       },
       isDev: !this.isPackaged,
+      bundle: this.bundle,
     });
 
     // Recreate provider

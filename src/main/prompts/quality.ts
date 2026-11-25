@@ -34,6 +34,8 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
       /(?:do not|never|no|prohibit|avoid)\s+.*?(?:alter|modify|recolor|reposition|distort|mirror|replace|redesign|change)\s+.*?(?:artwork|design|print|graphic)/i,
       /(?:no|prohibit)\s+design\s+changes/i,
       /(?:without|do not allow)\s+(?:altering|modifying|changing)\s+.*?(?:design|artwork|print)/i,
+      // Comma-separated verb lists: "Do not redesign, replace, simplify, mirror, … the original printed artwork"
+      /(?:do not|never)\s+(?:alter|modify|recolor|reposition|distort|mirror|replace|redesign|change|reinterpret|simplify|duplicate)\b[^.\n]*?(?:artwork|design|print|graphic)/i,
     ],
   },
   {
@@ -97,6 +99,8 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
       /(?:no|do not|never|prohibit|avoid)\s+.*?(?:fake|unauthorized|fabricated)\s+.*?(?:claim|rating|discount|testimonial|badge)/i,
       /(?:no|prohibit)\s+fake\s+claims/i,
       /do\s+not\s+add\s+fake/i,
+      // "Do not invent product claims" — invented claims are fabricated claims
+      /(?:do not|never)\s+(?:invent|fabricate|make up)\s+[^.\n]*?(?:claims?|ratings?|testimonials?|badges?)/i,
     ],
   },
 ];

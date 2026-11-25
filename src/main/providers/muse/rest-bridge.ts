@@ -23,7 +23,7 @@ import {
   jobCancelEndpoint,
   jobEndpoint,
   JOBS_ENDPOINT,
-  JobStatusResponseSchema,
+  JobSchema,
   JobSubmitResponseSchema,
   REFERENCES_ENDPOINT,
   ReferenceUploadResponseSchema,
@@ -31,11 +31,13 @@ import {
   StatusResponseSchema,
 } from './endpoints';
 import { streamDownloadToFile, validateLoopbackUrl, validateSameOrigin } from './http';
+import type { MuseSubmitMode } from '@shared/config';
 import {
-  DEFAULT_CAPABILITIES,
   mapBridgeCapabilities,
   mapBridgeConnectionState,
+  mapBridgeJobError,
   mapBridgeJobState,
+  pickVideoAssetId,
 } from './mapping';
 
 const DEFAULT_CAPABILITIES_CACHE_TTL_MS = 60_000;
@@ -59,12 +61,14 @@ export class RestBridgeMuseProvider implements MuseProvider {
   private readonly uploadTimeoutMs: number;
   private readonly standardTimeoutMs: number;
 
+  private readonly submitMode: MuseSubmitMode;
+
   private cachedCapabilities: ProviderCapabilities | null = null;
   private capabilitiesCachedAt = 0;
-  private canLookupByRequestId = false;
 
   constructor(deps: ProviderFactoryDeps, options: RestBridgeOptions = {}) {
     this.config = deps.config;
+    this.submitMode = deps.config.museSubmitMode ?? 'chat';
     this.getApiKey = deps.getApiKey;
     this.logger = deps.logger;
     this.submitTimeoutMs = options.submitTimeoutMs ?? DEFAULT_SUBMIT_TIMEOUT_MS;
@@ -158,21 +162,14 @@ export class RestBridgeMuseProvider implements MuseProvider {
         return 'error';
       }
 
-      const state = mapBridgeConnectionState(parseResult.data);
+      const state = mapBridgeConnectionState(parseResult.data, this.submitMode);
       this.logger.info('muse.status_checked', {
         state,
         durationMs: Date.now() - startTime,
       });
 
-      // Update capabilities cache if present in status response
-      if (parseResult.data.capabilities) {
-        this.cachedCapabilities = mapBridgeCapabilities(parseResult.data.capabilities);
-        this.capabilitiesCachedAt = Date.now();
-        this.canLookupByRequestId =
-          parseResult.data.capabilities.can_lookup_by_request_id ??
-          parseResult.data.capabilities.canLookupByRequestId ??
-          false;
-      }
+      this.cachedCapabilities = mapBridgeCapabilities(parseResult.data, this.submitMode);
+      this.capabilitiesCachedAt = Date.now();
 
       return state;
     } catch {
@@ -192,7 +189,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
     const baseUrl = this.getBaseUrl();
     const apiKey = this.getApiKey();
     if (!apiKey) {
-      return { ...DEFAULT_CAPABILITIES };
+      return mapBridgeCapabilities(undefined, this.submitMode);
     }
 
     const statusUrl = new URL(STATUS_ENDPOINT, baseUrl).toString();
@@ -209,13 +206,9 @@ export class RestBridgeMuseProvider implements MuseProvider {
       if (res.ok) {
         const json = await res.json();
         const parseResult = StatusResponseSchema.safeParse(json);
-        if (parseResult.success && parseResult.data.capabilities) {
-          this.cachedCapabilities = mapBridgeCapabilities(parseResult.data.capabilities);
+        if (parseResult.success) {
+          this.cachedCapabilities = mapBridgeCapabilities(parseResult.data, this.submitMode);
           this.capabilitiesCachedAt = Date.now();
-          this.canLookupByRequestId =
-            parseResult.data.capabilities.can_lookup_by_request_id ??
-            parseResult.data.capabilities.canLookupByRequestId ??
-            false;
           return this.cachedCapabilities;
         }
       }
@@ -223,7 +216,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
       // Fallback to conservative defaults
     }
 
-    return { ...DEFAULT_CAPABILITIES };
+    return mapBridgeCapabilities(undefined, this.submitMode);
   }
 
   async generateVideo(input: GenerateVideoInput): Promise<ProviderJob> {
@@ -297,7 +290,8 @@ export class RestBridgeMuseProvider implements MuseProvider {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': mime,
-          'X-File-Name': safeFileName,
+          // Spec: UTF-8, percent-encoded (raw non-Latin-1 header values would make fetch throw).
+          'X-File-Name': encodeURIComponent(safeFileName),
         },
         body: imageBuffer,
         redirect: 'manual',
@@ -325,9 +319,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
 
       const json = await res.json();
       const parseResult = ReferenceUploadResponseSchema.safeParse(json);
-      const referenceId = parseResult.success
-        ? parseResult.data.reference_id ?? parseResult.data.id
-        : undefined;
+      const referenceId = parseResult.success ? parseResult.data.reference_id : undefined;
       if (!referenceId || typeof referenceId !== 'string') {
         throw new ProviderError(
           'PROVIDER_ERROR',
@@ -363,21 +355,21 @@ export class RestBridgeMuseProvider implements MuseProvider {
     const startTime = Date.now();
     const jobsUrl = new URL(JOBS_ENDPOINT, baseUrl).toString();
 
-    const requestPayload: Record<string, unknown> = {
-      kind: 'video',
-      mode: 'reference',
-      prompt: input.prompt,
-      reference_id: referenceId,
-      repeat: 1,
-      account: 'auto',
-    };
-
-    if (input.durationSeconds) {
-      requestPayload['duration'] = input.durationSeconds;
-    }
-    if (input.aspectRatio) {
-      requestPayload['aspect_ratio'] = input.aspectRatio;
-    }
+    // Muse4AI schemas are additionalProperties:false — no duration/aspect fields exist, so none are sent
+    // (capabilities report them as unsupported and the UI hides those controls).
+    // chat: the full prompt goes to Muse verbatim (≤ 32000 chars) with the mockup attached — the same as pasting
+    //       it into muse.ai; video: dedicated video job (≤ 4000 chars).
+    const requestPayload: Record<string, unknown> =
+      this.submitMode === 'chat'
+        ? { kind: 'chat', prompt: input.prompt, attachments: [referenceId], account: 'auto' }
+        : {
+            kind: 'video',
+            mode: 'reference',
+            prompt: input.prompt,
+            reference_id: referenceId,
+            repeat: 1,
+            account: 'auto',
+          };
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.submitTimeoutMs);
@@ -444,23 +436,16 @@ export class RestBridgeMuseProvider implements MuseProvider {
 
     // 4xx handling per explicit review table
     if (res.status >= 400 && res.status < 500) {
+      // Muse4AI rejects with RFC 9457 problem+json before creating any job, so 4xx is pre-submit
+      // (408/409/other unknown 4xx are still treated as ambiguous below).
       let bodyCode: string | undefined;
-      let isSubmitted = false;
+      const isSubmitted = false;
 
       try {
         const errorJson = await res.json();
         const parsedError = BridgeErrorResponseSchema.safeParse(errorJson);
-        if (parsedError.success) {
-          if (parsedError.data.submitted === true) {
-            isSubmitted = true;
-          }
-          if (parsedError.data.code) {
-            bodyCode = parsedError.data.code.toLowerCase();
-          } else if (typeof parsedError.data.error === 'object' && parsedError.data.error?.code) {
-            bodyCode = parsedError.data.error.code.toLowerCase();
-          } else if (typeof parsedError.data.error === 'string') {
-            bodyCode = parsedError.data.error.toLowerCase();
-          }
+        if (parsedError.success && parsedError.data.code) {
+          bodyCode = parsedError.data.code.toLowerCase();
         }
       } catch {
         // Ignored
@@ -494,6 +479,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
 
       // needs_login | login_required | unauthenticated -> NEEDS_LOGIN, phase before_submit
       if (
+        bodyCode === 'invalid_api_key' ||
         bodyCode === 'needs_login' ||
         bodyCode === 'login_required' ||
         bodyCode === 'unauthenticated'
@@ -555,10 +541,11 @@ export class RestBridgeMuseProvider implements MuseProvider {
         };
       }
 
-      const data = parseResult.data;
-      const jobId = data.id ?? data.job_id ?? data.jobs?.[0]?.id ?? data.jobs?.[0]?.job_id;
+      // repeat: 1 → exactly one job in `jobs`.
+      const created = parseResult.data.jobs[0];
+      const jobId = created?.id;
 
-      if (!jobId || typeof jobId !== 'string') {
+      if (!created || !jobId) {
         this.logger.warn('muse.submit_missing_job_id_ambiguous', {
           requestId: input.requestId,
           durationMs: Date.now() - startTime,
@@ -571,7 +558,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
         };
       }
 
-      const state = data.state ? mapBridgeJobState(data.state) : 'queued';
+      const state = mapBridgeJobState(created.status);
 
       this.logger.info('muse.submit_success', {
         requestId: input.requestId,
@@ -579,11 +566,20 @@ export class RestBridgeMuseProvider implements MuseProvider {
         durationMs: Date.now() - startTime,
       });
 
-      return {
+      const result: ProviderJob = {
         providerJobId: jobId,
         state,
         providerReferenceId: referenceId,
       };
+      if (state === 'failed') {
+        const code = mapBridgeJobError(created.error?.code);
+        result.errorCode = code;
+        result.safeMessage = SAFE_ERROR_MESSAGES[code];
+      } else if (state === 'ambiguous') {
+        result.errorCode = 'SUBMIT_AMBIGUOUS';
+        result.safeMessage = SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS;
+      }
+      return result;
     } catch {
       // Unparsable JSON on 2xx -> AMBIGUOUS
       this.logger.warn('muse.submit_json_parse_error_ambiguous', {
@@ -658,7 +654,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
       });
     }
 
-    const parseResult = JobStatusResponseSchema.safeParse(json);
+    const parseResult = JobSchema.safeParse(json);
     if (!parseResult.success) {
       throw new ProviderError('PROVIDER_ERROR', 'after_submit', 'Invalid job status payload from bridge.', {
         cause: parseResult.error,
@@ -666,22 +662,32 @@ export class RestBridgeMuseProvider implements MuseProvider {
     }
 
     const data = parseResult.data;
-    const state = mapBridgeJobState(data.state);
+    let state = mapBridgeJobState(data.status);
 
-    const jobResult: ProviderJob = {
-      providerJobId,
-      state,
-      providerReferenceId: data.reference_id ?? undefined,
-      providerAssetId: data.asset_id ?? undefined,
-    };
-
-    if (typeof data.progress === 'number' && data.progress >= 0 && data.progress <= 1) {
-      jobResult.progress = data.progress;
+    const jobResult: ProviderJob = { providerJobId, state };
+    if (state === 'succeeded') {
+      const assetId = pickVideoAssetId(data);
+      if (assetId) {
+        jobResult.providerAssetId = assetId;
+      } else if (data.kind === 'chat') {
+        // Muse answered the chat turn without producing a video (text only). Terminal, never resent.
+        // Muse's answer text (result.text) is deliberately not read or logged.
+        state = 'failed';
+        jobResult.state = state;
+        jobResult.errorCode = 'OUTPUT_MISSING';
+        jobResult.safeMessage =
+          'Muse replied but did not create a video. Check the conversation in Muse4AI; nothing was resent.';
+      }
     }
 
-    if (state === 'failed') {
-      jobResult.errorCode = 'PROVIDER_ERROR';
-      jobResult.safeMessage = SAFE_ERROR_MESSAGES.PROVIDER_ERROR;
+    if (state === 'failed' && !jobResult.errorCode) {
+      const code = mapBridgeJobError(data.error?.code);
+      jobResult.errorCode = code;
+      jobResult.safeMessage = SAFE_ERROR_MESSAGES[code];
+    } else if (state === 'ambiguous') {
+      jobResult.errorCode = 'SUBMIT_AMBIGUOUS';
+      jobResult.safeMessage =
+        'Muse4AI could not confirm this job and marked it for review. Check it in Muse4AI (Queue) — it will NOT be resent automatically.';
     }
 
     this.logger.debug('muse.get_job_success', {
@@ -693,60 +699,16 @@ export class RestBridgeMuseProvider implements MuseProvider {
     return jobResult;
   }
 
-  async findJobByRequestId(requestId: string): Promise<ProviderJob | null> {
-    if (!this.canLookupByRequestId) {
-      throw new ProviderError(
-        'SUBMIT_AMBIGUOUS',
-        'unknown',
-        'Provider bridge does not support lookup by requestId.'
-      );
-    }
-
-    const baseUrl = this.getBaseUrl();
-    const apiKey = this.getApiKey();
-    if (!apiKey) {
-      throw new ProviderError('NEEDS_LOGIN', 'before_submit');
-    }
-
-    const url = new URL(`${JOBS_ENDPOINT}?idempotency_key=${encodeURIComponent(requestId)}`, baseUrl).toString();
-
-    try {
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-        redirect: 'manual',
-        signal: AbortSignal.timeout(this.standardTimeoutMs),
-      });
-
-      if (res.status === 404) return null;
-      if (!res.ok) {
-        throw new ProviderError('PROVIDER_ERROR', 'unknown');
-      }
-
-      const json = await res.json();
-      if (!json || (Array.isArray(json) && json.length === 0)) {
-        return null;
-      }
-
-      const rawJob = Array.isArray(json) ? json[0] : json;
-      const parsed = JobStatusResponseSchema.safeParse(rawJob);
-      if (!parsed.success) return null;
-
-      const jobId = parsed.data.id ?? parsed.data.job_id ?? '';
-      return {
-        providerJobId: jobId,
-        state: mapBridgeJobState(parsed.data.state),
-        providerAssetId: parsed.data.asset_id ?? undefined,
-        providerReferenceId: parsed.data.reference_id ?? undefined,
-      };
-    } catch (err) {
-      if (err instanceof ProviderError) throw err;
-      throw new ProviderError('SUBMIT_AMBIGUOUS', 'unknown', 'Failed to lookup job by requestId.', {
-        cause: err,
-      });
-    }
+  /**
+   * Muse4AI has no lookup by Idempotency-Key, so an ambiguous submit without a provider job id cannot be
+   * reconciled automatically — the job stays AMBIGUOUS for a person to check in Muse4AI.
+   */
+  async findJobByRequestId(_requestId: string): Promise<ProviderJob | null> {
+    throw new ProviderError(
+      'SUBMIT_AMBIGUOUS',
+      'unknown',
+      'Provider bridge does not support lookup by requestId.'
+    );
   }
 
   async downloadOutput(

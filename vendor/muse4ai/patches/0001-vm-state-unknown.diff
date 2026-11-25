@@ -1,0 +1,75 @@
+diff --git a/desktop/src/main/adapter/muse/driver.ts b/desktop/src/main/adapter/muse/driver.ts
+index 98da475..b239e7b 100644
+--- a/desktop/src/main/adapter/muse/driver.ts
++++ b/desktop/src/main/adapter/muse/driver.ts
+@@ -2,6 +2,7 @@ import { attributeMuseExtend, findMuseAcceptedTurn, museHistoryShown, museSnapsh
+ import { randomUUID } from "node:crypto";
+ import fs from "node:fs";
+ import { VERIFIED_CAPABILITIES } from "../../../shared/capabilities";
++import { vmRunning } from "../../../shared/gateway/client";
+ import { parseTokenAmount, resetLabelToTime } from "../../../shared/quota";
+ import type { CapabilityKey, JobKind, Quota } from "../../../shared/types";
+ import { AbortedError, AdapterError, type MediaRef, type MuseAdapter, type ObserveHooks, type ObserveResult, type SubmitHooks, type SubmitResult, type SubmitSpec, sleep, throwIfAborted } from "../types";
+@@ -231,7 +232,8 @@ export class MuseDriver implements MuseAdapter {
+       // Not proven logged out — treat as transient so a healthy account is not disabled.
+       throw new AdapterError("PRE_SUBMIT_TRANSIENT", `Muse chưa sẵn sàng (phiên ${info.status}${info.body?.status ? ` · ${String(info.body.status)}` : ""})`);
+     }
+-    if (info.body.vm_state !== "RUNNING" && info.body.vm_state !== "DISABLED" && typeof info.body.vm_id === "string") {
++    // Local fix: Muse reports vm_state "UNKNOWN" for a usable machine; only wake states that are really asleep.
++    if (!vmRunning(info.body.vm_state) && !/^disabled$/i.test(String(info.body.vm_state)) && typeof info.body.vm_id === "string") {
+       await this.wake(String(info.body.vm_id), signal);
+     }
+   }
+@@ -250,7 +252,7 @@ export class MuseDriver implements MuseAdapter {
+     while (this.now() < until) {
+       await this.wait(2000, signal);
+       const s = await this.sessionInfo();
+-      if (s.body?.vm_state === "RUNNING") return;
++      if (vmRunning(s.body?.vm_state)) return;
+     }
+     throw new AdapterError("PRE_SUBMIT_TRANSIENT", "Máy ảo Muse chưa khởi động xong");
+   }
+diff --git a/desktop/src/main/adapter/muse/selectors.ts b/desktop/src/main/adapter/muse/selectors.ts
+index e19627d..7d0de1f 100644
+--- a/desktop/src/main/adapter/muse/selectors.ts
++++ b/desktop/src/main/adapter/muse/selectors.ts
+@@ -115,7 +115,7 @@ export const TIMEOUTS = {
+   accept: 25_000,
+   sessionFetch: 12_000,
+   wakeFetch: 10_000,
+-  wakePoll: 20_000,
++  wakePoll: 60_000,
+   evalDefault: 20_000,
+   download: 180_000,
+   downloadTries: 4,
+diff --git a/desktop/src/main/coordinator.ts b/desktop/src/main/coordinator.ts
+index c966620..a69d6a6 100644
+--- a/desktop/src/main/coordinator.ts
++++ b/desktop/src/main/coordinator.ts
+@@ -2267,7 +2267,8 @@ export class Coordinator {
+       else this.applyGenericFailure(id);
+       // The proxy itself is what failed: show it in Settings → Proxy too (one truth for proxy health).
+       if (cls === "PROXY_FAILED") this.d.emit("proxy", this.repo.updateProxy(acc.proxyId, { health: "failed", lastError: note }));
+-      if (!quiet) this.d.log("warn", "account", "session check failed", { id, cls });
++      // Local fix: log quiet (background) checks too, with the redacted reason, so a pause is never silent.
++      this.d.log("warn", "account", "session check failed", { id, cls, note, quiet });
+     } finally {
+       if (this.leases.get(id) === lease) this.leases.delete(id);
+       this.requestSchedule();
+diff --git a/desktop/src/shared/gateway/client.ts b/desktop/src/shared/gateway/client.ts
+index bd9a50f..f29ff13 100644
+--- a/desktop/src/shared/gateway/client.ts
++++ b/desktop/src/shared/gateway/client.ts
+@@ -37,9 +37,10 @@ export interface GatewayEnv {
+ export type ConnectFailure = "session" | "wake" | "token" | "socket" | "handshake" | "challenge";
+ /** Longest wait for a suspended Muse machine to report RUNNING after a wake request. */
+ export const VM_WAKE_WAIT_MS = 90_000;
+-/** A missing state is treated as running (older responses); any other non-running state is woken first. */
++/** A missing state is treated as running (older responses); any other non-running state is woken first.
++ * Local fix: Muse now reports "UNKNOWN" for a usable machine, so it counts as running too. */
+ export function vmRunning(state: unknown): boolean {
+-  return typeof state !== "string" || state === "" || /^(running|live|ready)$/i.test(state);
++  return typeof state !== "string" || state === "" || /^(running|live|ready|unknown)$/i.test(state);
+ }
+ export class GatewayError extends Error {
+   constructor(

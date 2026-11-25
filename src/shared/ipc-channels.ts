@@ -9,6 +9,7 @@ export const IPC = {
   appGetInfo: 'app:getInfo',
   providerGetStatus: 'provider:getStatus',
   providerTestConnection: 'provider:testConnection',
+  providerSetupAction: 'provider:setupAction',
   imagesPick: 'images:pick',
   imagesStagePath: 'images:stagePath',
   catalogListCategories: 'catalog:listCategories',

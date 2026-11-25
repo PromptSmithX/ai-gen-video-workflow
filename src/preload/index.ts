@@ -9,6 +9,7 @@ const api: PodApi = {
   provider: {
     getStatus: () => ipcRenderer.invoke(IPC.providerGetStatus),
     testConnection: () => ipcRenderer.invoke(IPC.providerTestConnection),
+    setupAction: (input) => ipcRenderer.invoke(IPC.providerSetupAction, input),
   },
   images: {
     pick: () => ipcRenderer.invoke(IPC.imagesPick),

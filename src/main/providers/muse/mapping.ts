@@ -1,15 +1,13 @@
 /**
- * Mapping between bridge HTTP status/payloads and POD Video Studio domain models.
+ * Mapping between Muse4AI bridge payloads (agent API 2.0.0-beta.35) and POD Video Studio domain models.
  */
-import {
-  ASPECT_RATIOS,
-  type AspectRatio,
-  type ProviderCapabilities,
-  type ProviderConnectionState,
-  type ProviderJobState,
-} from '@shared/provider';
+import type { ProviderCapabilities, ProviderConnectionState, ProviderJobState } from '@shared/provider';
 import type { ErrorCode } from '@shared/errors';
-import type { StatusResponse } from './endpoints';
+import type { MuseSubmitMode } from '@shared/config';
+import type { BridgeJob, StatusResponse } from './endpoints';
+
+/** Muse4AI chat prompt limit (`limits.chat_prompt_max_chars`). */
+export const CHAT_PROMPT_MAX_DEFAULT = 32000;
 
 export const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   canCancel: false,
@@ -21,86 +19,117 @@ export const DEFAULT_CAPABILITIES: ProviderCapabilities = {
 };
 
 /**
- * Maps raw bridge job state strings to ProviderJobState.
+ * Maps the public Muse4AI job `status` to ProviderJobState.
+ * `needs_review` = Muse4AI cannot prove whether Muse received/finished the job; a person must check in
+ * Muse4AI — it is never resubmitted, so it maps to 'ambiguous'. Unknown values are treated the same way
+ * (stop and ask a human) rather than guessing success/failure.
  */
-export function mapBridgeJobState(rawState: string): ProviderJobState {
-  const s = rawState.toLowerCase();
-  switch (s) {
+export function mapBridgeJobState(status: string): ProviderJobState {
+  switch (status.toLowerCase()) {
     case 'queued':
-    case 'pending':
       return 'queued';
-    case 'submitting':
-      return 'submitting';
     case 'running':
-    case 'processing':
       return 'running';
     case 'succeeded':
-    case 'completed':
-    case 'done':
       return 'succeeded';
     case 'failed':
-    case 'error':
       return 'failed';
     case 'cancelled':
     case 'canceled':
       return 'cancelled';
-    case 'ambiguous':
-      return 'ambiguous';
+    case 'needs_review':
     default:
-      return 'failed';
+      return 'ambiguous';
   }
 }
 
+/** Maps a failed job's Muse4AI `error.code` (ErrorClass) to a safe ErrorCode. */
+export function mapBridgeJobError(code: string | undefined | null): ErrorCode {
+  switch ((code ?? '').toUpperCase()) {
+    case 'QUOTA_LIMIT':
+      return 'QUOTA_LIMITED';
+    case 'CONTENT_REFUSED':
+      return 'CONTENT_REFUSED';
+    case 'SESSION_EXPIRED':
+    case 'CHECKPOINT':
+      return 'NEEDS_LOGIN';
+    case 'DOWNLOAD_FAILED':
+      return 'DOWNLOAD_FAILED';
+    case 'AMBIGUOUS_SUBMIT':
+      return 'SUBMIT_AMBIGUOUS';
+    case 'PROXY_FAILED':
+    case 'PRE_SUBMIT_TRANSIENT':
+    case 'NOT_ACCEPTED':
+    case 'HTTP_CONNECT_FAILED':
+      return 'NOT_CONNECTED';
+    default:
+      // PROVIDER_ERROR, EMPTY_RESPONSE, UI_CHANGED, HTTP_*, ANOMALY_REPORTED, UNKNOWN …
+      return 'PROVIDER_ERROR';
+  }
+}
+
+/** Picks the downloadable video output of a succeeded job. */
+export function pickVideoAssetId(job: BridgeJob): string | undefined {
+  const outputs = job.outputs ?? [];
+  const video =
+    outputs.find((o) => o.available !== false && (o.kind === 'video' || o.mime === 'video/mp4')) ??
+    outputs.find((o) => o.kind === 'video' || o.mime === 'video/mp4');
+  return video?.asset_id;
+}
+
 /**
- * Derives ProviderCapabilities from /v1/status capabilities or conservative defaults.
+ * Derives ProviderCapabilities from /v1/status. Muse4AI's create-job schema has no duration or aspect-ratio
+ * field (additionalProperties: false), so those controls stay hidden. Progress is not reported.
  */
-export function mapBridgeCapabilities(raw?: StatusResponse['capabilities']): ProviderCapabilities {
-  if (!raw) return { ...DEFAULT_CAPABILITIES };
-
-  const supportedAspectRatios = (raw.supported_aspect_ratios ?? raw.supportedAspectRatios ?? []).filter(
-    (ar): ar is AspectRatio => (ASPECT_RATIOS as readonly string[]).includes(ar)
-  );
-
+export function mapBridgeCapabilities(
+  status: StatusResponse | undefined,
+  mode: MuseSubmitMode = 'chat'
+): ProviderCapabilities {
+  if (!status) {
+    return mode === 'chat' ? { ...DEFAULT_CAPABILITIES, maxPromptChars: CHAT_PROMPT_MAX_DEFAULT } : { ...DEFAULT_CAPABILITIES };
+  }
+  const maxPromptChars =
+    mode === 'chat'
+      ? status.limits?.chat_prompt_max_chars ?? CHAT_PROMPT_MAX_DEFAULT
+      : status.limits?.prompt_max_chars ?? DEFAULT_CAPABILITIES.maxPromptChars;
   return {
-    canCancel: raw.can_cancel ?? raw.canCancel ?? false,
-    reportsProgress: raw.reports_progress ?? raw.reportsProgress ?? false,
-    supportedDurations: raw.supported_durations ?? raw.supportedDurations ?? [],
-    supportedAspectRatios,
-    maxPromptChars: raw.max_prompt_chars ?? raw.maxPromptChars ?? 4000,
-    maxUploadBytes: raw.max_upload_bytes ?? raw.maxUploadBytes ?? 20 * 1024 * 1024,
+    // POST /v1/jobs/{id}/cancel exists; a "status only" key cannot create or cancel anything anyway.
+    canCancel: status.key?.scope !== undefined && status.key.scope !== 'status',
+    reportsProgress: false,
+    supportedDurations: [],
+    supportedAspectRatios: [],
+    maxPromptChars,
+    maxUploadBytes: status.limits?.upload_max_bytes ?? DEFAULT_CAPABILITIES.maxUploadBytes,
   };
 }
 
-/**
- * Maps bridge /v1/status payload to ProviderConnectionState.
- */
-export function mapBridgeConnectionState(statusData: StatusResponse): ProviderConnectionState {
-  if (statusData.needs_login === true || statusData.login_required === true || statusData.status === 'needs_login') {
-    return 'needs_login';
-  }
-  if (statusData.quota_limited === true || statusData.quota_exhausted === true || statusData.status === 'quota_limited') {
-    return 'quota_limited';
-  }
-  if (statusData.busy === true || statusData.status === 'busy') {
-    return 'busy';
-  }
-  if (statusData.status === 'ready' || statusData.status === 'ok' || statusData.authenticated === true) {
-    return 'ready';
-  }
-  if (statusData.status === 'not_installed') {
-    return 'not_installed';
-  }
+/** Maps /v1/status (capabilities + account groups/quota) to ProviderConnectionState. */
+export function mapBridgeConnectionState(status: StatusResponse, mode: MuseSubmitMode = 'chat'): ProviderConnectionState {
+  if (mode === 'chat' && status.capabilities && status.capabilities.chat === false) return 'error';
+  if (mode === 'video' && status.capabilities && status.capabilities.video_from_image === false) return 'error';
+  if (status.key?.scope === 'status') return 'error';
+
+  const acc = status.accounts;
+  if (!acc) return 'error';
+  const items = acc.items ?? [];
+  const usable = items.filter((i) => {
+    const tier = i.quota?.tier;
+    return tier !== 'exhausted' && tier !== 'weekly_full';
+  });
+
+  if ((acc.ready ?? 0) > 0 && (items.length === 0 || usable.some((i) => i.group === 'ready'))) return 'ready';
+  if (items.length > 0 && usable.length === 0) return 'quota_limited';
+  if ((acc.busy ?? 0) > 0 || (acc.waiting ?? 0) > 0) return 'busy';
+  if ((acc.needs_user ?? 0) > 0 || (acc.total ?? 0) === 0) return 'needs_login';
+  if ((acc.ready ?? 0) > 0) return 'quota_limited';
   return 'error';
 }
 
-/**
- * Maps HTTP status codes to safe ErrorCodes.
- */
+/** Maps HTTP status codes to safe ErrorCodes. */
 export function mapHttpStatusToErrorCode(status: number): ErrorCode {
   if (status === 401) return 'NEEDS_LOGIN';
   if (status === 403 || status === 422) return 'CONTENT_REFUSED';
   if (status === 429) return 'QUOTA_LIMITED';
   if (status === 404) return 'NOT_FOUND';
-  if (status >= 500 && status <= 599) return 'PROVIDER_ERROR';
   return 'PROVIDER_ERROR';
 }

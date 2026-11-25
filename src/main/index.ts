@@ -139,6 +139,9 @@ if (!gotLock) {
 
     // 6. Create window
     mainWindow = createWindow();
+
+    // 7. Bundled Muse4AI: start + provision in the background (the Setup screen shows progress).
+    if (container.muse4ai) void container.muse4ai.ensure();
   });
 
   app.on('window-all-closed', () => {
