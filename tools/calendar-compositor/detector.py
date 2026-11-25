@@ -111,14 +111,85 @@ def detect_page_quad(frame: np.ndarray) -> tuple[np.ndarray | None, float]:
     return None, 0.0
 
 
-def detect_hand_mask(frame: np.ndarray, quad_corners: np.ndarray) -> np.ndarray:
+class PaperColorModel:
+    """Tracks and models calendar page paper color in Lab space."""
+
+    def __init__(self) -> None:
+        self.median_lab: np.ndarray | None = None
+        self.std_lab: np.ndarray | None = None
+
+    def update(self, frame: np.ndarray, quad_corners: np.ndarray) -> None:
+        """Samples inner quad region to update the paper color model."""
+        h, w = frame.shape[:2]
+        quad_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(quad_mask, np.int32(quad_corners), 255)
+
+        # Inset heavily (40px) to sample pure paper interior away from edges, spirals, and entering fingers
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
+        inner_mask = cv2.erode(quad_mask, kernel, iterations=2)
+        if np.count_nonzero(inner_mask) < 200:
+            return
+
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        inner_lab = lab[inner_mask > 0]
+        med = np.median(inner_lab, axis=0)
+        std = np.std(inner_lab, axis=0)
+
+        if self.median_lab is None:
+            self.median_lab = med
+            self.std_lab = std
+        else:
+            self.median_lab = 0.9 * self.median_lab + 0.1 * med
+            self.std_lab = 0.9 * self.std_lab + 0.1 * std
+
+
+def detect_hand_mask(
+    frame: np.ndarray,
+    quad_corners: np.ndarray,
+    paper_model: PaperColorModel | None = None,
+) -> tuple[np.ndarray, bool]:
     """
     Detects hand/finger skin pixels inside the page quad.
-    Returns a binary mask (uint8, 0 or 255) where 255 indicates hand pixels.
+
+    Requirements:
+    1. Never classify warm-cream/white paper as hand.
+    2. Hand pixels must be skin-toned in YCrCb and HSV.
+    3. Hand pixels must be clearly different from the paper model in Lab space (dist >= 25.0).
+    4. Hand pixels must belong to a connected component that touches the quad boundary band
+       (hands enter from the page edge; interior features/text are rejected).
+    5. Cap hand area: if total hand area > 35% of the quad, treat frame as low-confidence
+       rather than 'hand' (returns is_excessive=True).
+    6. If unsure or no valid components, returns empty mask (prefer no hand mask over wiping artwork).
+
+    Returns:
+        (hand_mask, is_excessive_hand)
     """
     h, w = frame.shape[:2]
+    quad_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(quad_mask, np.int32(quad_corners), 255)
+    quad_area = float(cv2.contourArea(quad_corners))
+    if quad_area < 100.0:
+        return np.zeros((h, w), dtype=np.uint8), False
 
-    # Skin in YCrCb
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+
+    # Determine paper median Lab color
+    if paper_model is not None and paper_model.median_lab is not None:
+        med_lab = paper_model.median_lab
+    else:
+        # Sample interior of quad
+        kernel_sample = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41))
+        inner_mask = cv2.erode(quad_mask, kernel_sample, iterations=2)
+        if np.count_nonzero(inner_mask) > 100:
+            med_lab = np.median(lab[inner_mask > 0], axis=0)
+        else:
+            med_lab = np.median(lab[quad_mask > 0], axis=0)
+
+    # Color distance from paper model in Lab space
+    diff = lab.astype(np.float32) - med_lab.astype(np.float32)
+    dist_from_paper = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # Skin in YCrCb (natural human skin tones)
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
     cr = ycrcb[:, :, 1]
     cb = ycrcb[:, :, 2]
@@ -131,15 +202,42 @@ def detect_hand_mask(frame: np.ndarray, quad_corners: np.ndarray) -> np.ndarray:
     v_chan = hsv[:, :, 2]
     skin_hsv = (h_chan <= 25) & (s_chan >= 30) & (s_chan <= 210) & (v_chan >= 60)
 
-    skin = (skin_ycrcb & skin_hsv).astype(np.uint8) * 255
+    # Condition: skin-toned AND clearly different from paper (dist >= 25.0) AND inside quad
+    diff_thresh = 25.0
+    cand_skin = (skin_ycrcb & skin_hsv & (dist_from_paper >= diff_thresh) & (quad_mask > 0)).astype(
+        np.uint8
+    ) * 255
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, kernel)
-    skin = cv2.dilate(skin, kernel, iterations=1)
+    # Morphology cleanup
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cand_skin = cv2.morphologyEx(cand_skin, cv2.MORPH_OPEN, kernel_clean)
 
-    # Intersect with the page quad
-    quad_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(quad_mask, np.int32(quad_corners), 255)
+    # Quad boundary band (15px inside the quad edge) - hands enter from the edge
+    boundary_band = cv2.subtract(
+        quad_mask,
+        cv2.erode(quad_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)), iterations=1),
+    )
 
-    hand_mask = cv2.bitwise_and(skin, quad_mask)
-    return hand_mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cand_skin)
+    valid_hand_mask = np.zeros((h, w), dtype=np.uint8)
+    total_hand_pixels = 0
+
+    for lbl in range(1, num_labels):
+        comp_area = stats[lbl, cv2.CC_STAT_AREA]
+        if comp_area < 100:  # Ignore tiny noise (< 100 px)
+            continue
+        comp_mask = (labels == lbl)
+        # Connected component must intersect the quad boundary
+        if np.any(comp_mask & (boundary_band > 0)):
+            valid_hand_mask[comp_mask] = 255
+            total_hand_pixels += comp_area
+
+    # Cap hand area: if > 35% of quad area, treat as excessive hand occlusion (low-confidence)
+    if total_hand_pixels > 0.35 * quad_area:
+        return np.zeros((h, w), dtype=np.uint8), True
+
+    # Dilate valid hand mask slightly (3px) so hand edges don't leak artwork
+    if total_hand_pixels > 0:
+        valid_hand_mask = cv2.dilate(valid_hand_mask, kernel_clean, iterations=1)
+
+    return valid_hand_mask, False

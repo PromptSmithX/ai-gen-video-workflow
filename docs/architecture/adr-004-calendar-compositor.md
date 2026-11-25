@@ -1,6 +1,6 @@
 # ADR-004: Local Calendar Artwork Compositor Architecture
 
-- **Status:** Accepted
+- **Status:** Accepted (Updated with Paper Color Modeling & Boundary-Constrained Hand Detection)
 - **Date:** 2026-11-25
 - **Context:** Feature brief `calendar-category-integration.md` §7, §11, §12 W-CAL-4; Task CAL-3
 
@@ -51,8 +51,13 @@ When packaged, the application directory layout will resolve:
 1. **Probe:** `ffprobe` extracts exact framerate, dimensions, duration, and audio stream existence.
 2. **Detection:** Combined color/brightness thresholding (cream/light paper mask in HSV/LAB) and convex polygon approximation detect candidate page quadrilaterals.
 3. **Tracking & Optical Flow:** Lucas-Kanade optical flow (`calcOpticalFlowPyrLK`) on an interior grid + RANSAC homography estimation track corner positions across frames. Drift is corrected by periodic fusion with confident page detections.
-4. **Warping & Margin Inset:** Full-resolution artwork is warped in-memory onto the quadrilateral with a 1.5% margin inset to prevent bleed over spirals and page borders. Mask edges are feathered `<= 2 px`.
-5. **Hand/Finger Preservation:** Skin-color segmentation in YCrCb/HSV detects fingers or thumbs entering the page quad and preserves hand pixels on top of the artwork.
+4. **Warping & Directional Margin Inset:** Full-resolution artwork is warped in-memory onto the quadrilateral with directional margin insets. The top edge is inset by $\ge 4\%$ of page height (default 5%) so artwork never touches or overlaps the spiral binding coils. Side and bottom margins are inset by 2%. Mask edges are feathered `<= 2 px`.
+5. **Paper Color Model & Hand/Finger Segmentation:**
+   - To eliminate false-positive skin classifications on warm-cream paper (which shares chromatic characteristics with human skin in HSV/YCrCb), the sidecar builds a dynamic **Paper Color Model** in Lab space from the inner quad region.
+   - Hand pixels must be skin-toned in YCrCb/HSV **and** have a Euclidean color distance $\ge 25.0$ in Lab space relative to the median paper model.
+   - Hand candidate pixels must belong to a connected component that intersects the quad's outer boundary (hands enter from page borders; interior features and text are never classified as hand).
+   - If detected hand area exceeds 35% of the quad, the frame is marked as low-confidence.
+   - If unsure or no components touch the boundary, no hand mask is applied (preferring full artwork over wiping pixels).
 6. **Temporal Smoothing & Low Confidence Protection:** Confident frame runs use an exponential moving average (alpha=0.3) to eliminate sub-pixel jitter. Low confidence frames (`< 0.65`) suppress artwork rendering to eliminate jumping or drifting.
 7. **Audio Preservation:** Audio stream from the input video is preserved bit-for-bit via ffmpeg stream copy (`-c:a copy`).
 
@@ -83,6 +88,8 @@ The local build at `C:\ffmpeg\bin` was compiled with `--enable-gpl --enable-vers
 
 ### Positive
 - High-fidelity artwork placement without risking generative AI hallucinations.
+- Paper color modeling completely eliminates false-positive masking on warm-cream paper.
+- Top inset cleanly isolates the spiral binding, guaranteeing spiral loops remain uncolored.
 - Completely isolated process crashes cannot terminate the main Electron UI or backend orchestrator.
 - Deterministic quality gate protects brand and product standards by rejecting poorly tracked generations.
 - Preserves 100% of the apparel generation pipeline without alterations.
