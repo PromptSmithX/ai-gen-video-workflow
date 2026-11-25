@@ -761,4 +761,158 @@ describe('Calendar Job Orchestrator E2E', () => {
     stack.orchestrator.stop();
     stack.db.close();
   });
+
+  // 12. Mutable category config: calendar post-processing runs even if promptGroup changed or category removed before download
+  it('Download: calendar post-processing runs even if category promptGroup changed to other before download', async () => {
+    let capturedInput: CalendarCompositionInput | null = null;
+    const testCompositor: CalendarArtworkCompositor = {
+      process: async (input) => {
+        capturedInput = input;
+        fs.writeFileSync(input.outputVideoPath, createMinimalValidMp4());
+        return {
+          applied: true,
+          artworkSha256: await hashFile(input.artworkPath),
+          processedFrames: 120,
+          visibleFrames: 100,
+          trackingCoverage: 0.9,
+          lowConfidenceFrames: 0,
+          compositorVersion: '2.5.0-cal',
+        };
+      },
+    };
+
+    const stack = createTestStack({ compositor: testCompositor });
+    const cover = await stack.stageImage('cover.png', 100, 100, 501);
+    const artwork = await stack.stageImage('art.png', 120, 120, 502);
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: 'calendar-review',
+        templateVersion: 'v1',
+        sku: 'CAL-MUTCFG-SUCCESS',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+
+    // Change category config while job is in flight (promptGroup becomes 'other')
+    const deskCal = stack.config.categories.find((c) => c.id === 'desk-calendar');
+    if (deskCal) {
+      deskCal.promptGroup = 'other';
+    }
+
+    await waitForJobState(stack.db, view.job.id, 'SUCCEEDED', 8000);
+    stack.orchestrator.stop();
+
+    // Compositor was still called!
+    expect(capturedInput).not.toBeNull();
+    const artAsset = stack.db.assets.listByJob(view.job.id).find((a) => a.role === 'interior_artwork');
+    expect(artAsset).toBeDefined();
+    expect(capturedInput!.artworkPath).toBe(stack.media.resolve(artAsset!.path));
+
+    // Stored video asset exists with calendarPostProcess metadata
+    const videoAsset = stack.db.assets.listByJob(view.job.id).find((a) => a.role === 'generated_video');
+    expect(videoAsset).toBeDefined();
+
+    const metadataDir = path.join(stack.config.libraryRoot, 'CAL-MUTCFG-SUCCESS', 'metadata');
+    const metadataFiles = fs.readdirSync(metadataDir).filter((f) => f.endsWith('.json'));
+    expect(metadataFiles.length).toBe(1);
+    const metadataContent = JSON.parse(fs.readFileSync(path.join(metadataDir, metadataFiles[0]!), 'utf-8'));
+    expect(metadataContent.calendarPostProcess).toBeDefined();
+    expect(metadataContent.calendarPostProcess.applied).toBe(true);
+
+    stack.db.close();
+  });
+
+  // 13. Mutable category config: failing compositor with changed/removed category config -> DOWNLOAD_FAILED + CALENDAR_COMPOSITING_FAILED, no video asset
+  it('Download: when category removed, failing compositor transitions to DOWNLOAD_FAILED + CALENDAR_COMPOSITING_FAILED and no video asset', async () => {
+    let compositorCallCount = 0;
+    const testCompositor: CalendarArtworkCompositor = {
+      process: async () => {
+        compositorCallCount++;
+        throw new PodError('CALENDAR_COMPOSITING_FAILED', 'Compositor failure on removed category');
+      },
+    };
+
+    const stack = createTestStack({ compositor: testCompositor });
+    const cover = await stack.stageImage('cover.png', 100, 100, 503);
+    const artwork = await stack.stageImage('art.png', 120, 120, 504);
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: 'calendar-review',
+        templateVersion: 'v1',
+        sku: 'CAL-MUTCFG-FAIL',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+
+    // Remove category entirely from config while job is running
+    stack.config.categories = stack.config.categories.filter((c) => c.id !== 'desk-calendar');
+
+    const failedJob = await waitForJobState(stack.db, view.job.id, 'DOWNLOAD_FAILED', 8000);
+    stack.orchestrator.stop();
+
+    expect(compositorCallCount).toBe(1);
+    expect(failedJob.errorCode).toBe('CALENDAR_COMPOSITING_FAILED');
+
+    // No generated_video asset was created
+    const videoAsset = stack.db.assets.listByJob(view.job.id).find((a) => a.role === 'generated_video');
+    expect(videoAsset).toBeUndefined();
+
+    stack.db.close();
+  });
+
+  // 14. Mutable category config: regenerate reattaches artwork even if category promptGroup changed or category removed
+  it('Regenerate: reattaches artwork even if category promptGroup changed to other', async () => {
+    const stack = createTestStack();
+    const cover = await stack.stageImage('cover.png', 100, 100, 505);
+    const artwork = await stack.stageImage('art.png', 120, 120, 506);
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: 'calendar-review',
+        templateVersion: 'v1',
+        sku: 'CAL-MUTCFG-REGEN',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+
+    const initialJob = await waitForJobState(stack.db, view.job.id, 'SUCCEEDED', 8000);
+    const originalArtAsset = stack.db.assets.listByJob(initialJob.id).find((a) => a.role === 'interior_artwork');
+    expect(originalArtAsset).toBeDefined();
+
+    // Now change config: desk-calendar promptGroup becomes 'other'
+    const deskCal = stack.config.categories.find((c) => c.id === 'desk-calendar');
+    if (deskCal) {
+      deskCal.promptGroup = 'other';
+    }
+
+    // Regenerate
+    const regenView = await stack.orchestrator.regenerate(initialJob.id, true, newId());
+    expect(regenView.job.id).not.toBe(initialJob.id);
+    expect(regenView.interiorArtworkUrl).toMatch(/^pod-media:\/\/asset\//);
+
+    // New job still has its own interior_artwork row reattached with same sha256 and path
+    const regenAssets = stack.db.assets.listByJob(regenView.job.id);
+    const regenArtAsset = regenAssets.find((a) => a.role === 'interior_artwork');
+    expect(regenArtAsset).toBeDefined();
+    expect(regenArtAsset!.id).not.toBe(originalArtAsset!.id);
+    expect(regenArtAsset!.sha256).toBe(originalArtAsset!.sha256);
+    expect(regenArtAsset!.path).toBe(originalArtAsset!.path);
+
+    stack.orchestrator.stop();
+    stack.db.close();
+  });
 });

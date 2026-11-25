@@ -410,13 +410,12 @@ export class JobOrchestrator extends EventEmitter {
       throw new PodError('INVALID_STATE', 'Original prompt snapshot missing');
     }
 
+    const originalArtwork = this.findInteriorArtworkAsset(original);
     const product = this.db.products.getById(original.productId);
     const category = this.config.categories.find((c) => c.id === product?.category);
-    const isCalendar = category?.promptGroup === 'calendar';
+    const isCalendar = originalArtwork !== undefined || category?.promptGroup === 'calendar';
 
-    let originalArtwork: Asset | undefined;
     if (isCalendar) {
-      originalArtwork = this.findInteriorArtworkAsset(original);
       if (!originalArtwork) {
         throw new PodError('NOT_FOUND', 'Original interior artwork asset missing');
       }
@@ -827,6 +826,18 @@ export class JobOrchestrator extends EventEmitter {
     return undefined;
   }
 
+  /**
+   * Determines if a job is a calendar job and finds its interior artwork asset.
+   * A job is a calendar job if it already has an interior_artwork asset or its current category promptGroup is 'calendar'.
+   */
+  private jobCalendarInfo(job: Job): { isCalendar: boolean; artwork: Asset | undefined } {
+    const artwork = this.db.assets.listByJob(job.id).find((a) => a.role === 'interior_artwork');
+    const product = this.db.products.getById(job.productId);
+    const category = this.config.categories.find((c) => c.id === product?.category);
+    const isCalendar = artwork !== undefined || category?.promptGroup === 'calendar';
+    return { isCalendar, artwork };
+  }
+
   private async handleSubmit(job: Job): Promise<void> {
     // 1. Resolve source asset file BEFORE transitioning to SUBMITTING
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
@@ -1163,17 +1174,13 @@ export class JobOrchestrator extends EventEmitter {
         return;
       }
 
-      // Check product category for calendar post-processing
-      const product = this.db.products.getById(job.productId);
-      const category = this.config.categories.find((c) => c.id === product?.category);
-      const isCalendar = category?.promptGroup === 'calendar';
+      // Check calendar post-processing (artwork asset present or category is calendar)
+      const { isCalendar, artwork: artworkAsset } = this.jobCalendarInfo(job);
 
       let videoFileToStore = tempPartPath;
       let compositionReport: CalendarCompositionReport | null = null;
 
       if (isCalendar) {
-        const jobAssets = this.db.assets.listByJob(job.id);
-        const artworkAsset = jobAssets.find((a) => a.role === 'interior_artwork');
         if (!artworkAsset) {
           this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
             errorCode: 'NOT_FOUND',
@@ -1393,12 +1400,10 @@ export class JobOrchestrator extends EventEmitter {
   async toJobView(job: Job, capsOverride?: ProviderCapabilities): Promise<JobView> {
     const caps = capsOverride ?? (await this.getCapabilities());
     const product = this.db.products.getById(job.productId);
-    const category = this.config.categories.find((c) => c.id === product?.category);
-    const isCalendar = category?.promptGroup === 'calendar';
     const assets = this.db.assets.listByJob(job.id);
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
     const videoAsset = assets.find((a) => a.role === 'generated_video');
-    const artworkAsset = isCalendar ? assets.find((a) => a.role === 'interior_artwork') : null;
+    const artworkAsset = assets.find((a) => a.role === 'interior_artwork');
 
     let elapsedMs: number;
     if (isTerminal(job.state)) {
@@ -1428,12 +1433,10 @@ export class JobOrchestrator extends EventEmitter {
 
   private toJobViewSync(job: Job): JobView {
     const product = this.db.products.getById(job.productId);
-    const category = this.config.categories.find((c) => c.id === product?.category);
-    const isCalendar = category?.promptGroup === 'calendar';
     const assets = this.db.assets.listByJob(job.id);
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
     const videoAsset = assets.find((a) => a.role === 'generated_video');
-    const artworkAsset = isCalendar ? assets.find((a) => a.role === 'interior_artwork') : null;
+    const artworkAsset = assets.find((a) => a.role === 'interior_artwork');
 
     let elapsedMs: number;
     if (isTerminal(job.state)) {
