@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { app, BrowserWindow, dialog, net, protocol } from 'electron';
+import type { AssetRole } from '@shared/domain';
 import { PodError } from '@shared/errors';
 import { IPC, MEDIA_PROTOCOL } from '@shared/ipc';
 import { createAppContainer, type AppContainer } from './app/container';
@@ -100,6 +101,15 @@ if (!gotLock) {
           if (!asset) {
             return new Response('Not Found', { status: 404 });
           }
+          const allowedRoles: AssetRole[] = [
+            'source_image',
+            'generated_video',
+            'thumbnail',
+            'interior_artwork',
+          ];
+          if (!allowedRoles.includes(asset.role)) {
+            return new Response('Not Found', { status: 404 });
+          }
           const absPath = container.media.resolve(asset.path);
           if (!fs.existsSync(absPath)) {
             return new Response('Not Found', { status: 404 });
@@ -150,6 +160,11 @@ if (!gotLock) {
 
   app.on('before-quit', () => {
     if (container) {
+      try {
+        container.compositor.dispose?.();
+      } catch {
+        // ignore
+      }
       container.close();
       container = null;
     }

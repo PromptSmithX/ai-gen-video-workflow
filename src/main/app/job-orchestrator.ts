@@ -10,11 +10,22 @@ import type { CreateJobInput, JobView } from '@shared/ipc';
 import { JOB_STATE_LABELS } from '@shared/job-state';
 import type { MuseProvider, ProviderCapabilities, ProviderJob } from '@shared/provider';
 import { ProviderError } from '@shared/provider';
-import type { JobFilter, Logger, MediaLibrary, PodDatabase, PromptService, StoredFile } from '@shared/services';
+import type {
+  CalendarArtworkCompositor,
+  CalendarCompositionReport,
+  JobFilter,
+  Logger,
+  MediaLibrary,
+  PodDatabase,
+  PromptService,
+  StoredFile,
+} from '@shared/services';
 import { newId, nowIso } from '../domain/ids';
 import { isTerminal, nextActionsFor } from '../domain/job-machine';
+import { hashFile } from '../infra/media/hash';
 import { nextPollDelay } from '../providers/muse/poll';
-import type { ImageStagingService } from './image-staging';
+import type { ImageStagingService, StagedImageRecord } from './image-staging';
+import { createUnavailableCompositor } from './unavailable-compositor';
 
 export interface OrchestratorDeps {
   db: PodDatabase;
@@ -24,6 +35,7 @@ export interface OrchestratorDeps {
   config: AppConfig;
   logger: Logger;
   imageStaging: ImageStagingService;
+  compositor: CalendarArtworkCompositor;
   /** Max concurrent active generations. Defaults to 1. */
   maxConcurrent?: number;
 }
@@ -45,6 +57,7 @@ export class JobOrchestrator extends EventEmitter {
   private config: AppConfig;
   private readonly logger: Logger;
   private readonly imageStaging: ImageStagingService;
+  private readonly compositor: CalendarArtworkCompositor;
   private readonly maxConcurrent: number;
 
   private isProcessing = false;
@@ -63,6 +76,7 @@ export class JobOrchestrator extends EventEmitter {
     this.config = deps.config;
     this.logger = deps.logger;
     this.imageStaging = deps.imageStaging;
+    this.compositor = deps.compositor ?? createUnavailableCompositor();
     this.maxConcurrent = deps.maxConcurrent ?? 1;
   }
 
@@ -128,14 +142,33 @@ export class JobOrchestrator extends EventEmitter {
       throw new PodError('INVALID_SKU');
     }
 
-    const staged = this.imageStaging.get(input.sourceToken);
-    if (!staged) {
+    const stagedSource = this.imageStaging.get(input.sourceToken);
+    if (!stagedSource) {
       throw new PodError('INVALID_IMAGE', 'Staged image token expired or invalid');
     }
 
     const category = this.config.categories.find((c) => c.id === input.categoryId);
     if (!category) {
       throw new PodError('CONFIG_INVALID', 'Category not found in configuration');
+    }
+
+    const isCalendar = category.promptGroup === 'calendar';
+    let stagedArtwork: StagedImageRecord | null = null;
+    if (isCalendar) {
+      if (!input.interiorArtworkToken) {
+        throw new PodError('INVALID_IMAGE', 'Interior artwork is required for Desk Calendar');
+      }
+      const staged = this.imageStaging.get(input.interiorArtworkToken);
+      if (!staged) {
+        throw new PodError('INVALID_IMAGE', 'Interior artwork token expired or invalid');
+      }
+      stagedArtwork = staged;
+    }
+
+    // Validate images before any import
+    await this.media.validateImage(stagedSource.absPath);
+    if (isCalendar && stagedArtwork) {
+      await this.media.validateImage(stagedArtwork.absPath);
     }
 
     // Ensure template exists
@@ -161,7 +194,7 @@ export class JobOrchestrator extends EventEmitter {
           sku: normalizedSku,
           product_category: category.label,
           product_name: input.productName,
-          source_image_filename: staged.fileName,
+          source_image_filename: stagedSource.fileName,
           duration_seconds: input.durationSeconds,
           aspect_ratio: input.aspectRatio,
           review_style: input.reviewStyle,
@@ -188,16 +221,29 @@ export class JobOrchestrator extends EventEmitter {
     }
 
     // Perform async file operations before the single synchronous DB transaction
-    const sourceAssetFile = await this.media.importSourceImage(staged.absPath, normalizedSku);
-    const promptSnapshotFile = await this.media.writePromptSnapshot(
-      normalizedSku,
-      input.templateVersion || 'v1',
-      promptText
-    );
+    const createdFiles: string[] = [];
+    let sourceAssetFile: StoredFile | null = null;
+    let artworkAssetFile: StoredFile | null = null;
+    let promptSnapshotFile: StoredFile | null = null;
 
     const jobId = newId();
     let job: Job;
     try {
+      sourceAssetFile = await this.media.importSourceImage(stagedSource.absPath, normalizedSku);
+      createdFiles.push(sourceAssetFile.absPath);
+
+      if (isCalendar && stagedArtwork) {
+        artworkAssetFile = await this.media.importInteriorArtwork(stagedArtwork.absPath, normalizedSku);
+        createdFiles.push(artworkAssetFile.absPath);
+      }
+
+      promptSnapshotFile = await this.media.writePromptSnapshot(
+        normalizedSku,
+        input.templateVersion || 'v1',
+        promptText
+      );
+      createdFiles.push(promptSnapshotFile.absPath);
+
       job = this.db.transaction(() => {
         const product = this.db.products.upsertBySku({
           sku: normalizedSku,
@@ -209,13 +255,13 @@ export class JobOrchestrator extends EventEmitter {
           productId: product.id,
           jobId: null,
           role: 'source_image',
-          path: sourceAssetFile.relPath,
-          mime: sourceAssetFile.mime,
-          bytes: sourceAssetFile.bytes,
-          width: sourceAssetFile.width,
-          height: sourceAssetFile.height,
+          path: sourceAssetFile!.relPath,
+          mime: sourceAssetFile!.mime,
+          bytes: sourceAssetFile!.bytes,
+          width: sourceAssetFile!.width,
+          height: sourceAssetFile!.height,
           durationMs: null,
-          sha256: sourceAssetFile.sha256,
+          sha256: sourceAssetFile!.sha256,
         });
 
         const newJob = this.db.jobs.insert({
@@ -227,7 +273,7 @@ export class JobOrchestrator extends EventEmitter {
           sourceAssetId: sourceAsset.id,
           promptTemplateId: input.templateId,
           promptTemplateVersion: input.templateVersion,
-          promptSha256: promptSnapshotFile.sha256,
+          promptSha256: promptSnapshotFile!.sha256,
           promptOverridden: Boolean(input.promptOverride && input.promptOverride.trim().length > 0),
           durationSeconds: input.durationSeconds ?? null,
           aspectRatio: input.aspectRatio ?? null,
@@ -235,32 +281,44 @@ export class JobOrchestrator extends EventEmitter {
           regeneratedFromJobId: null,
         });
 
+        if (isCalendar && artworkAssetFile) {
+          this.db.assets.insert({
+            productId: product.id,
+            jobId: newJob.id,
+            role: 'interior_artwork',
+            path: artworkAssetFile.relPath,
+            mime: artworkAssetFile.mime,
+            bytes: artworkAssetFile.bytes,
+            width: artworkAssetFile.width,
+            height: artworkAssetFile.height,
+            durationMs: null,
+            sha256: artworkAssetFile.sha256,
+          });
+        }
+
         this.db.assets.insert({
           productId: product.id,
           jobId: newJob.id,
           role: 'prompt_snapshot',
-          path: promptSnapshotFile.relPath,
-          mime: promptSnapshotFile.mime,
-          bytes: promptSnapshotFile.bytes,
+          path: promptSnapshotFile!.relPath,
+          mime: promptSnapshotFile!.mime,
+          bytes: promptSnapshotFile!.bytes,
           width: null,
           height: null,
           durationMs: null,
-          sha256: promptSnapshotFile.sha256,
+          sha256: promptSnapshotFile!.sha256,
         });
 
         return newJob;
       });
     } catch (err) {
-      // Best-effort cleanup of files if the transaction fails
-      try {
-        if (fs.existsSync(sourceAssetFile.absPath)) fs.unlinkSync(sourceAssetFile.absPath);
-      } catch {
-        // ignore
-      }
-      try {
-        if (fs.existsSync(promptSnapshotFile.absPath)) fs.unlinkSync(promptSnapshotFile.absPath);
-      } catch {
-        // ignore
+      // Best-effort cleanup of files if the transaction or file writing fails
+      for (const filePath of createdFiles) {
+        try {
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        } catch {
+          // ignore
+        }
       }
 
       // Check if duplicate key from idempotency race
@@ -352,6 +410,34 @@ export class JobOrchestrator extends EventEmitter {
       throw new PodError('INVALID_STATE', 'Original prompt snapshot missing');
     }
 
+    const product = this.db.products.getById(original.productId);
+    const category = this.config.categories.find((c) => c.id === product?.category);
+    const isCalendar = category?.promptGroup === 'calendar';
+
+    let originalArtwork: Asset | undefined;
+    if (isCalendar) {
+      originalArtwork = this.findInteriorArtworkAsset(original);
+      if (!originalArtwork) {
+        throw new PodError('NOT_FOUND', 'Original interior artwork asset missing');
+      }
+
+      let artworkAbsPath: string;
+      try {
+        artworkAbsPath = this.media.resolve(originalArtwork.path);
+      } catch {
+        throw new PodError('NOT_FOUND', 'Original interior artwork file missing');
+      }
+
+      if (!fs.existsSync(artworkAbsPath)) {
+        throw new PodError('NOT_FOUND', 'Original interior artwork file missing');
+      }
+
+      const calculatedSha256 = await hashFile(artworkAbsPath);
+      if (calculatedSha256 !== originalArtwork.sha256) {
+        throw new PodError('INVALID_IMAGE', 'Original interior artwork hash mismatch');
+      }
+    }
+
     const newJobId = newId();
     const newJob = this.db.transaction(() => {
       const inserted = this.db.jobs.insert({
@@ -383,6 +469,20 @@ export class JobOrchestrator extends EventEmitter {
         durationMs: null,
         sha256: originalSnapshot.sha256,
       });
+      if (isCalendar && originalArtwork) {
+        this.db.assets.insert({
+          productId: originalArtwork.productId,
+          jobId: inserted.id,
+          role: 'interior_artwork',
+          path: originalArtwork.path,
+          mime: originalArtwork.mime,
+          bytes: originalArtwork.bytes,
+          width: originalArtwork.width,
+          height: originalArtwork.height,
+          durationMs: null,
+          sha256: originalArtwork.sha256,
+        });
+      }
       return inserted;
     });
 
@@ -712,6 +812,21 @@ export class JobOrchestrator extends EventEmitter {
     return undefined;
   }
 
+  /**
+   * Interior artwork asset for a job. For regenerated jobs, walk back through `regeneratedFromJobId`
+   * if needed (though regenerate inserts an interior_artwork asset for the new job).
+   */
+  private findInteriorArtworkAsset(job: Job): Asset | undefined {
+    let current: Job | undefined = job;
+    for (let depth = 0; current && depth < 10; depth++) {
+      const found = this.db.assets.listByJob(current.id).find((a) => a.role === 'interior_artwork');
+      if (found) return found;
+      if (!current.regeneratedFromJobId) return undefined;
+      current = this.db.jobs.getById(current.regeneratedFromJobId) ?? undefined;
+    }
+    return undefined;
+  }
+
   private async handleSubmit(job: Job): Promise<void> {
     // 1. Resolve source asset file BEFORE transitioning to SUBMITTING
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
@@ -1026,123 +1141,245 @@ export class JobOrchestrator extends EventEmitter {
     }
 
     const tempPartPath = this.media.newTempPath();
+    let processedTempPath: string | null = null;
 
-    // 1. Download output to temp file
     try {
-      await this.provider.downloadOutput(job.providerJobId, tempPartPath, this.config.maxVideoBytes);
-    } catch (err: unknown) {
-      const code = err instanceof ProviderError ? err.code : 'DOWNLOAD_FAILED';
-      const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
-      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
-        errorCode: code,
-        safeErrorMessage: safeMessage,
-      });
-      this.logger.error('job_download_failed', {
-        jobId: job.id,
-        sku: job.skuSnapshot,
-        code,
-      });
-      await this.emitJobUpdated(job.id);
-      return;
-    }
-
-    // 2. Validate and store video in SKU folder
-    let storedVideo: StoredFile;
-    try {
-      storedVideo = await this.media.storeVideo(tempPartPath, job.skuSnapshot);
-    } catch (err: unknown) {
-      const code = err instanceof PodError ? err.code : 'DOWNLOAD_FAILED';
-      const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
-      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
-        errorCode: code,
-        safeErrorMessage: safeMessage,
-      });
-      this.logger.error('job_store_video_failed', {
-        jobId: job.id,
-        sku: job.skuSnapshot,
-        code,
-      });
-      await this.emitJobUpdated(job.id);
-      return;
-    }
-
-    // 3. Write sanitized metadata json (no prompt text, no absolute paths)
-    const baseName = path.parse(storedVideo.relPath).name;
-    const completedAt = nowIso();
-    const metadata = {
-      jobId: job.id,
-      productId: job.productId,
-      sku: job.skuSnapshot,
-      provider: job.provider,
-      providerJobId: job.providerJobId,
-      providerAssetId: job.providerAssetId,
-      templateId: job.promptTemplateId,
-      templateVersion: job.promptTemplateVersion,
-      promptSha256: job.promptSha256,
-      videoSha256: storedVideo.sha256,
-      videoBytes: storedVideo.bytes,
-      createdAt: job.createdAt,
-      completedAt,
-    };
-    try {
-      await this.media.writeMetadata(job.skuSnapshot, baseName, metadata);
-    } catch (err) {
-      this.logger.warn('metadata_write_failed', {
-        jobId: job.id,
-        sku: job.skuSnapshot,
-        error: (err as PodError)?.code ?? 'IO_ERROR',
-      });
-      // Non-critical: continue to SUCCEEDED
-    }
-
-    // 4. In a sync transaction: insert generated_video asset and set SUCCEEDED
-    try {
-      this.db.transaction(() => {
-        this.db.assets.insert({
-          productId: job.productId,
-          jobId: job.id,
-          role: 'generated_video',
-          path: storedVideo.relPath,
-          mime: 'video/mp4',
-          bytes: storedVideo.bytes,
-          width: storedVideo.width,
-          height: storedVideo.height,
-          durationMs: null,
-          sha256: storedVideo.sha256,
-        });
-        this.db.jobs.transition(job.id, 'SUCCEEDED', {
-          completedAt,
-        });
-      });
-    } catch (err) {
-      // Transaction failed: delete stored file and move to DOWNLOAD_FAILED
+      // 1. Download output to temp file
       try {
-        if (fs.existsSync(storedVideo.absPath)) {
-          fs.unlinkSync(storedVideo.absPath);
+        await this.provider.downloadOutput(job.providerJobId, tempPartPath, this.config.maxVideoBytes);
+      } catch (err: unknown) {
+        const code = err instanceof ProviderError ? err.code : 'DOWNLOAD_FAILED';
+        const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
+        this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+          errorCode: code,
+          safeErrorMessage: safeMessage,
+        });
+        this.logger.error('job_download_failed', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+          code,
+        });
+        await this.emitJobUpdated(job.id);
+        return;
+      }
+
+      // Check product category for calendar post-processing
+      const product = this.db.products.getById(job.productId);
+      const category = this.config.categories.find((c) => c.id === product?.category);
+      const isCalendar = category?.promptGroup === 'calendar';
+
+      let videoFileToStore = tempPartPath;
+      let compositionReport: CalendarCompositionReport | null = null;
+
+      if (isCalendar) {
+        const jobAssets = this.db.assets.listByJob(job.id);
+        const artworkAsset = jobAssets.find((a) => a.role === 'interior_artwork');
+        if (!artworkAsset) {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'NOT_FOUND',
+            safeErrorMessage: SAFE_ERROR_MESSAGES.NOT_FOUND,
+          });
+          this.logger.error('calendar_artwork_asset_missing', {
+            jobId: job.id,
+            sku: job.skuSnapshot,
+          });
+          await this.emitJobUpdated(job.id);
+          return;
         }
+
+        let artworkAbsPath: string;
+        try {
+          artworkAbsPath = this.media.resolve(artworkAsset.path);
+        } catch {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'NOT_FOUND',
+            safeErrorMessage: SAFE_ERROR_MESSAGES.NOT_FOUND,
+          });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+
+        if (!fs.existsSync(artworkAbsPath)) {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'NOT_FOUND',
+            safeErrorMessage: SAFE_ERROR_MESSAGES.NOT_FOUND,
+          });
+          this.logger.error('calendar_artwork_file_missing', {
+            jobId: job.id,
+            sku: job.skuSnapshot,
+          });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+
+        const calculatedSha256 = await hashFile(artworkAbsPath);
+        if (calculatedSha256 !== artworkAsset.sha256) {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'CALENDAR_COMPOSITING_FAILED',
+            safeErrorMessage: SAFE_ERROR_MESSAGES.CALENDAR_COMPOSITING_FAILED,
+          });
+          this.logger.error('calendar_artwork_hash_mismatch', {
+            jobId: job.id,
+            sku: job.skuSnapshot,
+          });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+
+        processedTempPath = this.media.newTempPath();
+
+        try {
+          compositionReport = await this.compositor.process({
+            inputVideoPath: tempPartPath,
+            artworkPath: artworkAbsPath,
+            outputVideoPath: processedTempPath,
+            sku: job.skuSnapshot,
+            jobId: job.id,
+          });
+        } catch (err: unknown) {
+          const code = 'CALENDAR_COMPOSITING_FAILED';
+          const safeMessage =
+            err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.CALENDAR_COMPOSITING_FAILED;
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: code,
+            safeErrorMessage: safeMessage,
+          });
+          this.logger.error('job_compositor_failed', {
+            jobId: job.id,
+            sku: job.skuSnapshot,
+            code,
+          });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+
+        videoFileToStore = processedTempPath;
+      }
+
+      // 2. Validate and store video in SKU folder
+      let storedVideo: StoredFile;
+      try {
+        storedVideo = await this.media.storeVideo(videoFileToStore, job.skuSnapshot);
+      } catch (err: unknown) {
+        const code = err instanceof PodError ? err.code : 'DOWNLOAD_FAILED';
+        const safeMessage = err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED;
+        this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+          errorCode: code,
+          safeErrorMessage: safeMessage,
+        });
+        this.logger.error('job_store_video_failed', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+          code,
+        });
+        await this.emitJobUpdated(job.id);
+        return;
+      }
+
+      // 3. Write sanitized metadata json (no prompt text, no absolute paths)
+      const baseName = path.parse(storedVideo.relPath).name;
+      const completedAt = nowIso();
+      const metadata: Record<string, unknown> = {
+        jobId: job.id,
+        productId: job.productId,
+        sku: job.skuSnapshot,
+        provider: job.provider,
+        providerJobId: job.providerJobId,
+        providerAssetId: job.providerAssetId,
+        templateId: job.promptTemplateId,
+        templateVersion: job.promptTemplateVersion,
+        promptSha256: job.promptSha256,
+        videoSha256: storedVideo.sha256,
+        videoBytes: storedVideo.bytes,
+        createdAt: job.createdAt,
+        completedAt,
+        ...(compositionReport
+          ? {
+              calendarPostProcess: {
+                applied: compositionReport.applied,
+                interiorArtworkSha256: compositionReport.artworkSha256,
+                compositorVersion: compositionReport.compositorVersion,
+                trackingCoverage: compositionReport.trackingCoverage,
+                processedFrames: compositionReport.processedFrames,
+                visibleFrames: compositionReport.visibleFrames,
+                lowConfidenceFrames: compositionReport.lowConfidenceFrames,
+              },
+            }
+          : {}),
+      };
+      try {
+        await this.media.writeMetadata(job.skuSnapshot, baseName, metadata);
+      } catch (err) {
+        this.logger.warn('metadata_write_failed', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+          error: (err as PodError)?.code ?? 'IO_ERROR',
+        });
+        // Non-critical: continue to SUCCEEDED
+      }
+
+      // 4. In a sync transaction: insert generated_video asset and set SUCCEEDED
+      try {
+        this.db.transaction(() => {
+          this.db.assets.insert({
+            productId: job.productId,
+            jobId: job.id,
+            role: 'generated_video',
+            path: storedVideo.relPath,
+            mime: 'video/mp4',
+            bytes: storedVideo.bytes,
+            width: storedVideo.width,
+            height: storedVideo.height,
+            durationMs: null,
+            sha256: storedVideo.sha256,
+          });
+          this.db.jobs.transition(job.id, 'SUCCEEDED', {
+            completedAt,
+          });
+        });
+      } catch (err) {
+        // Transaction failed: delete stored file and move to DOWNLOAD_FAILED
+        try {
+          if (fs.existsSync(storedVideo.absPath)) {
+            fs.unlinkSync(storedVideo.absPath);
+          }
+        } catch {
+          // ignore
+        }
+        this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+          errorCode: 'DOWNLOAD_FAILED',
+          safeErrorMessage: SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED,
+        });
+        this.logger.error('job_asset_insert_failed', {
+          jobId: job.id,
+          sku: job.skuSnapshot,
+          error: (err as PodError)?.code ?? 'DB_ERROR',
+        });
+        await this.emitJobUpdated(job.id);
+        return;
+      }
+
+      const elapsed = Math.max(0, new Date(completedAt).getTime() - new Date(job.createdAt).getTime());
+      this.logger.info('job_succeeded', {
+        jobId: job.id,
+        sku: job.skuSnapshot,
+        durationMs: elapsed,
+      });
+      await this.emitJobUpdated(job.id);
+    } finally {
+      try {
+        if (fs.existsSync(tempPartPath)) fs.unlinkSync(tempPartPath);
       } catch {
         // ignore
       }
-      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
-        errorCode: 'DOWNLOAD_FAILED',
-        safeErrorMessage: SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED,
-      });
-      this.logger.error('job_asset_insert_failed', {
-        jobId: job.id,
-        sku: job.skuSnapshot,
-        error: (err as PodError)?.code ?? 'DB_ERROR',
-      });
-      await this.emitJobUpdated(job.id);
-      return;
+      if (processedTempPath) {
+        try {
+          if (fs.existsSync(processedTempPath)) fs.unlinkSync(processedTempPath);
+        } catch {
+          // ignore
+        }
+      }
     }
-
-    const elapsed = Math.max(0, new Date(completedAt).getTime() - new Date(job.createdAt).getTime());
-    this.logger.info('job_succeeded', {
-      jobId: job.id,
-      sku: job.skuSnapshot,
-      durationMs: elapsed,
-    });
-    await this.emitJobUpdated(job.id);
   }
 
   private async emitJobUpdated(jobId: string): Promise<void> {
@@ -1156,9 +1393,12 @@ export class JobOrchestrator extends EventEmitter {
   async toJobView(job: Job, capsOverride?: ProviderCapabilities): Promise<JobView> {
     const caps = capsOverride ?? (await this.getCapabilities());
     const product = this.db.products.getById(job.productId);
+    const category = this.config.categories.find((c) => c.id === product?.category);
+    const isCalendar = category?.promptGroup === 'calendar';
     const assets = this.db.assets.listByJob(job.id);
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
     const videoAsset = assets.find((a) => a.role === 'generated_video');
+    const artworkAsset = isCalendar ? assets.find((a) => a.role === 'interior_artwork') : null;
 
     let elapsedMs: number;
     if (isTerminal(job.state)) {
@@ -1179,6 +1419,7 @@ export class JobOrchestrator extends EventEmitter {
       sourceUrl: sourceAsset ? `pod-media://asset/${sourceAsset.id}` : null,
       videoUrl: videoAsset ? `pod-media://asset/${videoAsset.id}` : null,
       videoAssetId: videoAsset?.id ?? null,
+      interiorArtworkUrl: artworkAsset ? `pod-media://asset/${artworkAsset.id}` : null,
       elapsedMs,
       progress: this.jobProgress.get(job.id) ?? null,
       nextActions: nextActionsFor(job, caps),
@@ -1187,9 +1428,12 @@ export class JobOrchestrator extends EventEmitter {
 
   private toJobViewSync(job: Job): JobView {
     const product = this.db.products.getById(job.productId);
+    const category = this.config.categories.find((c) => c.id === product?.category);
+    const isCalendar = category?.promptGroup === 'calendar';
     const assets = this.db.assets.listByJob(job.id);
     const sourceAsset = this.db.assets.getById(job.sourceAssetId);
     const videoAsset = assets.find((a) => a.role === 'generated_video');
+    const artworkAsset = isCalendar ? assets.find((a) => a.role === 'interior_artwork') : null;
 
     let elapsedMs: number;
     if (isTerminal(job.state)) {
@@ -1210,6 +1454,7 @@ export class JobOrchestrator extends EventEmitter {
       sourceUrl: sourceAsset ? `pod-media://asset/${sourceAsset.id}` : null,
       videoUrl: videoAsset ? `pod-media://asset/${videoAsset.id}` : null,
       videoAssetId: videoAsset?.id ?? null,
+      interiorArtworkUrl: artworkAsset ? `pod-media://asset/${artworkAsset.id}` : null,
       elapsedMs,
       progress: this.jobProgress.get(job.id) ?? null,
       nextActions: nextActionsFor(job, null),
