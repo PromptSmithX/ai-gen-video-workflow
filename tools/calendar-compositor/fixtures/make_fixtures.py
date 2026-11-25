@@ -8,6 +8,7 @@ Generates:
   - fixture_c_fake_text.mp4 (+ _gt.json): Page with fake 'AI' text/numbers printed on it
   - fixture_d_hand.mp4 (+ _gt.json): Skin-coloured hand/thumb blob crossing page edge
   - fixture_e_occluded.mp4: Page visible < 1 s / heavily occluded (must fail with exit 3)
+  - fixture_f_warm_cream.mp4 (+ _gt.json): Warmer cream page (RGB 240, 228, 205) proving no skin false-positives
   - fixture_benchmark_10s.mp4: 10 s 1080p clip for runtime/memory benchmarking
 """
 
@@ -33,11 +34,12 @@ BASE_BL = (460.0, 920.0)
 BASE_CORNERS = np.float32([BASE_TL, BASE_TR, BASE_BR, BASE_BL])
 
 # Colors (BGR)
-COLOR_BG_DESK = (70, 90, 120)        # Warm gray/wood desk
-COLOR_STAND = (40, 42, 45)           # Dark charcoal calendar easel base
-COLOR_CREAM_PAGE = (220, 242, 248)   # Cream paper (high R, G, B with slight warm tint)
-COLOR_SPIRAL = (180, 185, 190)       # Metallic spiral coils
-COLOR_SKIN = (130, 160, 215)         # Natural skin tone (YCrCb: Cr~150, Cb~105)
+COLOR_BG_DESK = (70, 90, 120)             # Warm gray/wood desk
+COLOR_STAND = (40, 42, 45)                # Dark charcoal calendar easel base
+COLOR_CREAM_PAGE = (220, 242, 248)        # Cream paper (high R, G, B with slight warm tint)
+COLOR_WARM_CREAM_PAGE = (205, 228, 240)   # Warmer cream paper: RGB (240, 228, 205)
+COLOR_SPIRAL = (180, 185, 190)            # Metallic spiral coils
+COLOR_SKIN = (130, 160, 215)              # Natural skin tone (YCrCb: Cr~150, Cb~105)
 
 
 def generate_artwork(output_path: str) -> None:
@@ -391,6 +393,35 @@ def make_fixture_e(ffmpeg_exe: str, out_dir: str) -> None:
     encode_video_with_audio(ffmpeg_exe, mp4_path, frame_gen, frames_count)
 
 
+def make_fixture_f_warm_cream(ffmpeg_exe: str, out_dir: str) -> None:
+    """Fixture (f): Warmer cream paper (RGB 240, 228, 205) to prove paper is never detected as skin."""
+    mp4_path = os.path.join(out_dir, "fixture_f_warm_cream.mp4")
+    gt_path = os.path.join(out_dir, "fixture_f_gt.json")
+    frames_count = 90  # 3.0 s
+
+    gt_data = []
+
+    def frame_gen():
+        for i in range(frames_count):
+            frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+            draw_background_and_stand(frame)
+
+            # Draw warmer cream page
+            cv2.fillConvexPoly(frame, np.int32(BASE_CORNERS), COLOR_WARM_CREAM_PAGE)
+            draw_spiral_binding(frame, BASE_TL, BASE_TR)
+
+            gt_data.append({
+                "frame": i,
+                "corners": BASE_CORNERS.tolist(),
+            })
+            yield frame
+
+    encode_video_with_audio(ffmpeg_exe, mp4_path, frame_gen, frames_count)
+
+    with open(gt_path, "w", encoding="utf-8") as f:
+        json.dump(gt_data, f)
+
+
 def make_fixture_benchmark(ffmpeg_exe: str, out_dir: str) -> None:
     """Fixture benchmark: 10 s (300 frames) 1080p clip to measure runtime and peak RAM."""
     mp4_path = os.path.join(out_dir, "fixture_benchmark_10s.mp4")
@@ -429,6 +460,7 @@ def generate_all_fixtures(ffmpeg_exe: str, out_dir: str, include_benchmark: bool
     make_fixture_c(ffmpeg_exe, out_dir)
     make_fixture_d(ffmpeg_exe, out_dir)
     make_fixture_e(ffmpeg_exe, out_dir)
+    make_fixture_f_warm_cream(ffmpeg_exe, out_dir)
 
     if include_benchmark:
         make_fixture_benchmark(ffmpeg_exe, out_dir)

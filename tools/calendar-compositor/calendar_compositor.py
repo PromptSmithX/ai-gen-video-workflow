@@ -6,7 +6,7 @@ Composites interior artwork onto desk calendar video page.
 Usage:
   calendar-compositor --input <mp4> --artwork <img> --output <mp4>
                       --ffmpeg <exe> --ffprobe <exe> --report <json>
-                      [--min-coverage 0.6]
+                      [--min-coverage 0.6] [--top-inset 0.05]
 
 Exit codes:
   0: OK (compositing applied and quality gate passed)
@@ -26,11 +26,11 @@ from typing import Any
 import cv2
 import numpy as np
 
-from detector import detect_hand_mask
+from detector import PaperColorModel, detect_hand_mask
 from tracker import PageTracker
 from warper import warp_and_composite
 
-COMPOSITOR_VERSION = "1.0.0"
+COMPOSITOR_VERSION = "1.0.1"
 
 
 def compute_file_sha256(path: str) -> str:
@@ -178,7 +178,6 @@ def run_compositor(args: argparse.Namespace) -> int:
         return 2
 
     # Setup ffmpeg output pipe
-    # Audio handling: copy input audio if present
     ffmpeg_cmd = [
         args.ffmpeg,
         "-y",
@@ -244,10 +243,12 @@ def run_compositor(args: argparse.Namespace) -> int:
         return 4
 
     tracker = PageTracker(alpha=0.3)
+    paper_model = PaperColorModel()
     processed_frames = 0
     visible_frames = 0
     low_confidence_frames = 0
     total_area_sum = 0.0
+    top_inset = getattr(args, "top_inset", 0.05)
 
     try:
         while True:
@@ -259,12 +260,22 @@ def run_compositor(args: argparse.Namespace) -> int:
             corners, confidence, is_confident = tracker.process_frame(frame)
 
             if is_confident and corners is not None:
-                hand_mask = detect_hand_mask(frame, corners)
-                frame_out = warp_and_composite(
-                    frame, artwork, corners, hand_mask=hand_mask, inset_ratio=0.015
-                )
-                visible_frames += 1
-                total_area_sum += float(cv2.contourArea(corners))
+                paper_model.update(frame, corners)
+                hand_mask, is_excessive = detect_hand_mask(frame, corners, paper_model=paper_model)
+
+                if is_excessive:
+                    low_confidence_frames += 1
+                    frame_out = frame
+                else:
+                    frame_out = warp_and_composite(
+                        frame,
+                        artwork,
+                        corners,
+                        hand_mask=hand_mask,
+                        top_inset=top_inset,
+                    )
+                    visible_frames += 1
+                    total_area_sum += float(cv2.contourArea(corners))
             else:
                 low_confidence_frames += 1
                 frame_out = frame
@@ -362,6 +373,7 @@ def main() -> None:
     parser.add_argument("--ffprobe", required=True, help="Path to ffprobe executable")
     parser.add_argument("--report", required=True, help="Path to output report JSON")
     parser.add_argument("--min-coverage", type=float, default=0.6, help="Minimum tracking coverage [0..1]")
+    parser.add_argument("--top-inset", type=float, default=0.05, help="Top edge inset ratio (>= 0.04)")
 
     try:
         args = parser.parse_args()

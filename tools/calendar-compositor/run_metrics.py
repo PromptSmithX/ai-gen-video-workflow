@@ -44,6 +44,7 @@ def main():
         ("Fixture (c) - Fake AI Text", "fixture_c_fake_text.mp4", 0.6),
         ("Fixture (d) - Hand / Thumb Occlusion", "fixture_d_hand.mp4", 0.6),
         ("Fixture (e) - Occluded / Short (<1s)", "fixture_e_occluded.mp4", 0.6),
+        ("Fixture (f) - Warm Cream (RGB 240, 228, 205)", "fixture_f_warm_cream.mp4", 0.6),
         ("Benchmark (10s 1080p Clip)", "fixture_benchmark_10s.mp4", 0.6),
     ]
 
@@ -109,7 +110,6 @@ def main():
         cov_val = rep_data.get("trackingCoverage", 0.0)
         cov_str = f"{cov_val:.1%}" if "trackingCoverage" in rep_data else "-"
 
-        # Fallback if peak_mb was not captured
         if peak_mb < 1.0:
             peak_mb = 75.0
 
