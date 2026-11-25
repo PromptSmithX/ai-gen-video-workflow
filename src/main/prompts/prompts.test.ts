@@ -702,4 +702,208 @@ No fake claims or ratings.
       expect(() => service.setDefault('product-review', 'v999')).toThrowError(PodError);
     });
   });
+
+  describe('6. Calendar category and prompt template (CAL-2)', () => {
+    it('calendar-review v1 listed, loads, isPlaceholder === true, not the default template; product-review / company default unchanged', () => {
+      const companyPath = path.join(tempBaseDir, 'company-master.md');
+      fs.writeFileSync(
+        companyPath,
+        `---
+id: product-review
+version: v2-company
+title: Company Master
+---
+Company master body for {{sku}}`,
+        'utf8',
+      );
+
+      // 1. Without company master
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const templates = service.listTemplates();
+
+      const calV1 = templates.find((t) => t.id === 'calendar-review' && t.version === 'v1');
+      expect(calV1).toBeDefined();
+      expect(calV1?.isPlaceholder).toBe(true);
+      expect(calV1?.isDefault).toBe(false);
+
+      // loads via getTemplate
+      const calTemplate = service.getTemplate('calendar-review');
+      expect(calTemplate.id).toBe('calendar-review');
+      expect(calTemplate.version).toBe('v1');
+      expect(calTemplate.isPlaceholder).toBe(true);
+
+      // product-review default is unchanged (v2)
+      const productDefault = service.getTemplate('product-review');
+      expect(productDefault.id).toBe('product-review');
+      expect(productDefault.version).toBe('v2');
+      expect(productDefault.isDefault).toBe(true);
+
+      // 2. With company master
+      const serviceWithCompany = createPromptService({ builtinDir, adminDir, companyMasterPath: companyPath });
+      const companyProductDefault = serviceWithCompany.getTemplate('product-review');
+      expect(companyProductDefault.source).toBe('company');
+      expect(companyProductDefault.version).toBe('v2-company');
+      expect(companyProductDefault.isDefault).toBe(true);
+
+      // calendar-review still resolves to builtin v1 and isPlaceholder === true
+      const calUnderCompany = serviceWithCompany.getTemplate('calendar-review');
+      expect(calUnderCompany.id).toBe('calendar-review');
+      expect(calUnderCompany.version).toBe('v1');
+      expect(calUnderCompany.isPlaceholder).toBe(true);
+      expect(calUnderCompany.source).toBe('builtin');
+    });
+
+    it('rendering with categoryGroup: "calendar" appends calendar.md content; all variables resolve; no unknown placeholder', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+
+      const rendered = service.render({
+        templateId: 'calendar-review',
+        variables: {
+          sku: 'CAL-2026-DESK',
+          product_category: 'calendar',
+          product_name: 'Minimalist Desk Calendar 2027',
+          review_style: 'casual and detailed',
+          duration_seconds: 15,
+          aspect_ratio: '16:9',
+        },
+        categoryGroup: 'calendar',
+        maxChars: 4000,
+        supportsDuration: true,
+        supportsAspectRatio: true,
+      });
+
+      expect(rendered.errors).toEqual([]);
+      expect(rendered.text).toContain('SKU: CAL-2026-DESK');
+      expect(rendered.text).toContain('Category: calendar');
+      expect(rendered.text).toContain('Product Name: Minimalist Desk Calendar 2027');
+      expect(rendered.text).toContain('Review Style: casual and detailed');
+      expect(rendered.text).toContain('Duration: 15 seconds');
+      expect(rendered.text).toContain('Aspect Ratio: 16:9');
+      // Category snippet content appended
+      expect(rendered.text).toContain('Category handling notes (Calendar):');
+      expect(rendered.text).toContain('physical spiral-bound desk calendar');
+      // No leftover unexpanded placeholders
+      expect(rendered.text).not.toContain('{{');
+      expect(rendered.text).not.toContain('}}');
+    });
+
+    it('rendered calendar prompt contains blank-interior-page requirement and exact front-cover preservation, and forbids generating text/dates/illustrations on the interior page', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+
+      const rendered = service.render({
+        templateId: 'calendar-review',
+        variables: {
+          sku: 'CAL-TEST-01',
+          product_category: 'calendar',
+        },
+        categoryGroup: 'calendar',
+        maxChars: 4000,
+        supportsDuration: false,
+        supportsAspectRatio: false,
+      });
+
+      expect(rendered.errors).toEqual([]);
+      // Blank interior page requirement
+      expect(rendered.text).toMatch(/blank.*?paper/i);
+      expect(rendered.text).toMatch(/warm-cream/i);
+      // Exact front-cover preservation
+      expect(rendered.text).toMatch(/preserve\s+(?:the\s+)?exact\s+front-cover\s+artwork/i);
+      // Forbids generating text, dates, illustrations on interior page
+      expect(rendered.text).toMatch(/do not generate.*?text.*?calendar dates.*?numbers.*?illustrations/i);
+    });
+
+    it('checkQuality(calendar body) passes all 8 rules; apparel v1/v2 still pass; negation tests still behave', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const calTemplate = service.getTemplate('calendar-review', 'v1');
+
+      // 1. Calendar template passes all 8 rules
+      const calReport = checkQuality(calTemplate.body);
+      expect(calReport.passed).toBe(true);
+      expect(calReport.checks).toHaveLength(8);
+      for (const check of calReport.checks) {
+        expect(check.passed).toBe(true);
+      }
+
+      // 2. Apparel v1 and v2 still pass
+      const apparelV1 = service.getTemplate('product-review', 'v1');
+      const apparelV2 = service.getTemplate('product-review', 'v2');
+      expect(checkQuality(apparelV1.body).passed).toBe(true);
+      expect(checkQuality(apparelV2.body).passed).toBe(true);
+
+      // 3. Negation tests still behave correctly
+      const negatedPaper = `
+Human product review action where the reviewer presents and demonstrates the product.
+Preserve exact artwork and printed graphic.
+Do not alter or change the artwork.
+Consistent product construction.
+Never use natural textures for paper.
+Physically continuous movement with gravity.
+No impossible transitions or teleporting.
+No fake claims or ratings.
+`;
+      const reportNegated = checkQuality(negatedPaper);
+      const textureCheck = reportNegated.checks.find((c) => c.rule === 'natural_texture');
+      expect(textureCheck?.passed).toBe(false);
+      expect(reportNegated.passed).toBe(false);
+    });
+
+    it('admin-saved calendar-review v2 becomes what getTemplate("calendar-review") returns when set default for that id', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+
+      // Before saving: resolves to builtin v1
+      const initial = service.getTemplate('calendar-review');
+      expect(initial.version).toBe('v1');
+      expect(initial.source).toBe('builtin');
+
+      // Save admin version v2
+      const v2Summary = service.saveTemplateVersion({
+        id: 'calendar-review',
+        title: 'Calendar Review V2 (Admin Approved)',
+        note: 'Company reviewed calendar prompt',
+        body: `[COMPANY APPROVED CALENDAR PROMPT]
+SKU: {{sku}}
+Category: {{product_category}}
+Scene & Action: Reviewer presents and demonstrates the desk calendar.
+Rules:
+1. Preserve exact artwork and printed graphic.
+2. Do not alter or modify the design.
+3. Consistent product and paper construction throughout.
+4. Natural, non-plastic textures for paper and hands.
+5. Physically continuous motion and realistic gravity.
+6. No impossible transitions or teleporting.
+7. Human review action presenting product features.
+8. No fake claims, ratings, or badges.
+{{category_rules}}`,
+      });
+
+      expect(v2Summary.version).toBe('v2');
+      expect(v2Summary.source).toBe('admin');
+      expect(v2Summary.isPlaceholder).toBe(false);
+
+      // Set default for calendar-review
+      service.setDefault('calendar-review', 'v2');
+
+      // getTemplate('calendar-review') now resolves to v2
+      const currentDefault = service.getTemplate('calendar-review');
+      expect(currentDefault.version).toBe('v2');
+      expect(currentDefault.source).toBe('admin');
+      expect(currentDefault.isDefault).toBe(true);
+
+      // product-review default is untouched
+      const productDefault = service.getTemplate('product-review');
+      expect(productDefault.version).toBe('v2');
+      expect(productDefault.id).toBe('product-review');
+
+      // Persists across a new PromptService instance
+      const newService = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const reloadedCalendar = newService.getTemplate('calendar-review');
+      expect(reloadedCalendar.version).toBe('v2');
+      expect(reloadedCalendar.source).toBe('admin');
+      expect(reloadedCalendar.isDefault).toBe(true);
+
+      const reloadedProduct = newService.getTemplate('product-review');
+      expect(reloadedProduct.version).toBe('v2');
+      expect(reloadedProduct.id).toBe('product-review');
+    });
+  });
 });

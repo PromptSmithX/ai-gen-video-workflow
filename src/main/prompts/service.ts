@@ -104,7 +104,8 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           defaultPlaceholder: false,
         });
 
-        const targetId = parsed.metadata.id || 'product-review';
+        // The company master path (companyMasterPath) stays bound to product-review only
+        const targetId = 'product-review';
         let targetVersion = parsed.metadata.version || `company-${hash}`;
 
         // Ensure (id, version) is unique across sources; suffix with -company on collision
@@ -197,12 +198,12 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       for (const t of matching) {
         t.isDefault = t.version === persistedDefaultVer;
       }
-    } else if (companyLoaded && matching.some((t) => t.source === 'company')) {
-      // Company template wins as default
+    } else if (companyLoaded && id === 'product-review' && matching.some((t) => t.source === 'company')) {
+      // Company template wins as default for product-review
       for (const t of matching) {
         t.isDefault = t.source === 'company';
       }
-    } else {
+    } else if (id === 'product-review') {
       // Pick builtin template marked default, or v2, or latest version
       const explicitDefault = matching.find((t) => t.isDefault);
       const v2Default = matching.find((t) => t.version === 'v2');
@@ -210,6 +211,13 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
 
       for (const t of matching) {
         t.isDefault = targetDefault ? t.version === targetDefault.version : false;
+      }
+    } else {
+      // For other template ids (e.g. calendar-review):
+      // Only set isDefault = true if explicitly marked in frontmatter or persisted in admin defaults
+      const explicitDefault = matching.find((t) => t.isDefault);
+      for (const t of matching) {
+        t.isDefault = explicitDefault ? t.version === explicitDefault.version : false;
       }
     }
   }
@@ -277,7 +285,11 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       if (version) {
         target = templates.find((t) => t.id === id && t.version === version);
       } else {
-        target = templates.find((t) => t.id === id && t.isDefault) ?? templates.find((t) => t.id === id);
+        // Resolve to admin/company version if one exists, otherwise builtin v1 / default
+        target =
+          templates.find((t) => t.id === id && t.isDefault) ??
+          templates.filter((t) => t.id === id && (t.source === 'admin' || t.source === 'company')).pop() ??
+          templates.find((t) => t.id === id);
       }
 
       if (!target) {
