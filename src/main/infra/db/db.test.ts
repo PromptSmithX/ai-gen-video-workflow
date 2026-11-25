@@ -7,6 +7,7 @@ import { PodError } from '@shared/errors';
 import type { NewJob, PodDatabase } from '@shared/services';
 import { newId } from '../../domain/ids';
 import { openDatabase, restoreFrom } from './index';
+import { MIGRATIONS } from './migrations';
 
 describe('Database and Repositories', () => {
   let tmpDir: string;
@@ -30,27 +31,241 @@ describe('Database and Repositories', () => {
 
       // Verify schema_migrations table
       const rawDb = new DatabaseSync(dbPath);
-      const rows = rawDb.prepare('SELECT version, name FROM schema_migrations').all() as Array<{
+      const rows = rawDb.prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC').all() as Array<{
         version: number;
         name: string;
       }>;
-      expect(rows).toHaveLength(1);
+      expect(rows).toHaveLength(2);
       expect(rows[0]?.version).toBe(1);
       expect(rows[0]?.name).toBe('initial_schema');
+      expect(rows[1]?.version).toBe(2);
+      expect(rows[1]?.name).toBe('assets_interior_artwork_role');
       rawDb.close();
       db1.close();
 
       // Re-open
       const db2 = openDatabase(dbPath);
       const rawDb2 = new DatabaseSync(dbPath);
-      const rows2 = rawDb2.prepare('SELECT version, name FROM schema_migrations').all() as Array<{
+      const rows2 = rawDb2.prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC').all() as Array<{
         version: number;
         name: string;
       }>;
-      expect(rows2).toHaveLength(1);
+      expect(rows2).toHaveLength(2);
       expect(rows2[0]?.version).toBe(1);
+      expect(rows2[1]?.version).toBe(2);
       rawDb2.close();
       db2.close();
+    });
+
+    it('migrates v1 database to v2: preserves all rows across 4 old roles, recreates indexes, allows interior_artwork and rejects invalid role', () => {
+      const dbPath = path.join(tmpDir, 'v1_upgrade.db');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+      `);
+
+      // Run v1 migration only
+      MIGRATIONS[0]!.up(rawDb);
+      rawDb.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+        INSERT INTO schema_migrations (version, name, applied_at)
+        VALUES (1, 'initial_schema', '${new Date().toISOString()}');
+      `);
+
+      // Insert product and job
+      rawDb.exec(`
+        INSERT INTO products (id, sku, category, product_name, created_at, updated_at)
+        VALUES ('prod-1', 'SKU-001', 't-shirt', 'T-Shirt 1', '2026-11-25T00:00:00.000Z', '2026-11-25T00:00:00.000Z');
+
+        INSERT INTO jobs (
+          id, product_id, sku_snapshot, employee_id, provider, source_asset_id,
+          prompt_template_id, prompt_template_version, prompt_sha256, prompt_overridden,
+          state, idempotency_key, attempt, review_status, created_at, updated_at
+        ) VALUES (
+          'job-1', 'prod-1', 'SKU-001', 'emp-1', 'muse', 'asset-source',
+          'tpl-1', 'v1', 'hash-prompt', 0,
+          'QUEUED', 'key-1', 0, 'pending', '2026-11-25T00:00:00.000Z', '2026-11-25T00:00:00.000Z'
+        );
+      `);
+
+      // Insert asset rows for all 4 old roles
+      const oldAssets = [
+        {
+          id: 'asset-1',
+          product_id: 'prod-1',
+          job_id: null,
+          role: 'source_image',
+          path: 'SKU-001/source/orig.png',
+          mime: 'image/png',
+          bytes: 1234,
+          width: 800,
+          height: 600,
+          duration_ms: null,
+          sha256: 'sha-source',
+          created_at: '2026-11-25T01:00:00.000Z',
+        },
+        {
+          id: 'asset-2',
+          product_id: 'prod-1',
+          job_id: 'job-1',
+          role: 'generated_video',
+          path: 'SKU-001/videos/SKU-001-video-001.mp4',
+          mime: 'video/mp4',
+          bytes: 54321,
+          width: null,
+          height: null,
+          duration_ms: 5000,
+          sha256: 'sha-video',
+          created_at: '2026-11-25T02:00:00.000Z',
+        },
+        {
+          id: 'asset-3',
+          product_id: 'prod-1',
+          job_id: 'job-1',
+          role: 'thumbnail',
+          path: 'SKU-001/thumbnails/thumb.jpg',
+          mime: 'image/jpeg',
+          bytes: 432,
+          width: 200,
+          height: 150,
+          duration_ms: null,
+          sha256: 'sha-thumb',
+          created_at: '2026-11-25T03:00:00.000Z',
+        },
+        {
+          id: 'asset-4',
+          product_id: 'prod-1',
+          job_id: 'job-1',
+          role: 'prompt_snapshot',
+          path: 'SKU-001/prompts/prompt.md',
+          mime: 'text/markdown',
+          bytes: 50,
+          width: null,
+          height: null,
+          duration_ms: null,
+          sha256: 'sha-prompt',
+          created_at: '2026-11-25T04:00:00.000Z',
+        },
+      ];
+
+      const insertStmt = rawDb.prepare(`
+        INSERT INTO assets (
+          id, product_id, job_id, role, path, mime, bytes, width, height, duration_ms, sha256, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const a of oldAssets) {
+        insertStmt.run(
+          a.id,
+          a.product_id,
+          a.job_id,
+          a.role,
+          a.path,
+          a.mime,
+          a.bytes,
+          a.width,
+          a.height,
+          a.duration_ms,
+          a.sha256,
+          a.created_at,
+        );
+      }
+
+      // Verify v1 rejects interior_artwork before migration
+      expect(() => {
+        insertStmt.run(
+          'asset-cal-fail',
+          'prod-1',
+          'job-1',
+          'interior_artwork',
+          'SKU-001/source/art.png',
+          'image/png',
+          500,
+          null,
+          null,
+          null,
+          'sha-cal',
+          '2026-11-25T05:00:00.000Z',
+        );
+      }).toThrow();
+
+      rawDb.close();
+
+      // Now open through openDatabase which runs runMigrations()
+      const podDb = openDatabase(dbPath);
+
+      // Verify schema_migrations now contains version 2
+      const postDb = new DatabaseSync(dbPath);
+      const migRows = postDb.prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC').all() as Array<{
+        version: number;
+        name: string;
+      }>;
+      expect(migRows).toHaveLength(2);
+      expect(migRows[1]?.version).toBe(2);
+      expect(migRows[1]?.name).toBe('assets_interior_artwork_role');
+
+      // Verify every old asset row is identical across all columns
+      const migratedAssets = postDb.prepare('SELECT * FROM assets ORDER BY id ASC').all();
+      expect(migratedAssets).toEqual(oldAssets);
+
+      // Verify indexes exist
+      const indexRows = postDb.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'assets'
+      `).all() as Array<{ name: string }>;
+      const indexNames = indexRows.map((r) => r.name);
+      expect(indexNames).toContain('idx_assets_product_id');
+      expect(indexNames).toContain('idx_assets_job_id');
+
+      // Verify inserting interior_artwork works now
+      const newAsset = podDb.assets.insert({
+        productId: 'prod-1',
+        jobId: 'job-1',
+        role: 'interior_artwork',
+        path: 'SKU-001/source/SKU-001-interior-artwork.png',
+        mime: 'image/png',
+        bytes: 2048,
+        width: 1024,
+        height: 768,
+        durationMs: null,
+        sha256: 'sha-cal-valid',
+      });
+      expect(newAsset.id).toBeDefined();
+      expect(newAsset.role).toBe('interior_artwork');
+
+      // Verify round-tripping via repository
+      const fetched = podDb.assets.getById(newAsset.id);
+      expect(fetched).toEqual(newAsset);
+
+      const jobAssets = podDb.assets.listByJob('job-1');
+      expect(jobAssets.some((a) => a.role === 'interior_artwork')).toBe(true);
+
+      const prodAssets = podDb.assets.listByProduct('prod-1');
+      expect(prodAssets.some((a) => a.role === 'interior_artwork')).toBe(true);
+
+      // Verify an unknown role still fails the CHECK constraint
+      expect(() => {
+        postDb.prepare(`
+          INSERT INTO assets (
+            id, product_id, job_id, role, path, mime, bytes, width, height, duration_ms, sha256, created_at
+          ) VALUES (
+            'asset-invalid', 'prod-1', 'job-1', 'unknown_role', 'p.png', 'image/png', 10, null, null, null, 'sha', '2026-11-25'
+          )
+        `).run();
+      }).toThrow();
+
+      postDb.close();
+      podDb.close();
+
+      // Verify re-opening is idempotent
+      const reopenDb = openDatabase(dbPath);
+      const reopenAssets = reopenDb.assets.listByProduct('prod-1');
+      expect(reopenAssets).toHaveLength(5); // 4 old + 1 new interior_artwork
+      reopenDb.close();
     });
 
     it('works with :memory:', () => {
