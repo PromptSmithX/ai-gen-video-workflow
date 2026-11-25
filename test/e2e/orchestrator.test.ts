@@ -7,10 +7,11 @@ import type { Job } from '@shared/domain';
 import { PodError } from '@shared/errors';
 import { ProviderError } from '@shared/provider';
 import type { JobState } from '@shared/job-state';
-import type { Logger, LogFields, MediaLibrary, PodDatabase, PromptService } from '@shared/services';
+import type { CalendarArtworkCompositor, Logger, LogFields, MediaLibrary, PodDatabase, PromptService } from '@shared/services';
 import { createAppContainer } from '../../src/main/app/container';
 import { ImageStagingService } from '../../src/main/app/image-staging';
 import { JobOrchestrator } from '../../src/main/app/job-orchestrator';
+import { createUnavailableCompositor } from '../../src/main/app/unavailable-compositor';
 import { newId } from '../../src/main/domain/ids';
 import { openDatabase } from '../../src/main/infra/db';
 import { hashFile } from '../../src/main/infra/media/hash';
@@ -108,6 +109,7 @@ describe('JobOrchestrator E2E', () => {
     db?: PodDatabase;
     media?: MediaLibrary;
     prompts?: PromptService;
+    compositor?: CalendarArtworkCompositor;
     submitTimeoutMs?: number;
     companyMasterPath?: string;
     promptMaxChars?: number;
@@ -174,6 +176,7 @@ describe('JobOrchestrator E2E', () => {
       config,
       logger: testLogger,
       imageStaging,
+      compositor: opts?.compositor ?? createUnavailableCompositor(),
     });
 
     const stageImage = async (name = 'test.png'): Promise<string> => {

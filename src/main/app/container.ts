@@ -6,7 +6,7 @@ import { safeStorage } from 'electron';
 import type { AdminSettings, AppConfig, BundledResources } from '@shared/config';
 import type { DiagnosticsPreview, PlatformCompatibility, ProviderStatus } from '@shared/ipc';
 import type { MuseProvider, ProviderCapabilities } from '@shared/provider';
-import type { Logger, MediaLibrary, PodDatabase, PromptService, SecretStore } from '@shared/services';
+import type { Logger, MediaLibrary, PodDatabase, PromptService, SecretStore, CalendarArtworkCompositor } from '@shared/services';
 import { nowIso } from '../domain/ids';
 import { isAdmin, loadConfig, readEffectiveEnv } from '../infra/config';
 import { openDatabase } from '../infra/db';
@@ -19,6 +19,7 @@ import { createSecretStore, getBridgeApiKey, type SafeStorageLike } from '../inf
 import { Muse4aiSupervisor } from '../infra/muse4ai/supervisor';
 import { ImageStagingService } from './image-staging';
 import { JobOrchestrator } from './job-orchestrator';
+import { createUnavailableCompositor } from './unavailable-compositor';
 
 export interface CreateContainerOpts {
   appPath: string;
@@ -31,6 +32,8 @@ export interface CreateContainerOpts {
   envFilePath?: string;
   /** Override bundled-resource discovery (tests). */
   bundle?: BundledResources;
+  /** Override compositor (tests or custom factory). */
+  compositor?: CalendarArtworkCompositor & { dispose?(): void };
 }
 
 /** Installer-shipped Muse4AI + company Prompt Master (dev: vendor/muse4ai/dist when it was built). */
@@ -64,6 +67,7 @@ export class AppContainer {
   readonly media: MediaLibrary;
   readonly prompts: PromptService;
   readonly imageStaging: ImageStagingService;
+  readonly compositor: CalendarArtworkCompositor & { dispose?(): void };
   provider: MuseProvider;
   readonly orchestrator: JobOrchestrator;
   /** Present when POD starts and provisions the bundled Muse4AI itself. */
@@ -188,6 +192,10 @@ export class AppContainer {
           })
         : null;
 
+    // 9c. Calendar Compositor
+    // TODO: When CAL-3 lands, switch to createCalendarCompositor from src/main/infra/compositor
+    this.compositor = opts.compositor ?? createUnavailableCompositor();
+
     // 10. Job Orchestrator
     this.orchestrator = new JobOrchestrator({
       db: this.db,
@@ -197,6 +205,7 @@ export class AppContainer {
       config: this.config,
       logger: this.logger,
       imageStaging: this.imageStaging,
+      compositor: this.compositor,
     });
   }
 
@@ -340,6 +349,11 @@ export class AppContainer {
 
   close(): void {
     this.orchestrator.stop();
+    try {
+      this.compositor.dispose?.();
+    } catch {
+      // ignore
+    }
     try {
       this.db.close();
     } catch {
