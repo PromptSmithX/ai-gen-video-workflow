@@ -7,7 +7,7 @@
   "properties": {
     "id": {
       "type": "string",
-      "description": "Template identifier, e.g. product-review"
+      "description": "Template identifier, e.g. product-review or calendar-review"
     },
     "version": {
       "type": "string",

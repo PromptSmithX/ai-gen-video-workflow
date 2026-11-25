@@ -202,6 +202,13 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       for (const t of matching) {
         t.isDefault = t.source === 'company';
       }
+    } else if (id === 'calendar-review') {
+      // Only for calendar-review without a persisted admin default:
+      // isDefault only if explicitly marked in frontmatter (builtin v1 has default: false -> not default)
+      const explicitDefault = matching.find((t) => t.isDefault);
+      for (const t of matching) {
+        t.isDefault = explicitDefault ? t.version === explicitDefault.version : false;
+      }
     } else {
       // Pick builtin template marked default, or v2, or latest version
       const explicitDefault = matching.find((t) => t.isDefault);
@@ -277,7 +284,11 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       if (version) {
         target = templates.find((t) => t.id === id && t.version === version);
       } else {
-        target = templates.find((t) => t.id === id && t.isDefault) ?? templates.find((t) => t.id === id);
+        // Resolve to admin/company version if one exists, otherwise builtin v1 / default
+        target =
+          templates.find((t) => t.id === id && t.isDefault) ??
+          templates.filter((t) => t.id === id && (t.source === 'admin' || t.source === 'company')).pop() ??
+          templates.find((t) => t.id === id);
       }
 
       if (!target) {
