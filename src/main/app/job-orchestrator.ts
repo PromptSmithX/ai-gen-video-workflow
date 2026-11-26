@@ -23,6 +23,7 @@ import type {
 import { newId, nowIso } from '../domain/ids';
 import { isTerminal, nextActionsFor } from '../domain/job-machine';
 import { hashFile } from '../infra/media/hash';
+import { prepareUploadImage, type PreparedUploadImage, type UploadImageEncoder } from '../infra/media/upload-image';
 import { nextPollDelay } from '../providers/muse/poll';
 import type { ImageStagingService, StagedImageRecord } from './image-staging';
 import { createUnavailableCompositor } from './unavailable-compositor';
@@ -36,6 +37,11 @@ export interface OrchestratorDeps {
   logger: Logger;
   imageStaging: ImageStagingService;
   compositor: CalendarArtworkCompositor;
+  /**
+   * Re-encodes a front cover that exceeds the provider upload limit (library original untouched).
+   * Absent => oversized images are passed through and the provider rejects them as before.
+   */
+  imageEncoder?: UploadImageEncoder;
   /** Max concurrent active generations. Defaults to 1. */
   maxConcurrent?: number;
 }
@@ -58,6 +64,7 @@ export class JobOrchestrator extends EventEmitter {
   private readonly logger: Logger;
   private readonly imageStaging: ImageStagingService;
   private readonly compositor: CalendarArtworkCompositor;
+  private readonly imageEncoder: UploadImageEncoder | undefined;
   private readonly maxConcurrent: number;
 
   private isProcessing = false;
@@ -77,6 +84,7 @@ export class JobOrchestrator extends EventEmitter {
     this.logger = deps.logger;
     this.imageStaging = deps.imageStaging;
     this.compositor = deps.compositor ?? createUnavailableCompositor();
+    this.imageEncoder = deps.imageEncoder;
     this.maxConcurrent = deps.maxConcurrent ?? 1;
   }
 
@@ -899,6 +907,47 @@ export class JobOrchestrator extends EventEmitter {
       return;
     }
 
+    // 2b. Fit the front cover into the provider upload limit BEFORE SUBMITTING (failure => not sent).
+    let upload: PreparedUploadImage;
+    try {
+      const caps = await this.getCapabilities();
+      upload = await prepareUploadImage({
+        srcPath: sourceAbsPath,
+        fileName: path.basename(sourceAsset.path),
+        maxBytes: caps.maxUploadBytes,
+        newTempPath: () => this.media.newTempPath(),
+        encoder: this.imageEncoder,
+      });
+    } catch (err) {
+      const code = err instanceof PodError ? err.code : 'INVALID_IMAGE';
+      this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+        errorCode: code,
+        safeErrorMessage: err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.INVALID_IMAGE,
+      });
+      this.logger.warn('source_image_prepare_failed', { jobId: job.id, sku: job.skuSnapshot, code });
+      await this.emitJobUpdated(job.id);
+      return;
+    }
+    if (upload.transcoded) {
+      this.logger.info('source_image_transcoded', {
+        jobId: job.id,
+        sku: job.skuSnapshot,
+        originalBytes: upload.originalBytes,
+        uploadBytes: upload.uploadBytes,
+        width: upload.width,
+        height: upload.height,
+        quality: upload.quality,
+      });
+    }
+
+    try {
+      await this.submitPrepared(job, upload, promptText);
+    } finally {
+      upload.cleanup();
+    }
+  }
+
+  private async submitPrepared(job: Job, upload: PreparedUploadImage, promptText: string): Promise<void> {
     // 3. Persist SUBMITTING + submitIntentAt before calling provider.generateVideo
     const now = nowIso();
     const updated = this.db.jobs.transition(job.id, 'SUBMITTING', {
@@ -914,8 +963,8 @@ export class JobOrchestrator extends EventEmitter {
     try {
       const res = await this.provider.generateVideo({
         sku: updated.skuSnapshot,
-        sourceImagePath: sourceAbsPath,
-        sourceFileName: path.basename(sourceAsset.path),
+        sourceImagePath: upload.path,
+        sourceFileName: upload.fileName,
         prompt: promptText,
         requestId: updated.idempotencyKey,
         durationSeconds: updated.durationSeconds ?? undefined,
