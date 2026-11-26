@@ -1,5 +1,6 @@
 import { nativeImage, type NativeImage } from 'electron';
 import type { UploadImageEncoder } from './upload-image';
+import type { ReferenceBoardRenderer } from './reference-board';
 
 /**
  * Composites premultiplied BGRA pixels onto white in place. Returns false when the image is fully opaque
@@ -64,6 +65,30 @@ export function createElectronImageEncoder(): UploadImageEncoder {
     },
     release() {
       cache = null;
+    },
+  };
+}
+
+/** Reference-board renderer backed by nativeImage (main process only). */
+export function createElectronBoardRenderer(): ReferenceBoardRenderer {
+  const decode = (srcPath: string): NativeImage => {
+    const image = nativeImage.createFromPath(srcPath);
+    if (image.isEmpty()) throw new Error('image_decode_failed');
+    return image;
+  };
+  return {
+    size(srcPath) {
+      return decode(srcPath).getSize();
+    },
+    loadResized(srcPath, width, height) {
+      const image = decode(srcPath).resize({ width, height, quality: 'best' });
+      const actual = image.getSize();
+      const pixels = image.toBitmap();
+      flattenPremultipliedOntoWhite(pixels);
+      return { width: actual.width, height: actual.height, pixels };
+    },
+    encodeJpeg(bitmap, quality) {
+      return nativeImage.createFromBitmap(bitmap.pixels, { width: bitmap.width, height: bitmap.height }).toJPEG(quality);
     },
   };
 }

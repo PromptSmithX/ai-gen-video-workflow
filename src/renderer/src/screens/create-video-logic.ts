@@ -1,5 +1,6 @@
 import type { Category } from '@shared/domain';
 import type { AspectRatio } from '@shared/provider';
+import { CALENDAR_AI_TEMPLATE_ID, isCalendarTemplateId } from '@shared/prompt';
 import type { PromptTemplateSummary, RenderedPrompt } from '@shared/prompt';
 import type { CreateJobInput, StagedImage } from '@shared/ipc';
 
@@ -7,8 +8,13 @@ export function makeTemplateKey(tpl: { id: string; version: string }): string {
   return `${tpl.id}@@${tpl.version}`;
 }
 
+/**
+ * Default calendar template. Prefers `calendar-review-ai` (Muse draws the inside page from the reference board);
+ * `calendar-review` (blank page + local compositing) stays selectable in the template list.
+ */
 export function findCalendarTemplate(templates: PromptTemplateSummary[]): PromptTemplateSummary | null {
-  const calTemplates = templates.filter((t) => t.id === 'calendar-review');
+  const ai = templates.filter((t) => t.id === CALENDAR_AI_TEMPLATE_ID);
+  const calTemplates = ai.length > 0 ? ai : templates.filter((t) => isCalendarTemplateId(t.id));
   if (calTemplates.length === 0) return null;
   // Prefer default (company/admin default over placeholder, or any default)
   const defaultTpl =
@@ -20,7 +26,7 @@ export function findCalendarTemplate(templates: PromptTemplateSummary[]): Prompt
 }
 
 export function findDefaultNonCalendarTemplate(templates: PromptTemplateSummary[]): PromptTemplateSummary | null {
-  const nonCalTemplates = templates.filter((t) => t.id !== 'calendar-review');
+  const nonCalTemplates = templates.filter((t) => !isCalendarTemplateId(t.id));
   if (nonCalTemplates.length === 0) return templates[0] ?? null;
   return (
     nonCalTemplates.find((t) => t.isDefault && !t.isPlaceholder) ??
@@ -53,7 +59,7 @@ export function pickTemplateForCategory(params: PickTemplateParams): string {
     // Already in calendar: keep current choice if valid calendar template, otherwise find calendar-review
     if (currentTemplateKey) {
       const [id] = currentTemplateKey.split('@@');
-      if (id === 'calendar-review') return currentTemplateKey;
+      if (id && isCalendarTemplateId(id)) return currentTemplateKey;
     }
     const calTpl = findCalendarTemplate(templates);
     return calTpl ? makeTemplateKey(calTpl) : '';

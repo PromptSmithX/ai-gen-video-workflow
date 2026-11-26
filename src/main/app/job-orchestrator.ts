@@ -8,6 +8,7 @@ import { normalizeSku } from '@shared/domain';
 import { PodError, SAFE_ERROR_MESSAGES } from '@shared/errors';
 import type { CreateJobInput, JobView } from '@shared/ipc';
 import { JOB_STATE_LABELS } from '@shared/job-state';
+import { CALENDAR_AI_TEMPLATE_ID } from '@shared/prompt';
 import type { MuseProvider, ProviderCapabilities, ProviderJob } from '@shared/provider';
 import { ProviderError } from '@shared/provider';
 import type {
@@ -23,6 +24,7 @@ import type {
 import { newId, nowIso } from '../domain/ids';
 import { isTerminal, nextActionsFor } from '../domain/job-machine';
 import { hashFile } from '../infra/media/hash';
+import { buildReferenceBoard, type ReferenceBoardRenderer } from '../infra/media/reference-board';
 import { prepareUploadImage, type PreparedUploadImage, type UploadImageEncoder } from '../infra/media/upload-image';
 import { nextPollDelay } from '../providers/muse/poll';
 import type { ImageStagingService, StagedImageRecord } from './image-staging';
@@ -42,6 +44,11 @@ export interface OrchestratorDeps {
    * Absent => oversized images are passed through and the provider rejects them as before.
    */
   imageEncoder?: UploadImageEncoder;
+  /**
+   * Builds the cover|interior reference board for calendar jobs where Muse draws the interior page
+   * (template `calendar-review-ai`). Absent => such jobs fail before submit with a clear message.
+   */
+  boardRenderer?: ReferenceBoardRenderer;
   /** Max concurrent active generations. Defaults to 1. */
   maxConcurrent?: number;
 }
@@ -65,6 +72,20 @@ export function providerRequestId(job: Pick<Job, 'idempotencyKey' | 'attempt'>):
   return job.attempt >= 2 ? `${job.idempotencyKey}.a${job.attempt}` : job.idempotencyKey;
 }
 
+/** Calendar job whose interior page Muse draws itself (no local compositing). */
+export function isAiInteriorJob(job: Pick<Job, 'promptTemplateId'>): boolean {
+  return job.promptTemplateId === CALENDAR_AI_TEMPLATE_ID;
+}
+
+function removeQuietly(p: string | null): void {
+  if (!p) return;
+  try {
+    fs.rmSync(p, { force: true });
+  } catch {
+    // temp file; the media library sweeps its temp folder anyway
+  }
+}
+
 export class JobOrchestrator extends EventEmitter {
   private readonly db: PodDatabase;
   private readonly media: MediaLibrary;
@@ -75,6 +96,7 @@ export class JobOrchestrator extends EventEmitter {
   private readonly imageStaging: ImageStagingService;
   private readonly compositor: CalendarArtworkCompositor;
   private readonly imageEncoder: UploadImageEncoder | undefined;
+  private readonly boardRenderer: ReferenceBoardRenderer | undefined;
   private readonly maxConcurrent: number;
 
   private isProcessing = false;
@@ -95,6 +117,7 @@ export class JobOrchestrator extends EventEmitter {
     this.imageStaging = deps.imageStaging;
     this.compositor = deps.compositor ?? createUnavailableCompositor();
     this.imageEncoder = deps.imageEncoder;
+    this.boardRenderer = deps.boardRenderer;
     this.maxConcurrent = deps.maxConcurrent ?? 1;
   }
 
@@ -917,18 +940,43 @@ export class JobOrchestrator extends EventEmitter {
       return;
     }
 
-    // 2b. Fit the front cover into the provider upload limit BEFORE SUBMITTING (failure => not sent).
+    // 2b. Fit the reference image into the provider upload limit BEFORE SUBMITTING (failure => not sent).
+    // Calendar jobs where Muse draws the interior page send ONE board image: cover left, interior artwork right.
     let upload: PreparedUploadImage;
+    let boardPath: string | null = null;
     try {
+      let refPath = sourceAbsPath;
+      let refName = path.basename(sourceAsset.path);
+      if (isAiInteriorJob(job)) {
+        const artwork = this.jobCalendarInfo(job).artwork;
+        const artworkAbs = artwork ? this.media.resolve(artwork.path) : null;
+        if (!artworkAbs || !fs.existsSync(artworkAbs)) {
+          throw new PodError('NOT_FOUND', 'Interior artwork file missing');
+        }
+        if (!this.boardRenderer) {
+          throw new PodError('INVALID_IMAGE', 'Reference board renderer unavailable');
+        }
+        boardPath = this.media.newTempPath();
+        buildReferenceBoard({
+          coverPath: sourceAbsPath,
+          interiorPath: artworkAbs,
+          outPath: boardPath,
+          renderer: this.boardRenderer,
+        });
+        refPath = boardPath;
+        refName = `${job.skuSnapshot}-reference-board.jpg`;
+        this.logger.info('calendar_reference_board_built', { jobId: job.id, sku: job.skuSnapshot });
+      }
       const caps = await this.getCapabilities();
       upload = await prepareUploadImage({
-        srcPath: sourceAbsPath,
-        fileName: path.basename(sourceAsset.path),
+        srcPath: refPath,
+        fileName: refName,
         maxBytes: caps.maxUploadBytes,
         newTempPath: () => this.media.newTempPath(),
         encoder: this.imageEncoder,
       });
     } catch (err) {
+      removeQuietly(boardPath);
       const code = err instanceof PodError ? err.code : 'INVALID_IMAGE';
       this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
         errorCode: code,
@@ -954,6 +1002,7 @@ export class JobOrchestrator extends EventEmitter {
       await this.submitPrepared(job, upload, promptText);
     } finally {
       upload.cleanup();
+      removeQuietly(boardPath);
     }
   }
 
@@ -1239,7 +1288,8 @@ export class JobOrchestrator extends EventEmitter {
       let videoFileToStore = tempPartPath;
       let compositionReport: CalendarCompositionReport | null = null;
 
-      if (isCalendar) {
+      // Muse already drew the interior page for `calendar-review-ai` jobs: nothing to composite.
+      if (isCalendar && !isAiInteriorJob(job)) {
         if (!artworkAsset) {
           this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
             errorCode: 'NOT_FOUND',

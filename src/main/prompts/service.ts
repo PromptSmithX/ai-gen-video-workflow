@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PodError } from '@shared/errors';
-import type { PromptTemplate, PromptTemplateSummary } from '@shared/prompt';
+import { CALENDAR_AI_TEMPLATE_ID, type PromptTemplate, type PromptTemplateSummary } from '@shared/prompt';
 import type { PromptService, RenderArgs } from '@shared/services';
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter';
 import { validatePrompt } from './quality';
@@ -311,7 +311,10 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
 
     render(args: RenderArgs) {
       const template = this.getTemplate(args.templateId, args.templateVersion);
-      const categorySnippet = loadCategorySnippet(args.categoryGroup);
+      // The calendar category notes describe the blank-page + compositing flow; the AI-interior template has its own
+      // inside-page rules and must not receive "the interior page must be blank".
+      const categorySnippet =
+        template.id === CALENDAR_AI_TEMPLATE_ID ? undefined : loadCategorySnippet(args.categoryGroup);
 
       return renderPrompt({
         templateId: template.id,

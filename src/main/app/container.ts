@@ -13,7 +13,7 @@ import { openDatabase } from '../infra/db';
 import { buildDiagnostics } from '../infra/diagnostics';
 import { createLogger } from '../infra/logging';
 import { createMediaLibrary } from '../infra/media';
-import { createElectronImageEncoder } from '../infra/media/electron-image-encoder';
+import { createElectronBoardRenderer, createElectronImageEncoder } from '../infra/media/electron-image-encoder';
 import { createCalendarCompositor } from '../infra/compositor';
 import { createPromptService } from '../prompts';
 import { createMuseProvider } from '../providers/muse';
@@ -209,6 +209,7 @@ export class AppContainer {
       imageStaging: this.imageStaging,
       compositor: this.compositor,
       imageEncoder: createElectronImageEncoder(),
+      boardRenderer: createElectronBoardRenderer(),
     });
   }
 

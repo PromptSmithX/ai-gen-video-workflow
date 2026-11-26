@@ -17,6 +17,8 @@ import type {
   PromptService,
 } from '@shared/services';
 import { ImageStagingService } from '../../src/main/app/image-staging';
+import type { ReferenceBoardRenderer } from '../../src/main/infra/media/reference-board';
+import { CALENDAR_AI_TEMPLATE_ID } from '@shared/prompt';
 import { JobOrchestrator } from '../../src/main/app/job-orchestrator';
 import { newId } from '../../src/main/domain/ids';
 import { openDatabase } from '../../src/main/infra/db';
@@ -116,6 +118,7 @@ describe('Calendar Job Orchestrator E2E', () => {
 
   function createTestStack(opts?: {
     compositor?: CalendarArtworkCompositor;
+    boardRenderer?: ReferenceBoardRenderer;
   }): TestStack {
     const db = openDatabase(path.join(tempRoot, 'test.db'));
     const libraryRoot = path.join(tempRoot, 'library');
@@ -140,7 +143,7 @@ describe('Calendar Job Orchestrator E2E', () => {
       promptMasterPath: null,
       libraryRoot,
       dataDir: tempRoot,
-      promptMaxChars: 4000,
+      promptMaxChars: 20000, // app default (calendar prompts are ~6k chars)
       pollIntervalMs: 80,
       pollMaxIntervalMs: 200,
       maxSourceBytes: 15 * 1024 * 1024,
@@ -189,6 +192,7 @@ describe('Calendar Job Orchestrator E2E', () => {
       logger: testLogger,
       imageStaging,
       compositor,
+      boardRenderer: opts?.boardRenderer,
     });
 
     const stageImage = async (name: string, width = 100, height = 100, tag = 0) => {
@@ -427,6 +431,62 @@ describe('Calendar Job Orchestrator E2E', () => {
       }
     }
 
+    stack.db.close();
+  });
+
+  it('AI interior template: ONE upload = reference board (cover + artwork), compositor skipped, temp board removed', async () => {
+    server.reset();
+    server.setExpectedToken(testApiKey);
+    const BOARD_JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('REFERENCE-BOARD')]);
+    const loaded: string[] = [];
+    const boardRenderer: ReferenceBoardRenderer = {
+      size: () => ({ width: 100, height: 100 }),
+      loadResized: (p, width, height) => {
+        loaded.push(p);
+        return { width, height, pixels: Buffer.alloc(width * height * 4, 200) };
+      },
+      encodeJpeg: () => BOARD_JPEG,
+    };
+    let compositorCalls = 0;
+    const stack = createTestStack({
+      boardRenderer,
+      compositor: {
+        process: async () => {
+          compositorCalls++;
+          throw new Error('compositor must not run for calendar-review-ai');
+        },
+      },
+    });
+    const cover = await stack.stageImage('cover.png', 100, 100, 901);
+    const artwork = await stack.stageImage('art.png', 120, 120, 902);
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: CALENDAR_AI_TEMPLATE_ID,
+        templateVersion: 'v1',
+        sku: 'CAL-AI01',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+    await waitForJobState(stack.db, view.job.id, 'SUCCEEDED', 8000);
+    stack.orchestrator.stop();
+
+    const refUploads = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/references');
+    expect(refUploads.length).toBe(1);
+    expect(refUploads[0]!.rawBody.equals(BOARD_JPEG)).toBe(true);
+    // Board built from the library copies: cover first (left), interior artwork second (right).
+    const assets = stack.db.assets.listByJob(view.job.id);
+    const art = assets.find((a) => a.role === 'interior_artwork')!;
+    const src = stack.db.assets.getById(view.job.sourceAssetId)!;
+    expect(loaded).toEqual([stack.media.resolve(src.path), stack.media.resolve(art.path)]);
+    expect(compositorCalls).toBe(0);
+    expect(assets.some((a) => a.role === 'generated_video')).toBe(true);
+    const tmp = path.join(stack.config.libraryRoot, '.tmp');
+    expect(fs.existsSync(tmp) ? fs.readdirSync(tmp) : []).toEqual([]);
     stack.db.close();
   });
 

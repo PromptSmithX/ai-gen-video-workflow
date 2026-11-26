@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   aspectWarning,
   buildCreateJobPayload,
+  findDefaultNonCalendarTemplate,
   isGenerateEnabled,
   makeTemplateKey,
   pickTemplateForCategory,
@@ -234,6 +235,33 @@ describe('create-video-logic pure functions', () => {
       });
 
       expect(selected).toBe(manualChoiceKey);
+    });
+
+    it('Prefers calendar-review-ai (Muse draws the inside page); keeps a manual calendar-review choice', () => {
+      const withAi: PromptTemplateSummary[] = [
+        ...sampleTemplates,
+        { ...sampleTemplates[2]!, id: 'calendar-review-ai', version: 'v1', title: 'AI inside page' },
+      ];
+      expect(
+        pickTemplateForCategory({
+          prevCategory: tshirtCategory,
+          newCategory: calendarCategory,
+          currentTemplateKey: defaultNonCalKey,
+          templates: withAi,
+          defaultNonCalendarKey: defaultNonCalKey,
+        })
+      ).toBe('calendar-review-ai@@v1');
+      // Staying in calendar keeps the compositing template the user picked by hand.
+      expect(
+        pickTemplateForCategory({
+          prevCategory: calendarCategory,
+          newCategory: calendarCategory,
+          currentTemplateKey: 'calendar-review@@v1',
+          templates: withAi,
+        })
+      ).toBe('calendar-review@@v1');
+      // Neither calendar template is offered as the non-calendar default.
+      expect(findDefaultNonCalendarTemplate(withAi)?.id).toBe('product-review');
     });
 
     it('Returns empty string when calendar-review is missing from templates', () => {

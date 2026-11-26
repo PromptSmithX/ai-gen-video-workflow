@@ -961,6 +961,27 @@ No fake claims or ratings.
       expect(rendered.text).not.toContain('{{');
     });
 
+    it('calendar-review-ai v1 renders a reference-board prompt (no blank page) that passes quality checks', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const rendered = service.render({
+        templateId: 'calendar-review-ai',
+        variables: { sku: 'CAL-AI', product_category: 'calendar' },
+        categoryGroup: 'calendar',
+        maxChars: 4000 * 2,
+        supportsDuration: false,
+        supportsAspectRatio: false,
+      });
+      expect(rendered.errors).toEqual([]);
+      expect(rendered.quality.passed).toBe(true);
+      expect(rendered.templateVersion).toBe('v1');
+      expect(rendered.text).toContain('LEFT panel = the calendar FRONT COVER');
+      expect(rendered.text).toContain('RIGHT panel = the INSIDE PAGE');
+      expect(rendered.text).toContain('Do not copy any motif');
+      expect(rendered.text).not.toMatch(/blank/i);
+      expect(rendered.text).not.toContain('{{');
+      expect(service.listTemplates().find((t) => t.id === 'calendar-review-ai')?.isDefault).toBe(true);
+    });
+
     it('admin-saved calendar-review v3 becomes what getTemplate("calendar-review") returns when set default for that id', () => {
       const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
 

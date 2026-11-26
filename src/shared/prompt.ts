@@ -77,3 +77,15 @@ export interface RenderedPrompt {
   /** Validation errors (unknown placeholder, too long, missing variable...). Empty = valid. */
   errors: string[];
 }
+
+/** Calendar template where the interior artwork is composited locally onto a blank page (compositor sidecar). */
+export const CALENDAR_COMPOSITE_TEMPLATE_ID = 'calendar-review';
+/**
+ * Calendar template where Muse draws the interior page itself from a two-panel reference board (cover left, interior
+ * right). Jobs made with it skip the compositor.
+ */
+export const CALENDAR_AI_TEMPLATE_ID = 'calendar-review-ai';
+
+export function isCalendarTemplateId(id: string): boolean {
+  return id === CALENDAR_COMPOSITE_TEMPLATE_ID || id === CALENDAR_AI_TEMPLATE_ID;
+}

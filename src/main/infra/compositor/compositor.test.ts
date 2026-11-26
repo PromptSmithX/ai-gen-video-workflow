@@ -363,5 +363,5 @@ describe('CalendarArtworkCompositor Adapter', () => {
       expect(res.applied).toBe(true);
       expect(fs.existsSync(out)).toBe(true);
     }
-  }, 60000);
+  }, 180_000); // two-pass compositor (1.1.0): ~50 s for this 1080p fixture on a dev laptop
 });
