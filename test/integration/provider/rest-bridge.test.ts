@@ -260,13 +260,22 @@ describe('RestBridgeMuseProvider Integration', () => {
       expect(failed.errorCode).toBe(expected);
     }
 
+    // NOT_ACCEPTED = Muse never received the request: not a "bridge down" message
+    server.setCustomGetJobResponse({
+      statusCode: 200,
+      body: { id: 'job-x', status: 'failed', error: { code: 'NOT_ACCEPTED', message: 'x' }, outputs: [] },
+    });
+    const notAccepted = await provider.getJob('job-x');
+    expect(notAccepted.errorCode).toBe('NOT_CONNECTED');
+    expect(notAccepted.safeMessage).toMatch(/did not receive/);
+
     // Unknown public status -> ambiguous (stop and ask a human), never guessed as success/failure
     server.setCustomGetJobResponse({ statusCode: 200, body: { id: 'job-x', status: 'something_new' } });
     expect((await provider.getJob('job-x')).state).toBe('ambiguous');
     server.setCustomGetJobResponse(null);
   });
 
-  it('derives connection state and capabilities from Muse4AI /v1/status (chat: 32000 chars, 2 MiB image)', async () => {
+  it('derives connection state and capabilities from Muse4AI /v1/status (chat: 32000 chars, 1 MiB image)', async () => {
     const provider = new RestBridgeMuseProvider({
       config: createConfig(),
       getApiKey: () => testApiKey,
@@ -280,8 +289,8 @@ describe('RestBridgeMuseProvider Integration', () => {
       supportedDurations: [],
       supportedAspectRatios: [],
       maxPromptChars: 32000,
-      // Chat attachments go inline on the HTTP path: Muse4AI refuses images over 2 MiB (422 capability_unavailable)
-      maxUploadBytes: 2 * 1024 * 1024,
+      // Chat attachments go inline on the HTTP path; only ~1.36 MiB is proven, larger images got no_ack from Muse
+      maxUploadBytes: 1024 * 1024,
     });
 
     const videoProvider = new RestBridgeMuseProvider({

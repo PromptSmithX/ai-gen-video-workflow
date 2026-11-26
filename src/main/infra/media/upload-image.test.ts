@@ -98,7 +98,7 @@ describe('prepareUploadImage', () => {
       prepareUploadImage({ srcPath: src, fileName: 'c.png', maxBytes: 5000, newTempPath, encoder: f.encoder })
     ).rejects.toMatchObject({ code: 'IMAGE_TOO_LARGE' });
     expect(f.calls.every((c) => c.maxLongEdge === null || c.maxLongEdge < 3000)).toBe(true);
-    expect(f.calls.map((c) => c.maxLongEdge)).toEqual([null, null, null, 2560, 2048, 2048]);
+    expect(f.calls.map((c) => c.maxLongEdge)).toEqual([null, null, null, 2560, 2048, 2048, 1600, 1280]);
     expect(fs.readdirSync(dir)).toEqual(['cover.png']);
     expect(f.released()).toBe(1);
   });

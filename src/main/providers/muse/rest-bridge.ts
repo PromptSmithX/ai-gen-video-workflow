@@ -35,6 +35,7 @@ import type { MuseSubmitMode } from '@shared/config';
 import {
   mapBridgeCapabilities,
   mapBridgeConnectionState,
+  bridgeJobSafeMessage,
   mapBridgeJobError,
   mapBridgeJobState,
   pickVideoAssetId,
@@ -576,7 +577,7 @@ export class RestBridgeMuseProvider implements MuseProvider {
       if (state === 'failed') {
         const code = mapBridgeJobError(created.error?.code);
         result.errorCode = code;
-        result.safeMessage = SAFE_ERROR_MESSAGES[code];
+        result.safeMessage = bridgeJobSafeMessage(created.error?.code, code);
       } else if (state === 'ambiguous') {
         result.errorCode = 'SUBMIT_AMBIGUOUS';
         result.safeMessage = SAFE_ERROR_MESSAGES.SUBMIT_AMBIGUOUS;
@@ -685,7 +686,13 @@ export class RestBridgeMuseProvider implements MuseProvider {
     if (state === 'failed' && !jobResult.errorCode) {
       const code = mapBridgeJobError(data.error?.code);
       jobResult.errorCode = code;
-      jobResult.safeMessage = SAFE_ERROR_MESSAGES[code];
+      jobResult.safeMessage = bridgeJobSafeMessage(data.error?.code, code);
+      const rawCode = data.error?.code;
+      this.logger.warn('muse.job_failed', {
+        providerJobId,
+        // Machine error class only (e.g. NOT_ACCEPTED); the human message is never logged.
+        bridgeCode: rawCode && /^[A-Za-z0-9_]{1,64}$/.test(rawCode) ? rawCode : undefined,
+      });
     } else if (state === 'ambiguous') {
       jobResult.errorCode = 'SUBMIT_AMBIGUOUS';
       jobResult.safeMessage =

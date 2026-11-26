@@ -2,7 +2,7 @@
  * Mapping between Muse4AI bridge payloads (agent API 2.0.0-beta.35) and POD Video Studio domain models.
  */
 import type { ProviderCapabilities, ProviderConnectionState, ProviderJobState } from '@shared/provider';
-import type { ErrorCode } from '@shared/errors';
+import { SAFE_ERROR_MESSAGES, type ErrorCode } from '@shared/errors';
 import type { MuseSubmitMode } from '@shared/config';
 import type { BridgeJob, StatusResponse } from './endpoints';
 
@@ -10,11 +10,12 @@ import type { BridgeJob, StatusResponse } from './endpoints';
 export const CHAT_PROMPT_MAX_DEFAULT = 32000;
 
 /**
- * Largest image Muse4AI accepts as a chat attachment. Chat runs only on the HTTP path, where images go inline and
- * are capped at 2 MiB (Muse4AI `HTTP_ATTACH_PROVEN_BYTES.image`); bigger ones are refused with 422
- * capability_unavailable even though /v1/status reports the generic `upload_max_bytes` (20 MiB).
+ * Largest image we send as a Muse4AI chat attachment. Chat runs only on the HTTP path, where images go inline:
+ * Muse4AI refuses > 2 MiB with 422 capability_unavailable (`HTTP_ATTACH_PROVEN_BYTES.image`) although /v1/status
+ * reports the generic 20 MiB `upload_max_bytes`, and only ~1.36 MiB inline is proven — a 1.58 MB image was submitted
+ * but never acknowledged by Muse (no_ack -> NOT_ACCEPTED). Stay at 1 MiB.
  */
-export const CHAT_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+export const CHAT_IMAGE_MAX_BYTES = 1024 * 1024;
 
 export const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   canCancel: false,
@@ -73,6 +74,17 @@ export function mapBridgeJobError(code: string | undefined | null): ErrorCode {
       // PROVIDER_ERROR, EMPTY_RESPONSE, UI_CHANGED, HTTP_*, ANOMALY_REPORTED, UNKNOWN …
       return 'PROVIDER_ERROR';
   }
+}
+
+/**
+ * Safe message for a failed Muse4AI job. NOT_ACCEPTED means Muse never received the request (nothing was charged and
+ * a retry cannot duplicate it) — not that the bridge is down, so it gets its own wording.
+ */
+export function bridgeJobSafeMessage(rawCode: string | undefined | null, mapped: ErrorCode): string {
+  if ((rawCode ?? '').toUpperCase() === 'NOT_ACCEPTED') {
+    return 'Muse did not receive this request (nothing was charged). Press Retry to send it again.';
+  }
+  return SAFE_ERROR_MESSAGES[mapped];
 }
 
 /** Picks the downloadable video output of a succeeded job. */
