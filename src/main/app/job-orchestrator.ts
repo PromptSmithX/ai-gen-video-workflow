@@ -55,6 +55,16 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   maxUploadBytes: 20 * 1024 * 1024,
 };
 
+/**
+ * Idempotency key sent to the provider. The first attempt uses the job's key unchanged; a user retry (attempt >= 2,
+ * only allowed after a failure the provider confirmed or that happened before submit) gets its own key, because
+ * Muse4AI replays — or, with a new reference image, rejects with 422 idempotency_conflict — a reused key.
+ * Retries of the same attempt (process restart, AMBIGUOUS reconcile) keep the same key, so nothing is double-sent.
+ */
+export function providerRequestId(job: Pick<Job, 'idempotencyKey' | 'attempt'>): string {
+  return job.attempt >= 2 ? `${job.idempotencyKey}.a${job.attempt}` : job.idempotencyKey;
+}
+
 export class JobOrchestrator extends EventEmitter {
   private readonly db: PodDatabase;
   private readonly media: MediaLibrary;
@@ -522,7 +532,7 @@ export class JobOrchestrator extends EventEmitter {
         if (job.providerJobId) {
           found = await this.provider.getJob(job.providerJobId);
         } else if (this.provider.findJobByRequestId) {
-          found = await this.provider.findJobByRequestId(job.idempotencyKey);
+          found = await this.provider.findJobByRequestId(providerRequestId(job));
         }
       } catch {
         found = null; // Stay in AMBIGUOUS if provider query fails
@@ -966,7 +976,7 @@ export class JobOrchestrator extends EventEmitter {
         sourceImagePath: upload.path,
         sourceFileName: upload.fileName,
         prompt: promptText,
-        requestId: updated.idempotencyKey,
+        requestId: providerRequestId(updated),
         durationSeconds: updated.durationSeconds ?? undefined,
         aspectRatio: updated.aspectRatio ?? undefined,
       });

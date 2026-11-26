@@ -8,7 +8,7 @@ import type { JobState } from '@shared/job-state';
 import type { GenerateVideoInput, MuseProvider, ProviderJob } from '@shared/provider';
 import type { Logger, LogFields, PodDatabase } from '@shared/services';
 import { ImageStagingService } from '../../src/main/app/image-staging';
-import { JobOrchestrator } from '../../src/main/app/job-orchestrator';
+import { JobOrchestrator, providerRequestId } from '../../src/main/app/job-orchestrator';
 import { createUnavailableCompositor } from '../../src/main/app/unavailable-compositor';
 import { newId } from '../../src/main/domain/ids';
 import { openDatabase } from '../../src/main/infra/db';
@@ -58,7 +58,7 @@ describe('Front cover upload transcode', () => {
   });
   afterEach(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
 
-  function setup(opts: { maxUploadBytes: number; encoder?: UploadImageEncoder }) {
+  function setup(opts: { maxUploadBytes: number; encoder?: UploadImageEncoder; failFirstSubmit?: boolean }) {
     const db = openDatabase(path.join(tempRoot, 'test.db'));
     const libraryRoot = path.join(tempRoot, 'library');
     const media = createMediaLibrary({
@@ -109,6 +109,9 @@ describe('Front cover upload transcode', () => {
       }),
       generateVideo: async (input): Promise<ProviderJob> => {
         calls.push({ input, bytes: fs.readFileSync(input.sourceImagePath) });
+        if (opts.failFirstSubmit && calls.length === 1) {
+          return { providerJobId: 'p-failed', state: 'failed', errorCode: 'NOT_CONNECTED', safeMessage: 'not received' };
+        }
         return { providerJobId: `p-${calls.length}`, state: 'queued' };
       },
       getJob: async (id) => ({ providerJobId: id, state: 'running' }),
@@ -226,6 +229,27 @@ describe('Front cover upload transcode', () => {
     expect(s.calls).toHaveLength(0);
     const leftovers = fs.existsSync(s.tempDir) ? fs.readdirSync(s.tempDir) : [];
     expect(leftovers).toEqual([]);
+    s.orchestrator.stop();
+    s.db.close();
+  });
+
+  it('retry after a provider failure sends a new idempotency key; first attempt keeps the job key', async () => {
+    expect(providerRequestId({ idempotencyKey: 'k', attempt: 0 })).toBe('k');
+    expect(providerRequestId({ idempotencyKey: 'k', attempt: 1 })).toBe('k');
+    expect(providerRequestId({ idempotencyKey: 'k', attempt: 2 })).toBe('k.a2');
+
+    const s = setup({ maxUploadBytes: 20 * 1024 * 1024, encoder, failFirstSubmit: true });
+    const cover = await s.stage('cover.png', 100);
+    const clientRequestId = newId();
+    const view = await s.orchestrator.createJob(
+      { clientRequestId, sourceToken: cover.token, templateId: 'product-review', templateVersion: 'v1', sku: 'RT-1', categoryId: 't-shirt' },
+      'emp'
+    );
+    await waitForJob(s.db, view.job.id, ['FAILED_PROVIDER']);
+    await s.orchestrator.retry(view.job.id, true);
+    await waitForJob(s.db, view.job.id, ['RUNNING']);
+
+    expect(s.calls.map((c) => c.input.requestId)).toEqual([clientRequestId, `${clientRequestId}.a2`]);
     s.orchestrator.stop();
     s.db.close();
   });
