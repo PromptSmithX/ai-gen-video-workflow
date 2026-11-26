@@ -91,13 +91,14 @@ describe('prepareUploadImage', () => {
   });
 
   it('skips downscale steps larger than the image itself', async () => {
-    // 3000x3000: steps 6000/5000/4096 would not shrink it -> must jump from full-size steps to 3072? 3072 >= 3000
-    // also skipped -> nothing fits -> IMAGE_TOO_LARGE, and the encoder saw only full-size calls.
+    // 3000x3000: steps 6000/5000/4096/3072 would not shrink it and are skipped; 2560/2048 still do not fit
+    // -> IMAGE_TOO_LARGE.
     const f = fakeEncoder(3000, 3000, 1);
     await expect(
       prepareUploadImage({ srcPath: src, fileName: 'c.png', maxBytes: 5000, newTempPath, encoder: f.encoder })
     ).rejects.toMatchObject({ code: 'IMAGE_TOO_LARGE' });
-    expect(f.calls.every((c) => c.maxLongEdge === null)).toBe(true);
+    expect(f.calls.every((c) => c.maxLongEdge === null || c.maxLongEdge < 3000)).toBe(true);
+    expect(f.calls.map((c) => c.maxLongEdge)).toEqual([null, null, null, 2560, 2048, 2048]);
     expect(fs.readdirSync(dir)).toEqual(['cover.png']);
     expect(f.released()).toBe(1);
   });

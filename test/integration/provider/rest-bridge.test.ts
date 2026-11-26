@@ -266,7 +266,7 @@ describe('RestBridgeMuseProvider Integration', () => {
     server.setCustomGetJobResponse(null);
   });
 
-  it('derives connection state and capabilities from Muse4AI /v1/status (chat default: 32000 chars)', async () => {
+  it('derives connection state and capabilities from Muse4AI /v1/status (chat: 32000 chars, 2 MiB image)', async () => {
     const provider = new RestBridgeMuseProvider({
       config: createConfig(),
       getApiKey: () => testApiKey,
@@ -280,7 +280,8 @@ describe('RestBridgeMuseProvider Integration', () => {
       supportedDurations: [],
       supportedAspectRatios: [],
       maxPromptChars: 32000,
-      maxUploadBytes: 20 * 1024 * 1024,
+      // Chat attachments go inline on the HTTP path: Muse4AI refuses images over 2 MiB (422 capability_unavailable)
+      maxUploadBytes: 2 * 1024 * 1024,
     });
 
     const videoProvider = new RestBridgeMuseProvider({
@@ -288,7 +289,10 @@ describe('RestBridgeMuseProvider Integration', () => {
       getApiKey: () => testApiKey,
       logger: mockLogger,
     });
-    expect((await videoProvider.getCapabilities()).maxPromptChars).toBe(4000);
+    expect(await videoProvider.getCapabilities()).toMatchObject({
+      maxPromptChars: 4000,
+      maxUploadBytes: 20 * 1024 * 1024,
+    });
   });
 
   it('chat mode sends the full long prompt verbatim with the mockup attached, and downloads the video', async () => {

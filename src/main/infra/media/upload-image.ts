@@ -31,7 +31,7 @@ export interface PreparedUploadImage {
 
 /**
  * Quality ladder, best first. Full resolution is tried before any downscale; Muse renders at most
- * 1080p video, so a 3072 px long edge still carries far more detail than the output can show.
+ * 1080p video, so even a 2048 px long edge carries more detail than the output can show.
  */
 export const UPLOAD_LADDER: ReadonlyArray<{ maxLongEdge: number | null; quality: number }> = [
   { maxLongEdge: null, quality: 95 },
@@ -41,6 +41,9 @@ export const UPLOAD_LADDER: ReadonlyArray<{ maxLongEdge: number | null; quality:
   { maxLongEdge: 5000, quality: 92 },
   { maxLongEdge: 4096, quality: 92 },
   { maxLongEdge: 3072, quality: 90 },
+  { maxLongEdge: 2560, quality: 90 },
+  { maxLongEdge: 2048, quality: 90 },
+  { maxLongEdge: 2048, quality: 85 },
 ];
 
 /** Headroom kept below the provider limit (multipart overhead, rounding). */

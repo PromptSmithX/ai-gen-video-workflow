@@ -9,6 +9,13 @@ import type { BridgeJob, StatusResponse } from './endpoints';
 /** Muse4AI chat prompt limit (`limits.chat_prompt_max_chars`). */
 export const CHAT_PROMPT_MAX_DEFAULT = 32000;
 
+/**
+ * Largest image Muse4AI accepts as a chat attachment. Chat runs only on the HTTP path, where images go inline and
+ * are capped at 2 MiB (Muse4AI `HTTP_ATTACH_PROVEN_BYTES.image`); bigger ones are refused with 422
+ * capability_unavailable even though /v1/status reports the generic `upload_max_bytes` (20 MiB).
+ */
+export const CHAT_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+
 export const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   canCancel: false,
   reportsProgress: false,
@@ -86,7 +93,9 @@ export function mapBridgeCapabilities(
   mode: MuseSubmitMode = 'chat'
 ): ProviderCapabilities {
   if (!status) {
-    return mode === 'chat' ? { ...DEFAULT_CAPABILITIES, maxPromptChars: CHAT_PROMPT_MAX_DEFAULT } : { ...DEFAULT_CAPABILITIES };
+    return mode === 'chat'
+      ? { ...DEFAULT_CAPABILITIES, maxPromptChars: CHAT_PROMPT_MAX_DEFAULT, maxUploadBytes: CHAT_IMAGE_MAX_BYTES }
+      : { ...DEFAULT_CAPABILITIES };
   }
   const maxPromptChars =
     mode === 'chat'
@@ -99,7 +108,10 @@ export function mapBridgeCapabilities(
     supportedDurations: [],
     supportedAspectRatios: [],
     maxPromptChars,
-    maxUploadBytes: status.limits?.upload_max_bytes ?? DEFAULT_CAPABILITIES.maxUploadBytes,
+    maxUploadBytes:
+      mode === 'chat'
+        ? Math.min(status.limits?.upload_max_bytes ?? CHAT_IMAGE_MAX_BYTES, CHAT_IMAGE_MAX_BYTES)
+        : status.limits?.upload_max_bytes ?? DEFAULT_CAPABILITIES.maxUploadBytes,
   };
 }
 

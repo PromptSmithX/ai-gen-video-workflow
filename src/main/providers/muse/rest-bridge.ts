@@ -454,6 +454,8 @@ export class RestBridgeMuseProvider implements MuseProvider {
       this.logger.warn('muse.submit_client_error', {
         requestId: input.requestId,
         statusCode: res.status,
+        // Machine error code only (e.g. capability_unavailable); the human message is never logged.
+        bridgeCode: bodyCode && /^[a-z0-9_]{1,64}$/.test(bodyCode) ? bodyCode : undefined,
         durationMs: Date.now() - startTime,
       });
 
