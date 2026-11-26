@@ -1,6 +1,6 @@
 import type { Category } from '@shared/domain';
 import type { AspectRatio } from '@shared/provider';
-import { CALENDAR_AI_TEMPLATE_ID, isCalendarTemplateId } from '@shared/prompt';
+import { CALENDAR_TWO_CLIP_TEMPLATE_ID, isCalendarTemplateId } from '@shared/prompt';
 import type { PromptTemplateSummary, RenderedPrompt } from '@shared/prompt';
 import type { CreateJobInput, StagedImage } from '@shared/ipc';
 
@@ -9,12 +9,12 @@ export function makeTemplateKey(tpl: { id: string; version: string }): string {
 }
 
 /**
- * Default calendar template. Prefers `calendar-review-ai` (Muse draws the inside page from the reference board);
- * `calendar-review` (blank page + local compositing) stays selectable in the template list.
+ * Default calendar template. Prefers `calendar-review-2clip` (two clips, one artwork each, joined at the page
+ * turn); `calendar-review` (compositing) and `calendar-review-ai` (reference board) stay selectable.
  */
 export function findCalendarTemplate(templates: PromptTemplateSummary[]): PromptTemplateSummary | null {
-  const ai = templates.filter((t) => t.id === CALENDAR_AI_TEMPLATE_ID);
-  const calTemplates = ai.length > 0 ? ai : templates.filter((t) => isCalendarTemplateId(t.id));
+  const preferred = templates.filter((t) => t.id === CALENDAR_TWO_CLIP_TEMPLATE_ID);
+  const calTemplates = preferred.length > 0 ? preferred : templates.filter((t) => isCalendarTemplateId(t.id));
   if (calTemplates.length === 0) return null;
   // Prefer default (company/admin default over placeholder, or any default)
   const defaultTpl =

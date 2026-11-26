@@ -3,7 +3,7 @@ id: calendar-review-ai
 version: v1
 title: Desk calendar review — Muse draws the inside page
 placeholder: false
-default: true
+default: false
 created_at: 2026-11-26
 note: Uses a two-panel reference board (LEFT = front cover, RIGHT = inside page). No local compositing.
 ---

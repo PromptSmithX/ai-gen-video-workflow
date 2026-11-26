@@ -14,6 +14,7 @@ import { buildDiagnostics } from '../infra/diagnostics';
 import { createLogger } from '../infra/logging';
 import { createMediaLibrary } from '../infra/media';
 import { createElectronBoardRenderer, createElectronImageEncoder } from '../infra/media/electron-image-encoder';
+import { createFfmpegStitcher, createUnavailableStitcher, type VideoStitcher } from '../infra/media/stitch';
 import { createCalendarCompositor } from '../infra/compositor';
 import { createPromptService } from '../prompts';
 import { createMuseProvider } from '../providers/muse';
@@ -210,6 +211,7 @@ export class AppContainer {
       compositor: this.compositor,
       imageEncoder: createElectronImageEncoder(),
       boardRenderer: createElectronBoardRenderer(),
+      stitcher: this.createStitcher(),
     });
   }
 
@@ -349,6 +351,20 @@ export class AppContainer {
       content,
       generatedAt: nowIso(),
     };
+  }
+
+  /** ffmpeg/ffprobe bundled next to the compositor sidecar; joins the two clips of two-clip calendar jobs. */
+  private createStitcher(): VideoStitcher {
+    const dir = this.isPackaged
+      ? path.join((process as unknown as { resourcesPath?: string }).resourcesPath ?? this.appPath, 'calendar-compositor')
+      : path.join(this.appPath, 'vendor', 'calendar-compositor', 'dist', 'calendar-compositor');
+    const ffmpegExe = path.join(dir, 'ffmpeg.exe');
+    const ffprobeExe = path.join(dir, 'ffprobe.exe');
+    if (!fs.existsSync(ffmpegExe) || !fs.existsSync(ffprobeExe)) {
+      this.logger.warn('video_stitcher_unavailable');
+      return createUnavailableStitcher();
+    }
+    return createFfmpegStitcher({ ffmpegExe, ffprobeExe, logger: this.logger });
   }
 
   private createCompositor(tempDir: string): CalendarArtworkCompositor & { dispose?(): void } {

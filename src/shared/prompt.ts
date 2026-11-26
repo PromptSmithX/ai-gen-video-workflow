@@ -86,6 +86,32 @@ export const CALENDAR_COMPOSITE_TEMPLATE_ID = 'calendar-review';
  */
 export const CALENDAR_AI_TEMPLATE_ID = 'calendar-review-ai';
 
+/**
+ * Calendar template that generates TWO clips, each with ONE artwork: clip A (front cover only) and clip B (inside
+ * page only), joined after download. The template holds both prompts, split by TWO_CLIP_MARKER.
+ */
+export const CALENDAR_TWO_CLIP_TEMPLATE_ID = 'calendar-review-2clip';
+
+/** Line separating the clip A prompt from the clip B prompt (an optional CLIP A marker may open the text). */
+export const TWO_CLIP_MARKER = '===== CLIP B =====';
+const CLIP_A_MARKER = '===== CLIP A =====';
+
 export function isCalendarTemplateId(id: string): boolean {
-  return id === CALENDAR_COMPOSITE_TEMPLATE_ID || id === CALENDAR_AI_TEMPLATE_ID;
+  return (
+    id === CALENDAR_COMPOSITE_TEMPLATE_ID || id === CALENDAR_AI_TEMPLATE_ID || id === CALENDAR_TWO_CLIP_TEMPLATE_ID
+  );
+}
+
+/** Splits a two-clip prompt into its clip A and clip B parts; null when the marker is missing or a part is empty. */
+export function splitTwoClipPrompt(text: string): { a: string; b: string } | null {
+  const lines = text.split(/\r?\n/);
+  const idx = lines.findIndex((l) => l.trim() === TWO_CLIP_MARKER);
+  if (idx < 0 || lines.slice(idx + 1).some((l) => l.trim() === TWO_CLIP_MARKER)) return null;
+  const a = lines
+    .slice(0, idx)
+    .filter((l) => l.trim() !== CLIP_A_MARKER)
+    .join('\n')
+    .trim();
+  const b = lines.slice(idx + 1).join('\n').trim();
+  return a && b ? { a, b } : null;
 }

@@ -132,6 +132,17 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'jobs_two_clip_segments',
+    up(db: DatabaseSync): void {
+      // Two-clip calendar jobs: which clip is in flight, and where clip A was saved.
+      db.exec(`
+        ALTER TABLE jobs ADD COLUMN segment INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN segment_a_path TEXT;
+      `);
+    },
+  },
 ];
 
 /**

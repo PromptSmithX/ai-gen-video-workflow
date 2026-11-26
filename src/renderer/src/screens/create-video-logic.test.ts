@@ -237,10 +237,11 @@ describe('create-video-logic pure functions', () => {
       expect(selected).toBe(manualChoiceKey);
     });
 
-    it('Prefers calendar-review-ai (Muse draws the inside page); keeps a manual calendar-review choice', () => {
+    it('Prefers calendar-review-2clip; keeps a manual calendar-review choice', () => {
       const withAi: PromptTemplateSummary[] = [
         ...sampleTemplates,
         { ...sampleTemplates[2]!, id: 'calendar-review-ai', version: 'v1', title: 'AI inside page' },
+        { ...sampleTemplates[2]!, id: 'calendar-review-2clip', version: 'v1', title: 'Two clips' },
       ];
       expect(
         pickTemplateForCategory({
@@ -250,7 +251,7 @@ describe('create-video-logic pure functions', () => {
           templates: withAi,
           defaultNonCalendarKey: defaultNonCalKey,
         })
-      ).toBe('calendar-review-ai@@v1');
+      ).toBe('calendar-review-2clip@@v1');
       // Staying in calendar keeps the compositing template the user picked by hand.
       expect(
         pickTemplateForCategory({

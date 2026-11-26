@@ -42,6 +42,8 @@ export type NewJob = Omit<
   | 'reviewStatus'
   | 'attempt'
   | 'state'
+  | 'segment'
+  | 'segmentAPath'
 > & { state?: JobState };
 
 export type JobPatch = Partial<
@@ -57,6 +59,8 @@ export type JobPatch = Partial<
     | 'safeErrorMessage'
     | 'attempt'
     | 'reviewStatus'
+    | 'segment'
+    | 'segmentAPath'
   >
 >;
 

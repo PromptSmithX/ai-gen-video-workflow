@@ -37,6 +37,8 @@ describe('CreateVideo Screen', () => {
           attempt: 1,
           regeneratedFromJobId: null,
           reviewStatus: 'pending',
+          segment: 0,
+          segmentAPath: null,
           submitIntentAt: null,
           acceptedAt: null,
           completedAt: null,

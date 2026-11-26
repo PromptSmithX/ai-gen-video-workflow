@@ -35,11 +35,13 @@ describe('Database and Repositories', () => {
         version: number;
         name: string;
       }>;
-      expect(rows).toHaveLength(2);
+      expect(rows).toHaveLength(3);
       expect(rows[0]?.version).toBe(1);
       expect(rows[0]?.name).toBe('initial_schema');
       expect(rows[1]?.version).toBe(2);
       expect(rows[1]?.name).toBe('assets_interior_artwork_role');
+      expect(rows[2]?.version).toBe(3);
+      expect(rows[2]?.name).toBe('jobs_two_clip_segments');
       rawDb.close();
       db1.close();
 
@@ -50,7 +52,7 @@ describe('Database and Repositories', () => {
         version: number;
         name: string;
       }>;
-      expect(rows2).toHaveLength(2);
+      expect(rows2).toHaveLength(3);
       expect(rows2[0]?.version).toBe(1);
       expect(rows2[1]?.version).toBe(2);
       rawDb2.close();
@@ -205,7 +207,7 @@ describe('Database and Repositories', () => {
         version: number;
         name: string;
       }>;
-      expect(migRows).toHaveLength(2);
+      expect(migRows).toHaveLength(3);
       expect(migRows[1]?.version).toBe(2);
       expect(migRows[1]?.name).toBe('assets_interior_artwork_role');
 
@@ -491,6 +493,18 @@ describe('Database and Repositories', () => {
       expect(updated.attempt).toBe(1);
       expect(updated.reviewStatus).toBe('approved');
       expect(updated.state).toBe(job.state);
+    });
+
+    it('new jobs start at segment 0; segment fields round-trip via update() and transition()', () => {
+      const job = db.jobs.insert(makeJobInput());
+      expect(job.segment).toBe(0);
+      expect(job.segmentAPath).toBeNull();
+      const u = db.jobs.update(job.id, { segment: 1, segmentAPath: 'SKU/segments/x-a.mp4' });
+      expect(u.segment).toBe(1);
+      expect(u.segmentAPath).toBe('SKU/segments/x-a.mp4');
+      const t = db.jobs.transition(job.id, 'SUBMITTING', { segmentAPath: null });
+      expect(t.segment).toBe(1);
+      expect(t.segmentAPath).toBeNull();
     });
   });
 

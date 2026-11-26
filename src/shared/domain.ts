@@ -87,6 +87,13 @@ export interface Job {
   completedAt: string | null;
   errorCode: ErrorCode | null;
   safeErrorMessage: string | null;
+  /**
+   * Two-clip calendar jobs (`calendar-review-2clip`): 0 = clip A (front cover), 1 = clip B (inside page).
+   * Always 0 for every other job.
+   */
+  segment: number;
+  /** Two-clip jobs: library-relative path of the downloaded clip A, set when the job moves on to clip B. */
+  segmentAPath: string | null;
   createdAt: string;
   updatedAt: string;
 }

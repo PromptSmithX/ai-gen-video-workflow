@@ -18,7 +18,8 @@ import type {
 } from '@shared/services';
 import { ImageStagingService } from '../../src/main/app/image-staging';
 import type { ReferenceBoardRenderer } from '../../src/main/infra/media/reference-board';
-import { CALENDAR_AI_TEMPLATE_ID } from '@shared/prompt';
+import { CALENDAR_AI_TEMPLATE_ID, CALENDAR_TWO_CLIP_TEMPLATE_ID } from '@shared/prompt';
+import type { VideoStitcher } from '../../src/main/infra/media/stitch';
 import { JobOrchestrator } from '../../src/main/app/job-orchestrator';
 import { newId } from '../../src/main/domain/ids';
 import { openDatabase } from '../../src/main/infra/db';
@@ -119,6 +120,7 @@ describe('Calendar Job Orchestrator E2E', () => {
   function createTestStack(opts?: {
     compositor?: CalendarArtworkCompositor;
     boardRenderer?: ReferenceBoardRenderer;
+    stitcher?: VideoStitcher;
   }): TestStack {
     const db = openDatabase(path.join(tempRoot, 'test.db'));
     const libraryRoot = path.join(tempRoot, 'library');
@@ -193,6 +195,7 @@ describe('Calendar Job Orchestrator E2E', () => {
       imageStaging,
       compositor,
       boardRenderer: opts?.boardRenderer,
+      stitcher: opts?.stitcher,
     });
 
     const stageImage = async (name: string, width = 100, height = 100, tag = 0) => {
@@ -487,6 +490,110 @@ describe('Calendar Job Orchestrator E2E', () => {
     expect(assets.some((a) => a.role === 'generated_video')).toBe(true);
     const tmp = path.join(stack.config.libraryRoot, '.tmp');
     expect(fs.existsSync(tmp) ? fs.readdirSync(tmp) : []).toEqual([]);
+    stack.db.close();
+  });
+
+  it('Two-clip template: clip A = cover + prompt A, then clip B = artwork ONLY + prompt B, joined; no compositor', async () => {
+    server.reset();
+    server.setExpectedToken(testApiKey);
+    const stitchCalls: Array<{ first: Buffer; second: Buffer }> = [];
+    const stitcher: VideoStitcher = {
+      stitch: async ({ firstPath, secondPath, outputPath }) => {
+        stitchCalls.push({ first: fs.readFileSync(firstPath), second: fs.readFileSync(secondPath) });
+        fs.writeFileSync(outputPath, createMinimalValidMp4());
+      },
+    };
+    let compositorCalls = 0;
+    const stack = createTestStack({
+      stitcher,
+      compositor: {
+        process: async () => {
+          compositorCalls++;
+          throw new Error('compositor must not run for two-clip jobs');
+        },
+      },
+    });
+    const cover = await stack.stageImage('cover.png', 100, 100, 1001);
+    const artwork = await stack.stageImage('art.png', 120, 120, 1002);
+    const coverBytes = fs.readFileSync(cover.absPath);
+    const artworkBytes = fs.readFileSync(artwork.absPath);
+    const clientRequestId = newId();
+
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId,
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: CALENDAR_TWO_CLIP_TEMPLATE_ID,
+        templateVersion: 'v1',
+        sku: 'CAL-2CLIP',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+    await waitForJobState(stack.db, view.job.id, 'SUCCEEDED', 12000);
+    stack.orchestrator.stop();
+
+    const requests = server.getRequests();
+    const refUploads = requests.filter((r) => r.method === 'POST' && r.url === '/v1/references');
+    expect(refUploads.map((r) => r.rawBody.equals(coverBytes))).toEqual([true, false]);
+    expect(refUploads[1]!.rawBody.equals(artworkBytes)).toBe(true);
+
+    const submits = requests.filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(submits).toHaveLength(2);
+    const prompts = submits.map((r) => String((JSON.parse(r.rawBody.toString('utf-8')) as { prompt: string }).prompt));
+    expect(prompts[0]).toContain('ONLY reference for the calendar FRONT COVER');
+    expect(prompts[0]).not.toContain('CLIP B');
+    expect(prompts[1]).toContain('it is the printed INSIDE PAGE');
+    expect(prompts[1]).not.toContain('CLIP');
+    // Different provider idempotency keys for the two clips.
+    expect(submits.map((r) => r.headers['idempotency-key'])).toEqual([clientRequestId, `${clientRequestId}.b`]);
+
+    expect(stitchCalls).toHaveLength(1);
+    expect(compositorCalls).toBe(0);
+    const job = stack.db.jobs.getById(view.job.id)!;
+    expect(job.segment).toBe(1);
+    expect(job.segmentAPath).toBe(`CAL-2CLIP/segments/${job.id}-a.mp4`);
+    expect(fs.existsSync(stack.media.resolve(job.segmentAPath!))).toBe(true);
+    const videos = stack.db.assets.listByJob(job.id).filter((a) => a.role === 'generated_video');
+    expect(videos).toHaveLength(1);
+    stack.db.close();
+  });
+
+  it('Two-clip template: stitch failure -> DOWNLOAD_FAILED VIDEO_STITCH_FAILED; Retry Download joins again without a new submit', async () => {
+    server.reset();
+    server.setExpectedToken(testApiKey);
+    let fail = true;
+    const stitcher: VideoStitcher = {
+      stitch: async ({ outputPath }) => {
+        if (fail) throw new PodError('VIDEO_STITCH_FAILED');
+        fs.writeFileSync(outputPath, createMinimalValidMp4());
+      },
+    };
+    const stack = createTestStack({ stitcher });
+    const cover = await stack.stageImage('cover.png', 100, 100, 1101);
+    const artwork = await stack.stageImage('art.png', 120, 120, 1102);
+    const view = await stack.orchestrator.createJob(
+      {
+        clientRequestId: newId(),
+        sourceToken: cover.token,
+        interiorArtworkToken: artwork.token,
+        templateId: CALENDAR_TWO_CLIP_TEMPLATE_ID,
+        templateVersion: 'v1',
+        sku: 'CAL-2CFAIL',
+        categoryId: 'desk-calendar',
+      },
+      'employee-1'
+    );
+    const failed = await waitForJobState(stack.db, view.job.id, 'DOWNLOAD_FAILED', 12000);
+    expect(failed.errorCode).toBe('VIDEO_STITCH_FAILED');
+
+    fail = false;
+    await stack.orchestrator.retryDownload(view.job.id);
+    await waitForJobState(stack.db, view.job.id, 'SUCCEEDED', 8000);
+    stack.orchestrator.stop();
+    const submits = server.getRequests().filter((r) => r.method === 'POST' && r.url === '/v1/jobs');
+    expect(submits).toHaveLength(2);
     stack.db.close();
   });
 

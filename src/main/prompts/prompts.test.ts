@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PodError } from '@shared/errors';
+import { splitTwoClipPrompt, TWO_CLIP_MARKER } from '@shared/prompt';
 import {
   checkQuality,
   createPromptService,
@@ -980,6 +981,41 @@ No fake claims or ratings.
       expect(rendered.text).not.toMatch(/blank/i);
       expect(rendered.text).not.toContain('{{');
       expect(service.listTemplates().find((t) => t.id === 'calendar-review-ai')?.isDefault).toBe(true);
+    });
+
+    it('calendar-review-2clip v1: default calendar template, splits into clip A (cover) and clip B (inside page)', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const rendered = service.render({
+        templateId: 'calendar-review-2clip',
+        variables: { sku: 'CAL-2C', product_category: 'calendar' },
+        categoryGroup: 'calendar',
+        maxChars: 20000,
+        supportsDuration: false,
+        supportsAspectRatio: false,
+      });
+      expect(rendered.errors).toEqual([]);
+      expect(rendered.quality.passed).toBe(true);
+      expect(rendered.text).not.toContain('{{');
+      // The blank-page category notes must not be appended.
+      expect(rendered.text).not.toMatch(/must be blank|composited locally/i);
+      const parts = splitTwoClipPrompt(rendered.text);
+      expect(parts).not.toBeNull();
+      expect(parts!.a).toContain('FRONT COVER');
+      expect(parts!.a).toMatch(/inside page must NEVER become visible/);
+      expect(parts!.a).not.toContain('CLIP A');
+      expect(parts!.b).toContain('INSIDE PAGE');
+      expect(parts!.b).not.toMatch(/front cover\b(?! sheet)/i);
+      // Same person/setting paragraph in both clips so the cut is seamless.
+      const persona = (t: string): string => t.split('## PERSON AND SETTING (keep exactly the same)')[1]!.split('##')[0]!.trim();
+      expect(persona(parts!.a)).toBe(persona(parts!.b));
+      expect(service.listTemplates().find((t) => t.id === 'calendar-review-2clip')?.isDefault).toBe(true);
+    });
+
+    it('splitTwoClipPrompt rejects a missing, repeated or empty part', () => {
+      expect(splitTwoClipPrompt('only one prompt')).toBeNull();
+      expect(splitTwoClipPrompt(`A\n${TWO_CLIP_MARKER}\n`)).toBeNull();
+      expect(splitTwoClipPrompt(`A\n${TWO_CLIP_MARKER}\nB\n${TWO_CLIP_MARKER}\nC`)).toBeNull();
+      expect(splitTwoClipPrompt(`===== CLIP A =====\nA text\r\n${TWO_CLIP_MARKER}\r\nB text`)).toEqual({ a: 'A text', b: 'B text' });
     });
 
     it('admin-saved calendar-review v3 becomes what getTemplate("calendar-review") returns when set default for that id', () => {

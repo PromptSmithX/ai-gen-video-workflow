@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { JobView, JobNextAction } from '@shared/ipc';
 import { ACTIVE_JOB_STATES } from '@shared/job-state';
+import { CALENDAR_TWO_CLIP_TEMPLATE_ID } from '@shared/prompt';
 import { getApi } from '../api';
 import { en } from '../i18n/en';
 import { Modal } from '../components/Modal';
@@ -283,6 +284,11 @@ export function Queue({ highlightJobId }: QueueProps): React.JSX.Element {
                       >
                         {stateLabel}
                       </span>
+                      {job.promptTemplateId === CALENDAR_TWO_CLIP_TEMPLATE_ID && isActive && (
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                          {job.segment >= 1 ? en.queue.twoClip.clipB : en.queue.twoClip.clipA}
+                        </div>
+                      )}
                     </td>
 
                     {/* Created */}

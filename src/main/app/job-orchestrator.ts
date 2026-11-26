@@ -8,7 +8,7 @@ import { normalizeSku } from '@shared/domain';
 import { PodError, SAFE_ERROR_MESSAGES } from '@shared/errors';
 import type { CreateJobInput, JobView } from '@shared/ipc';
 import { JOB_STATE_LABELS } from '@shared/job-state';
-import { CALENDAR_AI_TEMPLATE_ID } from '@shared/prompt';
+import { CALENDAR_AI_TEMPLATE_ID, CALENDAR_TWO_CLIP_TEMPLATE_ID, splitTwoClipPrompt } from '@shared/prompt';
 import type { MuseProvider, ProviderCapabilities, ProviderJob } from '@shared/provider';
 import { ProviderError } from '@shared/provider';
 import type {
@@ -25,6 +25,7 @@ import { newId, nowIso } from '../domain/ids';
 import { isTerminal, nextActionsFor } from '../domain/job-machine';
 import { hashFile } from '../infra/media/hash';
 import { buildReferenceBoard, type ReferenceBoardRenderer } from '../infra/media/reference-board';
+import { createUnavailableStitcher, type VideoStitcher } from '../infra/media/stitch';
 import { prepareUploadImage, type PreparedUploadImage, type UploadImageEncoder } from '../infra/media/upload-image';
 import { nextPollDelay } from '../providers/muse/poll';
 import type { ImageStagingService, StagedImageRecord } from './image-staging';
@@ -49,6 +50,8 @@ export interface OrchestratorDeps {
    * (template `calendar-review-ai`). Absent => such jobs fail before submit with a clear message.
    */
   boardRenderer?: ReferenceBoardRenderer;
+  /** Joins clip A + clip B of two-clip calendar jobs. Absent => such jobs end DOWNLOAD_FAILED VIDEO_STITCH_FAILED. */
+  stitcher?: VideoStitcher;
   /** Max concurrent active generations. Defaults to 1. */
   maxConcurrent?: number;
 }
@@ -68,8 +71,18 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
  * Muse4AI replays — or, with a new reference image, rejects with 422 idempotency_conflict — a reused key.
  * Retries of the same attempt (process restart, AMBIGUOUS reconcile) keep the same key, so nothing is double-sent.
  */
-export function providerRequestId(job: Pick<Job, 'idempotencyKey' | 'attempt'>): string {
-  return job.attempt >= 2 ? `${job.idempotencyKey}.a${job.attempt}` : job.idempotencyKey;
+export function providerRequestId(job: Pick<Job, 'idempotencyKey' | 'attempt'> & { segment?: number }): string {
+  // Clip B of a two-clip calendar job is a different provider request (other image, other prompt).
+  const base = (job.segment ?? 0) >= 1 ? `${job.idempotencyKey}.b` : job.idempotencyKey;
+  return job.attempt >= 2 ? `${base}.a${job.attempt}` : base;
+}
+
+/**
+ * Two-clip calendar job: clip A = front cover only, clip B = inside page only, joined after download.
+ * Each Muse request gets exactly ONE artwork, so the two designs cannot blend.
+ */
+export function isTwoClipJob(job: Pick<Job, 'promptTemplateId'>): boolean {
+  return job.promptTemplateId === CALENDAR_TWO_CLIP_TEMPLATE_ID;
 }
 
 /** Calendar job whose interior page Muse draws itself (no local compositing). */
@@ -97,6 +110,7 @@ export class JobOrchestrator extends EventEmitter {
   private readonly compositor: CalendarArtworkCompositor;
   private readonly imageEncoder: UploadImageEncoder | undefined;
   private readonly boardRenderer: ReferenceBoardRenderer | undefined;
+  private readonly stitcher: VideoStitcher;
   private readonly maxConcurrent: number;
 
   private isProcessing = false;
@@ -118,6 +132,7 @@ export class JobOrchestrator extends EventEmitter {
     this.compositor = deps.compositor ?? createUnavailableCompositor();
     this.imageEncoder = deps.imageEncoder;
     this.boardRenderer = deps.boardRenderer;
+    this.stitcher = deps.stitcher ?? createUnavailableStitcher();
     this.maxConcurrent = deps.maxConcurrent ?? 1;
   }
 
@@ -253,6 +268,10 @@ export class JobOrchestrator extends EventEmitter {
         throw new PodError(code, rendered.errors[0] || 'Prompt rendering or quality check failed');
       }
       promptText = rendered.text;
+    }
+
+    if (input.templateId === CALENDAR_TWO_CLIP_TEMPLATE_ID && !splitTwoClipPrompt(promptText)) {
+      throw new PodError('INVALID_PROMPT', 'Two-clip prompt must contain both clip A and clip B');
     }
 
     // Idempotency: return existing job if clientRequestId is already recorded
@@ -942,12 +961,35 @@ export class JobOrchestrator extends EventEmitter {
 
     // 2b. Fit the reference image into the provider upload limit BEFORE SUBMITTING (failure => not sent).
     // Calendar jobs where Muse draws the interior page send ONE board image: cover left, interior artwork right.
+    // Two-clip jobs: clip A sends the cover with prompt A; clip B sends ONLY the interior artwork with prompt B.
+    let promptToSend = promptText;
+    if (isTwoClipJob(job)) {
+      const parts = splitTwoClipPrompt(promptText);
+      if (!parts) {
+        this.db.jobs.transition(job.id, 'FAILED_RETRYABLE', {
+          errorCode: 'INVALID_PROMPT',
+          safeErrorMessage: 'Two-clip prompt must contain both clip A and clip B',
+        });
+        await this.emitJobUpdated(job.id);
+        return;
+      }
+      promptToSend = job.segment >= 1 ? parts.b : parts.a;
+    }
+
     let upload: PreparedUploadImage;
     let boardPath: string | null = null;
     try {
       let refPath = sourceAbsPath;
       let refName = path.basename(sourceAsset.path);
-      if (isAiInteriorJob(job)) {
+      if (isTwoClipJob(job) && job.segment >= 1) {
+        const artwork = this.jobCalendarInfo(job).artwork;
+        const artworkAbs = artwork ? this.media.resolve(artwork.path) : null;
+        if (!artwork || !artworkAbs || !fs.existsSync(artworkAbs)) {
+          throw new PodError('NOT_FOUND', 'Interior artwork file missing');
+        }
+        refPath = artworkAbs;
+        refName = path.basename(artwork.path);
+      } else if (isAiInteriorJob(job)) {
         const artwork = this.jobCalendarInfo(job).artwork;
         const artworkAbs = artwork ? this.media.resolve(artwork.path) : null;
         if (!artworkAbs || !fs.existsSync(artworkAbs)) {
@@ -999,7 +1041,7 @@ export class JobOrchestrator extends EventEmitter {
     }
 
     try {
-      await this.submitPrepared(job, upload, promptText);
+      await this.submitPrepared(job, upload, promptToSend);
     } finally {
       upload.cleanup();
       removeQuietly(boardPath);
@@ -1016,6 +1058,7 @@ export class JobOrchestrator extends EventEmitter {
     this.logger.info('job_submitting', {
       jobId: updated.id,
       sku: updated.skuSnapshot,
+      ...(isTwoClipJob(updated) ? { segment: updated.segment } : {}),
     });
     await this.emitJobUpdated(updated.id);
 
@@ -1249,6 +1292,38 @@ export class JobOrchestrator extends EventEmitter {
     }
   }
 
+  /** Saves clip A under `<sku>/segments/` and re-queues the same job for clip B. */
+  private async finishClipA(job: Job, downloadedPath: string): Promise<void> {
+    try {
+      // SKU folders are `<root>/<normalized sku>`; skuSnapshot is already normalized.
+      const rel = `${job.skuSnapshot}/segments/${job.id}-a.mp4`;
+      fs.mkdirSync(path.join(this.media.skuDir(job.skuSnapshot), 'segments'), { recursive: true });
+      const abs = this.media.resolve(rel);
+      fs.copyFileSync(downloadedPath, abs);
+      this.db.jobs.transition(job.id, 'QUEUED', {
+        segment: 1,
+        segmentAPath: rel,
+        providerJobId: null,
+        providerReferenceId: null,
+        providerAssetId: null,
+        submitIntentAt: null,
+        acceptedAt: null,
+        errorCode: null,
+        safeErrorMessage: null,
+        attempt: 0,
+      });
+      this.logger.info('two_clip_segment_a_saved', { jobId: job.id, sku: job.skuSnapshot });
+    } catch {
+      this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+        errorCode: 'DOWNLOAD_FAILED',
+        safeErrorMessage: SAFE_ERROR_MESSAGES.DOWNLOAD_FAILED,
+      });
+      this.logger.error('two_clip_segment_a_store_failed', { jobId: job.id, sku: job.skuSnapshot });
+    }
+    await this.emitJobUpdated(job.id);
+    this.scheduleProcessQueue();
+  }
+
   private async handleDownloading(job: Job): Promise<void> {
     if (!job.providerJobId) {
       this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
@@ -1282,14 +1357,47 @@ export class JobOrchestrator extends EventEmitter {
         return;
       }
 
+      // Two-clip calendar job, clip A done: keep it in the library and queue clip B (no new generation of A).
+      if (isTwoClipJob(job) && job.segment === 0) {
+        await this.finishClipA(job, tempPartPath);
+        return;
+      }
+
       // Check calendar post-processing (artwork asset present or category is calendar)
       const { isCalendar, artwork: artworkAsset } = this.jobCalendarInfo(job);
 
       let videoFileToStore = tempPartPath;
       let compositionReport: CalendarCompositionReport | null = null;
+      let stitched = false;
 
-      // Muse already drew the interior page for `calendar-review-ai` jobs: nothing to composite.
-      if (isCalendar && !isAiInteriorJob(job)) {
+      if (isTwoClipJob(job)) {
+        // Clip B done: join A + B (hard cut during the page turn). Retry Download re-downloads B and joins again.
+        const aAbs = job.segmentAPath ? this.media.resolve(job.segmentAPath) : null;
+        if (!aAbs || !fs.existsSync(aAbs)) {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'NOT_FOUND',
+            safeErrorMessage: 'Clip A of this calendar video is missing. Regenerate the job.',
+          });
+          this.logger.error('two_clip_segment_a_missing', { jobId: job.id, sku: job.skuSnapshot });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+        processedTempPath = this.media.newTempPath();
+        try {
+          await this.stitcher.stitch({ firstPath: aAbs, secondPath: tempPartPath, outputPath: processedTempPath });
+        } catch (err: unknown) {
+          this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
+            errorCode: 'VIDEO_STITCH_FAILED',
+            safeErrorMessage: err instanceof PodError ? err.safeMessage : SAFE_ERROR_MESSAGES.VIDEO_STITCH_FAILED,
+          });
+          this.logger.error('two_clip_stitch_failed', { jobId: job.id, sku: job.skuSnapshot });
+          await this.emitJobUpdated(job.id);
+          return;
+        }
+        videoFileToStore = processedTempPath;
+        stitched = true;
+      } else if (isCalendar && !isAiInteriorJob(job)) {
+        // Muse already drew the interior page for `calendar-review-ai` jobs: nothing to composite.
         if (!artworkAsset) {
           this.db.jobs.transition(job.id, 'DOWNLOAD_FAILED', {
             errorCode: 'NOT_FOUND',
@@ -1409,6 +1517,7 @@ export class JobOrchestrator extends EventEmitter {
         videoBytes: storedVideo.bytes,
         createdAt: job.createdAt,
         completedAt,
+        ...(stitched ? { twoClip: { clips: 2 } } : {}),
         ...(compositionReport
           ? {
               calendarPostProcess: {

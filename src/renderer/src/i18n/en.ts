@@ -149,6 +149,10 @@ export const en = {
       cancel: 'Cancel',
     },
     indeterminate: 'Generating…',
+    twoClip: {
+      clipA: 'Clip 1/2 — front cover',
+      clipB: 'Clip 2/2 — inside page',
+    },
     confirmRetry: {
       title: 'Confirm Retry',
       message: 'I understand this will submit again.',

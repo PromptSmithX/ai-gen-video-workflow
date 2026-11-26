@@ -10,6 +10,7 @@ export const ERROR_CODES = [
   'OUTPUT_MISSING',
   'DOWNLOAD_FAILED',
   'CALENDAR_COMPOSITING_FAILED',
+  'VIDEO_STITCH_FAILED',
   // local / validation
   'INVALID_SKU',
   'INVALID_IMAGE',
@@ -41,6 +42,8 @@ export const SAFE_ERROR_MESSAGES: Record<ErrorCode, string> = {
   DOWNLOAD_FAILED: 'The video was generated but could not be downloaded or validated.',
   CALENDAR_COMPOSITING_FAILED:
     'The video was generated, but the interior artwork could not be placed reliably on the calendar page. Retry the download to process it again; no new generation will be submitted.',
+  VIDEO_STITCH_FAILED:
+    'Both calendar clips were generated, but they could not be joined into one video. Retry the download to join them again; no new generation will be submitted.',
   INVALID_SKU: 'SKU may only contain A-Z, 0-9, hyphen and underscore.',
   INVALID_IMAGE: 'The image must be a valid PNG, JPEG or WEBP file.',
   IMAGE_TOO_LARGE: 'The image is too large.',

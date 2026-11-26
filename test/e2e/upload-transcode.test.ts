@@ -237,6 +237,9 @@ describe('Front cover upload transcode', () => {
     expect(providerRequestId({ idempotencyKey: 'k', attempt: 0 })).toBe('k');
     expect(providerRequestId({ idempotencyKey: 'k', attempt: 1 })).toBe('k');
     expect(providerRequestId({ idempotencyKey: 'k', attempt: 2 })).toBe('k.a2');
+    // Clip B of a two-clip calendar job: its own key, and its own retry keys.
+    expect(providerRequestId({ idempotencyKey: 'k', attempt: 1, segment: 1 })).toBe('k.b');
+    expect(providerRequestId({ idempotencyKey: 'k', attempt: 2, segment: 1 })).toBe('k.b.a2');
 
     const s = setup({ maxUploadBytes: 20 * 1024 * 1024, encoder, failFirstSubmit: true });
     const cover = await s.stage('cover.png', 100);
