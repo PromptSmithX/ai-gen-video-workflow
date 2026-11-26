@@ -241,3 +241,43 @@ def detect_hand_mask(
         valid_hand_mask = cv2.dilate(valid_hand_mask, kernel_clean, iterations=1)
 
     return valid_hand_mask, False
+
+
+# A blank calendar page is bright, near-neutral paper. Measured on a real Muse video: the open blank page scores
+# 0.93-0.99 of its interior bright-neutral, the printed front cover <= 0.67, the reviewer's shirt ~0.03 and the page
+# merged with a pale wall into one blob 0.78; synthetic fixtures (incl. a page with fake AI text) >= 0.98.
+BLANK_MIN_FRACTION = 0.85
+_BLANK_MIN_L = 150.0
+_BLANK_MAX_CHROMA = 18.0
+
+
+def page_blank_fraction(
+    frame: np.ndarray, quad_corners: np.ndarray, hand_mask: np.ndarray | None = None
+) -> float:
+    """Fraction of the quad interior (inset ~6%, hands excluded) that is bright, near-neutral paper."""
+    h, w = frame.shape[:2]
+    quad_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(quad_mask, np.int32(quad_corners), 255)
+    area = float(cv2.contourArea(np.asarray(quad_corners, dtype=np.float32)))
+    if area < 100.0:
+        return 0.0
+    k = max(3, int(0.06 * np.sqrt(area)))
+    inner = cv2.erode(quad_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    sel = inner > 0
+    if hand_mask is not None:
+        sel &= hand_mask == 0
+    if np.count_nonzero(sel) < 200:
+        return 0.0
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)[sel]
+    chroma = np.sqrt((lab[:, 1] - 128.0) ** 2 + (lab[:, 2] - 128.0) ** 2)
+    return float(np.mean((lab[:, 0] >= _BLANK_MIN_L) & (chroma < _BLANK_MAX_CHROMA)))
+
+
+def page_is_blank(
+    frame: np.ndarray,
+    quad_corners: np.ndarray,
+    hand_mask: np.ndarray | None = None,
+    min_fraction: float = BLANK_MIN_FRACTION,
+) -> bool:
+    """True when the quad shows the blank (cream/white) page, not a printed cover, clothing or background."""
+    return page_blank_fraction(frame, quad_corners, hand_mask) >= min_fraction

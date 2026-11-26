@@ -63,8 +63,9 @@ When packaged, the application directory layout will resolve:
 
 ### 4. Quality Gate & Safe Failure
 If any of the following conditions occur:
-- Open-page visible duration is `< 1.5 s` (`visibleFrames < 1.4 * fps`).
-- Tracking coverage is `< --min-coverage` (default `0.6`).
+- The longest continuous open-page run is `< 1.5 s` (`< 1.4 * fps` frames).
+- Coverage inside the open-page span (first to last open-page frame) is `< --min-coverage` (default `0.6`). Coverage over the whole clip is meaningless: the page is only shown after the cover and page turn.
+- Revised 2026-11-26 (v1.1.0) after the first real Muse video: blank-page check per frame, size-jump guard in the tracker, two-pass processing (gate decided before encoding).
 - Average page area is `< 5%` of the video frame.
 
 The sidecar:

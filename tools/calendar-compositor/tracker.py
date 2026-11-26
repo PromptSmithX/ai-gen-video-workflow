@@ -27,8 +27,14 @@ def generate_grid_points(corners: np.ndarray, nx: int = 8, ny: int = 8) -> np.nd
 class PageTracker:
     """Tracks the calendar page corners across video frames with drift correction."""
 
-    def __init__(self, alpha: float = 0.3) -> None:
+    def __init__(self, alpha: float = 0.3, max_area_jump: float = 0.3, relock_frames: int = 12) -> None:
         self.alpha = alpha  # Smoothing factor for confident runs
+        self.max_area_jump = max_area_jump
+        self.relock_frames = relock_frames
+        self.jump_streak = 0
+        # Last confidently tracked page: survives single-frame tracking dropouts so the size-jump guard still
+        # has a reference (cleared only by reset()).
+        self.anchor_corners: np.ndarray | None = None
         self.prev_gray: np.ndarray | None = None
         self.prev_corners: np.ndarray | None = None
         self.smoothed_corners: np.ndarray | None = None
@@ -39,6 +45,7 @@ class PageTracker:
         self.prev_corners = None
         self.smoothed_corners = None
         self.tracked_pts = None
+        self.anchor_corners = None
 
     def process_frame(
         self, frame: np.ndarray
@@ -51,6 +58,24 @@ class PageTracker:
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         det_corners, det_score = detect_page_quad(frame)
+
+        # A held page cannot change its size abruptly between frames. A detection that does is usually the page
+        # merged with a bright background (e.g. a pale wall) into one blob: ignore it, unless the new size persists
+        # (then the page really moved closer/further and we re-lock on it).
+        if det_corners is not None and self.anchor_corners is not None:
+            prev_area = float(cv2.contourArea(self.anchor_corners))
+            det_area = float(cv2.contourArea(det_corners))
+            if abs(det_area - prev_area) / max(prev_area, 1.0) > self.max_area_jump:
+                self.jump_streak += 1
+                if self.jump_streak < self.relock_frames:
+                    det_corners, det_score = None, 0.0
+                else:
+                    self.jump_streak = 0
+                    self.reset()
+            else:
+                self.jump_streak = 0
+        else:
+            self.jump_streak = 0
 
         tracked_corners: np.ndarray | None = None
         inlier_ratio = 0.0
@@ -139,6 +164,7 @@ class PageTracker:
                 )
 
             self.prev_corners = self.smoothed_corners.copy()
+            self.anchor_corners = self.smoothed_corners.copy()
             self.prev_gray = curr_gray.copy()
 
             # Refresh tracking points inside the new smoothed quad

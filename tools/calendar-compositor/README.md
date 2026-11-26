@@ -10,7 +10,10 @@ Local computer vision sidecar executable that tracks the blank cream interior pa
 4. **Warping & Masking**: The full-resolution original artwork is warped in-memory onto the smoothed quad with a 1.5% margin inset to keep artwork clear of page edges and top spirals. The mask is feathered <= 2 px.
 5. **Hand Handling**: Skin-tone segmentation inside the quad prevents drawing artwork over the reviewer's fingers.
 6. **Encoding & Audio**: The composited frames are streamed to `ffmpeg` via raw video pipe, copying the original audio stream bit-for-bit.
-7. **Quality Gate**: If the open page is visible for < 1.5 s, tracking coverage is below `--min-coverage` (default 0.6), or page area is too small, the sidecar exits with code 3, deletes any partial video, and reports `applied: false`.
+7. **Blank-page check (pass 1)**: every tracked quad must look like the blank page — at least 85% of its interior (hands excluded) bright, near-neutral paper. A printed front cover, the reviewer's clothing or a quad drifted onto the background is rejected and tracking restarts. The tracker also ignores sudden page-size jumps (page merged with a pale wall) unless the new size persists ~0.5 s.
+8. **Segment planning**: short detection gaps (≤ 0.25 s) are bridged by interpolating the corners; isolated runs shorter than 0.5 s are dropped so artwork never flashes.
+9. **Quality Gate**: the longest continuous open-page run must be ≥ ~1.5 s, at least `--min-coverage` (default 0.6) of the frames between the first and last open-page frame must be tracked, and the page must be large enough. A real review shows the page only for the last seconds, so coverage is measured inside that span, not over the whole clip. On failure the sidecar exits 3 before encoding anything and reports `applied: false`.
+10. **Pass 2**: only then are frames composited and encoded (`-f mp4`, so any output file name works, e.g. a `.part` temp file). An encoder failure exits 4.
 
 ## CLI Interface
 
