@@ -131,8 +131,8 @@ Company master prompt body for {{sku}}`,
       const templates = serviceNoCompany.listTemplates();
       expect(templates.length).toBeGreaterThanOrEqual(2);
 
-      const v1 = templates.find((t) => t.version === 'v1');
-      const v2 = templates.find((t) => t.version === 'v2');
+      const v1 = templates.find((t) => t.id === 'product-review' && t.version === 'v1');
+      const v2 = templates.find((t) => t.id === 'product-review' && t.version === 'v2');
       expect(v1).toBeDefined();
       expect(v2).toBeDefined();
       expect(v2?.isPlaceholder).toBe(true);
@@ -736,12 +736,12 @@ Company T-shirt Master body for {{sku}}`,
       expect(productDefault.isPlaceholder).toBe(true);
       expect(productDefault.isDefault).toBe(true);
 
-      // calendar-review builtin v1 is still placeholder and not default
+      // calendar-review default is the builtin v2 (user-authored, not placeholder); unaffected by the company master
       const calendarTmpl = service.getTemplate('calendar-review');
       expect(calendarTmpl.id).toBe('calendar-review');
-      expect(calendarTmpl.version).toBe('v1');
-      expect(calendarTmpl.isPlaceholder).toBe(true);
-      expect(calendarTmpl.isDefault).toBe(false);
+      expect(calendarTmpl.version).toBe('v2');
+      expect(calendarTmpl.isPlaceholder).toBe(false);
+      expect(calendarTmpl.isDefault).toBe(true);
     });
 
     it('company master without id defaults to product-review, source company, isDefault true, not placeholder', () => {
@@ -795,7 +795,7 @@ Untitled company master body for {{sku}}`,
       expect(bannerTmpl.isDefault).toBe(true);
     });
 
-    it('calendar-review v1 listed, loads, isPlaceholder === true, not the default template; product-review / company default unchanged', () => {
+    it('calendar-review v1 listed as placeholder, v2 is the default; product-review / company default unchanged', () => {
       const companyPath = path.join(tempBaseDir, 'company-master.md');
       fs.writeFileSync(
         companyPath,
@@ -817,11 +817,12 @@ Company master body for {{sku}}`,
       expect(calV1?.isPlaceholder).toBe(true);
       expect(calV1?.isDefault).toBe(false);
 
-      // loads via getTemplate
+      // default resolves to v2
       const calTemplate = service.getTemplate('calendar-review');
       expect(calTemplate.id).toBe('calendar-review');
-      expect(calTemplate.version).toBe('v1');
-      expect(calTemplate.isPlaceholder).toBe(true);
+      expect(calTemplate.version).toBe('v2');
+      expect(calTemplate.isPlaceholder).toBe(false);
+      expect(service.getTemplate('calendar-review', 'v1').isPlaceholder).toBe(true);
 
       // product-review default is unchanged (v2)
       const productDefault = service.getTemplate('product-review');
@@ -836,11 +837,11 @@ Company master body for {{sku}}`,
       expect(companyProductDefault.version).toBe('v2-company');
       expect(companyProductDefault.isDefault).toBe(true);
 
-      // calendar-review still resolves to builtin v1 and isPlaceholder === true
+      // calendar-review still resolves to builtin v2
       const calUnderCompany = serviceWithCompany.getTemplate('calendar-review');
       expect(calUnderCompany.id).toBe('calendar-review');
-      expect(calUnderCompany.version).toBe('v1');
-      expect(calUnderCompany.isPlaceholder).toBe(true);
+      expect(calUnderCompany.version).toBe('v2');
+      expect(calUnderCompany.isPlaceholder).toBe(false);
       expect(calUnderCompany.source).toBe('builtin');
     });
 
@@ -849,6 +850,7 @@ Company master body for {{sku}}`,
 
       const rendered = service.render({
         templateId: 'calendar-review',
+        templateVersion: 'v1',
         variables: {
           sku: 'CAL-2026-DESK',
           product_category: 'calendar',
@@ -883,6 +885,7 @@ Company master body for {{sku}}`,
 
       const rendered = service.render({
         templateId: 'calendar-review',
+        templateVersion: 'v1',
         variables: {
           sku: 'CAL-TEST-01',
           product_category: 'calendar',
@@ -938,15 +941,35 @@ No fake claims or ratings.
       expect(reportNegated.passed).toBe(false);
     });
 
-    it('admin-saved calendar-review v2 becomes what getTemplate("calendar-review") returns when set default for that id', () => {
+    it('calendar-review v2 renders as a direct video request that passes quality checks', () => {
+      const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
+      const rendered = service.render({
+        templateId: 'calendar-review',
+        variables: { sku: 'CAL-V2', product_category: 'calendar' },
+        categoryGroup: 'calendar',
+        maxChars: 32000,
+        supportsDuration: false,
+        supportsAspectRatio: false,
+      });
+      expect(rendered.errors).toEqual([]);
+      expect(rendered.quality.passed).toBe(true);
+      expect(rendered.templateVersion).toBe('v2');
+      expect(rendered.text).toMatch(/^Create a highly photorealistic 10-second .*video/);
+      expect(rendered.text).toContain('Generate the video directly');
+      expect(rendered.text).toContain('COMPLETELY BLANK');
+      expect(rendered.text).not.toMatch(/placeholder|review and approve/i);
+      expect(rendered.text).not.toContain('{{');
+    });
+
+    it('admin-saved calendar-review v3 becomes what getTemplate("calendar-review") returns when set default for that id', () => {
       const service = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
 
-      // Before saving: resolves to builtin v1
+      // Before saving: resolves to builtin v2
       const initial = service.getTemplate('calendar-review');
-      expect(initial.version).toBe('v1');
+      expect(initial.version).toBe('v2');
       expect(initial.source).toBe('builtin');
 
-      // Save admin version v2
+      // Save admin version (next after builtin v2 -> v3)
       const v2Summary = service.saveTemplateVersion({
         id: 'calendar-review',
         title: 'Calendar Review V2 (Admin Approved)',
@@ -967,16 +990,16 @@ Rules:
 {{category_rules}}`,
       });
 
-      expect(v2Summary.version).toBe('v2');
+      expect(v2Summary.version).toBe('v3');
       expect(v2Summary.source).toBe('admin');
       expect(v2Summary.isPlaceholder).toBe(false);
 
       // Set default for calendar-review
-      service.setDefault('calendar-review', 'v2');
+      service.setDefault('calendar-review', 'v3');
 
       // getTemplate('calendar-review') now resolves to v2
       const currentDefault = service.getTemplate('calendar-review');
-      expect(currentDefault.version).toBe('v2');
+      expect(currentDefault.version).toBe('v3');
       expect(currentDefault.source).toBe('admin');
       expect(currentDefault.isDefault).toBe(true);
 
@@ -988,7 +1011,7 @@ Rules:
       // Persists across a new PromptService instance
       const newService = createPromptService({ builtinDir, adminDir, companyMasterPath: null });
       const reloadedCalendar = newService.getTemplate('calendar-review');
-      expect(reloadedCalendar.version).toBe('v2');
+      expect(reloadedCalendar.version).toBe('v3');
       expect(reloadedCalendar.source).toBe('admin');
       expect(reloadedCalendar.isDefault).toBe(true);
 

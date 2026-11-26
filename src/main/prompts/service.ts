@@ -78,7 +78,8 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           id: parsed.metadata.id,
           version: parsed.metadata.version,
           title: parsed.metadata.title,
-          isPlaceholder: true,
+          // Builtins are placeholders unless their frontmatter explicitly says `placeholder: false`.
+          isPlaceholder: parsed.metadata.placeholder,
           source: 'builtin',
           isDefault: parsed.metadata.default,
           createdAt: parsed.metadata.createdAt,
