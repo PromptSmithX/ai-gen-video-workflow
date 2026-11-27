@@ -150,3 +150,27 @@ Because previous version files (`v1.md`, `v2.md`, etc.) are immutable and perman
 - Rolling back requires only a call to `setDefault(id, previousVersion)` (e.g., `setDefault('product-review', 'v2')`).
 - The operation immediately updates `<adminDir>/default.json`.
 - The rollback takes effect across the entire application with zero downtime and without modifying or deleting any template files.
+
+---
+
+## 7. Calendar Category Prompt Templates
+
+In addition to apparel (`product-review`), POD Video Studio supports dedicated prompt handling for spiral-bound desk calendars (`calendar-review`):
+
+### Template Isolation & Defaults
+
+- **Template Identifier**: `calendar-review`, with initial built-in version `v1` located at `prompts/master/calendar-review-v1.md`.
+- **Placeholder Guarantee**: The built-in calendar template is flagged with `isPlaceholder: true`. The placeholder flag is never stripped until an official company-approved prompt is reviewed and imported.
+- **Independent Default Scoping**: The built-in `calendar-review-v1` has `default: false` and does **not** displace the global default template (`product-review` or company master). In `listTemplates()`, `calendar-review-v1` is not the global default.
+- **Company Master Loading**: `PROMPT_MASTER_PATH` imports the company-approved template under its specified frontmatter id (defaulting to `product-review` if omitted, such as `tshirt-review`). It does not register as `calendar-review` unless explicitly crafted as such. Custom calendar prompts are versioned and managed through Admin or dedicated files.
+- **Resolution Semantics**: Calling `getTemplate('calendar-review')` resolves to an admin-saved version if one exists (or the version selected via `setDefault('calendar-review', ...)`); otherwise it safely falls back to built-in `v1`.
+
+### Category Snippet (`prompts/categories/calendar.md`)
+
+When a job specifies `categoryGroup: 'calendar'`, the PromptService automatically appends the calendar category snippet into the `{{category_rules}}` slot. This snippet enforces physical desk calendar constraints:
+1. Physical spiral binding along the top edge throughout.
+2. A single, natural page turn revealing a blank, warm-cream, matte interior paper page.
+3. Strict prohibition of AI-generated text, calendar dates, numbers, illustrations, patterns, or artwork on the interior page (since original customer artwork is composited locally post-download).
+4. Hands positioned on outer edges away from printable areas.
+5. Holding the opened page flat, front-facing, and unobstructed for at least 2–3 seconds with all four page edges clearly visible against the background.
+

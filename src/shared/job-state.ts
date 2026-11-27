@@ -42,7 +42,8 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = 
   SUBMITTING: ['RUNNING', 'FAILED_RETRYABLE', 'AMBIGUOUS', 'FAILED_REFUSED', 'FAILED_QUOTA', 'FAILED_PROVIDER'],
   // RUNNING -> AMBIGUOUS when the provider no longer knows the accepted job (e.g. 404 while polling).
   RUNNING: ['DOWNLOADING', 'FAILED_REFUSED', 'FAILED_QUOTA', 'FAILED_PROVIDER', 'CANCELLED', 'DOWNLOAD_FAILED', 'AMBIGUOUS'],
-  DOWNLOADING: ['SUCCEEDED', 'DOWNLOAD_FAILED'],
+  // DOWNLOADING -> QUEUED only for two-clip calendar jobs: clip A is saved, clip B is queued next.
+  DOWNLOADING: ['SUCCEEDED', 'DOWNLOAD_FAILED', 'QUEUED'],
   SUCCEEDED: [],
   // Manual retry (user acknowledged) re-queues the SAME job + SAME idempotency key.
   FAILED_RETRYABLE: ['QUEUED'],

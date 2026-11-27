@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PodError } from '@shared/errors';
-import type { PromptTemplate, PromptTemplateSummary } from '@shared/prompt';
+import { CALENDAR_AI_TEMPLATE_ID, CALENDAR_TWO_CLIP_TEMPLATE_ID, type PromptTemplate, type PromptTemplateSummary } from '@shared/prompt';
 import type { PromptService, RenderArgs } from '@shared/services';
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter';
 import { validatePrompt } from './quality';
@@ -78,7 +78,8 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
           id: parsed.metadata.id,
           version: parsed.metadata.version,
           title: parsed.metadata.title,
-          isPlaceholder: true,
+          // Builtins are placeholders unless their frontmatter explicitly says `placeholder: false`.
+          isPlaceholder: parsed.metadata.placeholder,
           source: 'builtin',
           isDefault: parsed.metadata.default,
           createdAt: parsed.metadata.createdAt,
@@ -202,6 +203,13 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       for (const t of matching) {
         t.isDefault = t.source === 'company';
       }
+    } else if (id === 'calendar-review') {
+      // Only for calendar-review without a persisted admin default:
+      // isDefault only if explicitly marked in frontmatter (builtin v1 has default: false -> not default)
+      const explicitDefault = matching.find((t) => t.isDefault);
+      for (const t of matching) {
+        t.isDefault = explicitDefault ? t.version === explicitDefault.version : false;
+      }
     } else {
       // Pick builtin template marked default, or v2, or latest version
       const explicitDefault = matching.find((t) => t.isDefault);
@@ -277,7 +285,11 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
       if (version) {
         target = templates.find((t) => t.id === id && t.version === version);
       } else {
-        target = templates.find((t) => t.id === id && t.isDefault) ?? templates.find((t) => t.id === id);
+        // Resolve to admin/company version if one exists, otherwise builtin v1 / default
+        target =
+          templates.find((t) => t.id === id && t.isDefault) ??
+          templates.filter((t) => t.id === id && (t.source === 'admin' || t.source === 'company')).pop() ??
+          templates.find((t) => t.id === id);
       }
 
       if (!target) {
@@ -299,7 +311,12 @@ export function createPromptService(opts: CreatePromptServiceOptions): PromptSer
 
     render(args: RenderArgs) {
       const template = this.getTemplate(args.templateId, args.templateVersion);
-      const categorySnippet = loadCategorySnippet(args.categoryGroup);
+      // The calendar category notes describe the blank-page + compositing flow; the AI-interior template has its own
+      // inside-page rules and must not receive "the interior page must be blank".
+      const categorySnippet =
+        template.id === CALENDAR_AI_TEMPLATE_ID || template.id === CALENDAR_TWO_CLIP_TEMPLATE_ID
+          ? undefined
+          : loadCategorySnippet(args.categoryGroup);
 
       return renderPrompt({
         templateId: template.id,

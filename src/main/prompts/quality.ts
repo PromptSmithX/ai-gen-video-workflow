@@ -41,20 +41,20 @@ export const QUALITY_RULES: readonly QualityRuleDef[] = [
   {
     id: 'consistent_product',
     label: 'Maintain consistent product identity and construction',
-    description: 'Requires maintaining consistent product identity, garment construction, and appearance throughout the video.',
+    description: 'Requires maintaining consistent product identity, garment/paper construction, and appearance throughout the video.',
     patterns: [
-      /(?:consistent|maintain|preserve)\s+.*?(?:product\s+identity|garment\s+construction|product\s+construction|appearance\s+throughout)/i,
-      /consistent\s+(?:product|garment|construction)/i,
+      /(?:consistent|maintain|preserve)\s+.*?(?:product\s+identity|garment\s+construction|product\s+construction|paper\s+construction|appearance\s+throughout)/i,
+      /consistent\s+(?:product|garment|paper|construction)/i,
       /product\s+identity\s+.*?(?:consistent|maintained)/i,
     ],
   },
   {
     id: 'natural_texture',
     label: 'Natural material, skin, and hand textures',
-    description: 'Ensures natural, non-plastic appearance for fabric, hands, skin, and materials.',
+    description: 'Ensures natural, non-plastic appearance for fabric, paper, hands, skin, and materials.',
     guardNegation: true,
     patterns: [
-      /(?:natural|realistic)\s+.*?(?:texture|material|skin|hands|fabric)/i,
+      /(?:natural|realistic)\s+.*?(?:texture|material|skin|hands|fabric|paper)/i,
       /non-plastic/i,
       /natural\s+textures?/i,
     ],

@@ -96,6 +96,53 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 2,
+    name: 'assets_interior_artwork_role',
+    up(db: DatabaseSync): void {
+      db.exec(`
+        CREATE TABLE assets_new (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          job_id TEXT REFERENCES jobs(id),
+          role TEXT NOT NULL CHECK(role IN ('source_image', 'generated_video', 'thumbnail', 'prompt_snapshot', 'interior_artwork')),
+          path TEXT NOT NULL,
+          mime TEXT NOT NULL,
+          bytes INTEGER NOT NULL,
+          width INTEGER,
+          height INTEGER,
+          duration_ms INTEGER,
+          sha256 TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+
+        INSERT INTO assets_new (
+          id, product_id, job_id, role, path, mime, bytes, width, height, duration_ms, sha256, created_at
+        )
+        SELECT
+          id, product_id, job_id, role, path, mime, bytes, width, height, duration_ms, sha256, created_at
+        FROM assets;
+
+        DROP TABLE assets;
+
+        ALTER TABLE assets_new RENAME TO assets;
+
+        CREATE INDEX IF NOT EXISTS idx_assets_product_id ON assets(product_id);
+        CREATE INDEX IF NOT EXISTS idx_assets_job_id ON assets(job_id);
+      `);
+    },
+  },
+  {
+    version: 3,
+    name: 'jobs_two_clip_segments',
+    up(db: DatabaseSync): void {
+      // Two-clip calendar jobs: which clip is in flight, and where clip A was saved.
+      db.exec(`
+        ALTER TABLE jobs ADD COLUMN segment INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN segment_a_path TEXT;
+      `);
+    },
+  },
 ];
 
 /**

@@ -32,6 +32,8 @@ interface JobRow {
   completed_at: string | null;
   error_code: string | null;
   safe_error_message: string | null;
+  segment: number | null;
+  segment_a_path: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -63,9 +65,22 @@ function mapRow(row: JobRow): Job {
     completedAt: row.completed_at ?? null,
     errorCode: (row.error_code as ErrorCode) ?? null,
     safeErrorMessage: row.safe_error_message ?? null,
+    segment: row.segment ?? 0,
+    segmentAPath: row.segment_a_path ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function applySegmentPatch(patch: JobPatch, setClauses: string[], params: unknown[]): void {
+  if ('segment' in patch && patch.segment !== undefined) {
+    setClauses.push('segment = ?');
+    params.push(patch.segment);
+  }
+  if ('segmentAPath' in patch) {
+    setClauses.push('segment_a_path = ?');
+    params.push(patch.segmentAPath ?? null);
+  }
 }
 
 export class SqliteJobRepository implements JobRepository {
@@ -293,6 +308,7 @@ export class SqliteJobRepository implements JobRepository {
         setClauses.push('review_status = ?');
         params.push(patch.reviewStatus);
       }
+      applySegmentPatch(patch, setClauses, params);
     }
 
     // Atomic update expecting current.state
@@ -366,6 +382,7 @@ export class SqliteJobRepository implements JobRepository {
       setClauses.push('review_status = ?');
       params.push(patch.reviewStatus);
     }
+    applySegmentPatch(patch, setClauses, params);
 
     const sql = `
       UPDATE jobs

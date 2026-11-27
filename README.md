@@ -118,7 +118,7 @@ All URLs and keys are company-supplied and must use placeholders:
 | `MUSE_BRIDGE_API_KEY` | `PLACEHOLDER` | Convenience API key fallback. Admin screen (DPAPI) is recommended for production. |
 | `PROMPT_MASTER_PATH` | `PLACEHOLDER` | Optional absolute path to company Prompt Master markdown file. |
 | `POD_LIBRARY_ROOT` | `<Documents>/POD_VIDEO_LIBRARY` | Destination folder for SKU video library. |
-| `PROMPT_MAX_CHARS` | `20000` | Maximum prompt length enforced by the app (the bridge limit also applies: 32000 in chat mode, 4000 in video mode). |
+| `PROMPT_MAX_CHARS` | `32000` | Maximum prompt length enforced by the app; 32000 is also the Muse4AI chat limit (video mode allows 4000). |
 | `POLL_INTERVAL_MS` | `3000` | Initial job polling interval in milliseconds. |
 | `POLL_MAX_INTERVAL_MS` | `15000` | Maximum backoff polling interval in milliseconds. |
 | `MAX_SOURCE_MB` | `15` | Maximum upload size for source mockups (in MB). |

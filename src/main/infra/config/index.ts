@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { PodError } from '@shared/errors';
 import { DEFAULT_CATEGORIES, type Category } from '@shared/domain';
+import { PROMPT_TEXT_MAX_CHARS } from '@shared/prompt';
 import type { AdminSettings, AppConfig, BundledResources, MuseSubmitMode, ProviderMode } from '@shared/config';
 
 /** Port the bundled Muse4AI serves its agent API on (its default, "this machine only"). */
@@ -105,7 +106,7 @@ export function assertDataDir(dataDir: string): void {
 const categorySchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
-  promptGroup: z.enum(['apparel', 'drinkware', 'home-decor', 'other']),
+  promptGroup: z.enum(['apparel', 'drinkware', 'home-decor', 'calendar', 'other']),
 });
 
 const numberBoundsSchema = z.object({
@@ -315,7 +316,7 @@ export function loadConfig(args: {
   assertDataDir(dataDir);
 
   // Numbers & Bounds validation (empty values fall back to defaults)
-  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? 20000;
+  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? PROMPT_TEXT_MAX_CHARS;
   const pollIntervalMsRaw = effectiveEnv['POLL_INTERVAL_MS'] ?? 3000;
   const pollMaxIntervalMsRaw = effectiveEnv['POLL_MAX_INTERVAL_MS'] ?? 15000;
 
@@ -383,7 +384,24 @@ export function loadConfig(args: {
     if (!catResult.success) {
       throw new PodError('CONFIG_INVALID', 'Invalid configuration for key: categories');
     }
-    categories = catResult.data;
+    const stored = catResult.data;
+    // We cannot distinguish an admin who deliberately deleted desk-calendar from a legacy
+    // install that predates the calendar category without an explicit marker. Therefore, we
+    // append the default desk-calendar category only when the stored list has no category
+    // with promptGroup === 'calendar' and no category with id 'desk-calendar'. Existing
+    // categories are preserved exactly (order, labels, prompt groups, and custom IDs).
+    const hasDeskCalendar = stored.some((c) => c.id === 'desk-calendar');
+    const hasCalendarGroup = stored.some((c) => c.promptGroup === 'calendar');
+    if (!hasDeskCalendar && !hasCalendarGroup) {
+      const defaultDeskCalendar = DEFAULT_CATEGORIES.find((c) => c.id === 'desk-calendar') ?? {
+        id: 'desk-calendar',
+        label: 'Desk Calendar',
+        promptGroup: 'calendar',
+      };
+      categories = [...stored, defaultDeskCalendar];
+    } else {
+      categories = stored;
+    }
   }
 
   return {

@@ -25,7 +25,7 @@ export interface Category {
   id: string;
   label: string;
   /** Prompt category snippet group (prompts/categories/<group>.md). */
-  promptGroup: 'apparel' | 'drinkware' | 'home-decor' | 'other';
+  promptGroup: 'apparel' | 'drinkware' | 'home-decor' | 'calendar' | 'other';
 }
 
 /** Default company-managed category list; admins may edit (stored in settings). */
@@ -38,9 +38,14 @@ export const DEFAULT_CATEGORIES: Category[] = [
   { id: 'pillow', label: 'Pillow', promptGroup: 'home-decor' },
   { id: 'poster', label: 'Poster', promptGroup: 'home-decor' },
   { id: 'blanket', label: 'Blanket', promptGroup: 'home-decor' },
+  { id: 'desk-calendar', label: 'Desk Calendar', promptGroup: 'calendar' },
 ];
 
-export type AssetRole = 'source_image' | 'generated_video' | 'thumbnail' | 'prompt_snapshot';
+/**
+ * `interior_artwork` (Calendar only): local-only, job-linked, byte-identical copy of the interior page artwork.
+ * Never sent to the provider; composited onto the generated video after download.
+ */
+export type AssetRole = 'source_image' | 'generated_video' | 'thumbnail' | 'prompt_snapshot' | 'interior_artwork';
 export type ReviewStatus = 'pending' | 'approved' | 'rejected';
 export type ImageMime = 'image/png' | 'image/jpeg' | 'image/webp';
 
@@ -82,6 +87,13 @@ export interface Job {
   completedAt: string | null;
   errorCode: ErrorCode | null;
   safeErrorMessage: string | null;
+  /**
+   * Two-clip calendar jobs (`calendar-review-2clip`): 0 = clip A (front cover), 1 = clip B (inside page).
+   * Always 0 for every other job.
+   */
+  segment: number;
+  /** Two-clip jobs: library-relative path of the downloaded clip A, set when the job moves on to clip B. */
+  segmentAPath: string | null;
   createdAt: string;
   updatedAt: string;
 }

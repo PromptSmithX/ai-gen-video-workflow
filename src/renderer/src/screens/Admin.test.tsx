@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { Admin } from './Admin';
 import { setApiOverride } from '../api';
 import type { PodApi, ProviderStatus } from '@shared/ipc';
@@ -111,5 +111,22 @@ describe('Admin Screen', () => {
     expect(screen.getByRole('tab', { name: /Prompt Master/i })).toBeDefined();
     expect(screen.getByRole('tab', { name: /Categories & Storage/i })).toBeDefined();
     expect(screen.getByRole('tab', { name: /Diagnostics & Cleanup/i })).toBeDefined();
+  });
+
+  it('Admin category editor includes Calendar prompt group option', async () => {
+    render(
+      <ToastProvider>
+        <Admin isAdmin={true} providerStatus={mockProviderStatus} onProviderStatusChange={vi.fn()} />
+      </ToastProvider>,
+    );
+
+    // Switch to Categories & Storage tab
+    fireEvent.click(screen.getByRole('tab', { name: /Categories & Storage/i }));
+
+    // Find the select for prompt group
+    const options = screen.getAllByRole('option');
+    const calendarOption = options.find((opt) => (opt as HTMLOptionElement).value === 'calendar');
+    expect(calendarOption).toBeDefined();
+    expect(calendarOption?.textContent).toBe('Calendar');
   });
 });

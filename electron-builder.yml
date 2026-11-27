@@ -9,6 +9,9 @@ extraResources:
     to: "prompts"
   - from: "vendor/muse4ai/dist"
     to: "muse4ai"
+  # Calendar artwork compositor sidecar (built by `npm run build:compositor`; see ADR-004)
+  - from: "vendor/calendar-compositor/dist/calendar-compositor"
+    to: "calendar-compositor"
 asar: true
 publish: null
 win:

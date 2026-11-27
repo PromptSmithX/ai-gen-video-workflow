@@ -17,3 +17,19 @@ vendor/muse4ai/.tmp/
 prompts/company/
 # Muse4AI library output (generated videos) when it is started from the repo folder
 /output/
+
+# Calendar Compositor sidecar venv, build artifacts and fixtures
+tools/calendar-compositor/.venv/
+tools/calendar-compositor/.tmp-pytest/
+tools/calendar-compositor/.tmp-metrics/
+tools/calendar-compositor/.pytest_cache/
+tools/calendar-compositor/*.spec
+vendor/calendar-compositor/dist/
+vendor/calendar-compositor/build/
+tools/calendar-compositor/fixtures/*.mp4
+tools/calendar-compositor/fixtures/*.png
+tools/calendar-compositor/fixtures/*.jpg
+tools/calendar-compositor/fixtures/*.json
+__pycache__/
+*.pyc
+tools/calendar-compositor/comparison_grid.png

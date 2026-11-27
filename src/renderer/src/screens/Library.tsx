@@ -286,19 +286,41 @@ export function Library(): React.JSX.Element {
       ) : (
         <div className="library-grid">
           {jobs.map((item) => {
-            const { job, category, productName, sourceUrl, videoUrl } = item;
+            const { job, category, productName, sourceUrl, videoUrl, interiorArtworkUrl } = item;
             const isPending = pendingJobIds.has(job.id);
+            const hasInteriorArtwork =
+              typeof interiorArtworkUrl === 'string' && interiorArtworkUrl.trim().length > 0;
 
             return (
               <div key={job.id} className="library-card">
                 {/* Side-by-side Source Mockup and Video (no autoplay) */}
-                <div className="media-comparison">
-                  {sourceUrl ? (
-                    <img src={sourceUrl} alt={`Source for ${job.skuSnapshot}`} />
+                <div className={`media-comparison ${hasInteriorArtwork ? 'media-comparison-calendar' : ''}`}>
+                  {hasInteriorArtwork ? (
+                    <>
+                      <div className="media-thumbnail-container" title={en.library.card.frontCoverLabel}>
+                        {sourceUrl ? (
+                          <img src={sourceUrl} alt={`${en.library.card.frontCoverLabel} for ${job.skuSnapshot}`} />
+                        ) : (
+                          <div className="media-empty">{en.library.card.noImage}</div>
+                        )}
+                        <span className="media-thumbnail-label">{en.library.card.frontCoverLabel}</span>
+                      </div>
+                      <div className="media-thumbnail-container" title={en.library.card.interiorArtworkLabel}>
+                        <img
+                          src={interiorArtworkUrl}
+                          alt={`${en.library.card.interiorArtworkLabel} for ${job.skuSnapshot}`}
+                        />
+                        <span className="media-thumbnail-label">{en.library.card.interiorArtworkLabel}</span>
+                      </div>
+                    </>
                   ) : (
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>
-                      No image
-                    </div>
+                    sourceUrl ? (
+                      <img src={sourceUrl} alt={`Source for ${job.skuSnapshot}`} />
+                    ) : (
+                      <div className="media-empty">
+                        {en.library.card.noImage}
+                      </div>
+                    )
                   )}
 
                   {videoUrl ? (
@@ -309,8 +331,8 @@ export function Library(): React.JSX.Element {
                       aria-label={`Generated video for ${job.skuSnapshot}`}
                     />
                   ) : (
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>
-                      No video
+                    <div className="media-empty">
+                      {en.library.card.noVideo}
                     </div>
                   )}
                 </div>
@@ -319,7 +341,12 @@ export function Library(): React.JSX.Element {
                 <div className="library-details">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                     <div>
-                      <h3 style={{ fontSize: '1rem', fontWeight: 700 }}>{job.skuSnapshot}</h3>
+                      <h3 style={{ fontSize: '1rem', fontWeight: 700 }}>
+                        {job.skuSnapshot}
+                        {hasInteriorArtwork && (
+                          <span className="badge-calendar">{en.queue.calendarBadge}</span>
+                        )}
+                      </h3>
                       {productName && <p className="info-text">{productName}</p>}
                     </div>
                     <span

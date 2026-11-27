@@ -2,12 +2,20 @@
  * Mapping between Muse4AI bridge payloads (agent API 2.0.0-beta.35) and POD Video Studio domain models.
  */
 import type { ProviderCapabilities, ProviderConnectionState, ProviderJobState } from '@shared/provider';
-import type { ErrorCode } from '@shared/errors';
+import { SAFE_ERROR_MESSAGES, type ErrorCode } from '@shared/errors';
 import type { MuseSubmitMode } from '@shared/config';
 import type { BridgeJob, StatusResponse } from './endpoints';
 
 /** Muse4AI chat prompt limit (`limits.chat_prompt_max_chars`). */
 export const CHAT_PROMPT_MAX_DEFAULT = 32000;
+
+/**
+ * Largest image we send as a Muse4AI chat attachment. Chat runs only on the HTTP path, where images go inline:
+ * Muse4AI refuses > 2 MiB with 422 capability_unavailable (`HTTP_ATTACH_PROVEN_BYTES.image`) although /v1/status
+ * reports the generic 20 MiB `upload_max_bytes`, and only ~1.36 MiB inline is proven — a 1.58 MB image was submitted
+ * but never acknowledged by Muse (no_ack -> NOT_ACCEPTED). Stay at 1 MiB.
+ */
+export const CHAT_IMAGE_MAX_BYTES = 1024 * 1024;
 
 export const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   canCancel: false,
@@ -68,6 +76,17 @@ export function mapBridgeJobError(code: string | undefined | null): ErrorCode {
   }
 }
 
+/**
+ * Safe message for a failed Muse4AI job. NOT_ACCEPTED means Muse never received the request (nothing was charged and
+ * a retry cannot duplicate it) — not that the bridge is down, so it gets its own wording.
+ */
+export function bridgeJobSafeMessage(rawCode: string | undefined | null, mapped: ErrorCode): string {
+  if ((rawCode ?? '').toUpperCase() === 'NOT_ACCEPTED') {
+    return 'Muse did not receive this request (nothing was charged). Press Retry to send it again.';
+  }
+  return SAFE_ERROR_MESSAGES[mapped];
+}
+
 /** Picks the downloadable video output of a succeeded job. */
 export function pickVideoAssetId(job: BridgeJob): string | undefined {
   const outputs = job.outputs ?? [];
@@ -86,7 +105,9 @@ export function mapBridgeCapabilities(
   mode: MuseSubmitMode = 'chat'
 ): ProviderCapabilities {
   if (!status) {
-    return mode === 'chat' ? { ...DEFAULT_CAPABILITIES, maxPromptChars: CHAT_PROMPT_MAX_DEFAULT } : { ...DEFAULT_CAPABILITIES };
+    return mode === 'chat'
+      ? { ...DEFAULT_CAPABILITIES, maxPromptChars: CHAT_PROMPT_MAX_DEFAULT, maxUploadBytes: CHAT_IMAGE_MAX_BYTES }
+      : { ...DEFAULT_CAPABILITIES };
   }
   const maxPromptChars =
     mode === 'chat'
@@ -99,7 +120,10 @@ export function mapBridgeCapabilities(
     supportedDurations: [],
     supportedAspectRatios: [],
     maxPromptChars,
-    maxUploadBytes: status.limits?.upload_max_bytes ?? DEFAULT_CAPABILITIES.maxUploadBytes,
+    maxUploadBytes:
+      mode === 'chat'
+        ? Math.min(status.limits?.upload_max_bytes ?? CHAT_IMAGE_MAX_BYTES, CHAT_IMAGE_MAX_BYTES)
+        : status.limits?.upload_max_bytes ?? DEFAULT_CAPABILITIES.maxUploadBytes,
   };
 }
 

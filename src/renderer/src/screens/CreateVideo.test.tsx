@@ -37,6 +37,8 @@ describe('CreateVideo Screen', () => {
           attempt: 1,
           regeneratedFromJobId: null,
           reviewStatus: 'pending',
+          segment: 0,
+          segmentAPath: null,
           submitIntentAt: null,
           acceptedAt: null,
           completedAt: null,
@@ -114,7 +116,10 @@ describe('CreateVideo Screen', () => {
       catalog: {
         listCategories: vi.fn().mockResolvedValue({
           ok: true,
-          data: [{ id: 't-shirt', label: 'T-shirt', promptGroup: 'apparel' }],
+          data: [
+            { id: 't-shirt', label: 'T-shirt', promptGroup: 'apparel' },
+            { id: 'desk-calendar', label: 'Desk Calendar', promptGroup: 'calendar' },
+          ],
         }),
       },
       prompts: {
@@ -139,6 +144,16 @@ describe('CreateVideo Screen', () => {
               source: 'builtin',
               isDefault: true,
               createdAt: '2026-11-20',
+              note: null,
+            },
+            {
+              id: 'calendar-review',
+              version: 'v1',
+              title: 'Desk Calendar Review',
+              isPlaceholder: false,
+              source: 'builtin',
+              isDefault: true,
+              createdAt: '2026-11-25',
               note: null,
             },
           ],
@@ -510,5 +525,299 @@ describe('CreateVideo Screen', () => {
         screen.queryByText(/The prompt override was edited for a different SKU, category, or template/i),
       ).toBeNull();
     });
+  });
+
+  it('Apparel: one dropzone, Generate possible with one image, payload has no interiorArtworkToken', async () => {
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Exactly one single dropzone
+    expect(screen.getByLabelText(/Upload mockup image dropzone/i)).toBeDefined();
+    expect(screen.queryByLabelText(/Upload front cover image dropzone/i)).toBeNull();
+    expect(screen.queryByLabelText(/Upload interior artwork image dropzone/i)).toBeNull();
+
+    // Stage image & enter SKU
+    fireEvent.click(screen.getByRole('button', { name: /Browse…/i }));
+    await waitFor(() => expect(screen.getByText(/mock\.png/i)).toBeDefined());
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-001' } });
+
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    await waitFor(() => expect(generateBtn.hasAttribute('disabled')).toBe(false));
+
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sku: 'TS-001',
+          sourceToken: 'staged_mock_token',
+        }),
+      );
+    });
+
+    const callPayload = mockJobCreate.mock.calls[0]?.[0];
+    expect(callPayload?.interiorArtworkToken).toBeUndefined();
+  });
+
+  it('Calendar: two dropzones; Generate disabled until both staged; payload has both tokens', async () => {
+    let pickCallCount = 0;
+    mockApi.images.pick = vi.fn().mockImplementation(async () => {
+      pickCallCount += 1;
+      if (pickCallCount === 1) {
+        return {
+          ok: true,
+          data: {
+            token: 'token_front_cover_abc',
+            fileName: 'front-cover.png',
+            info: { mime: 'image/png', width: 1000, height: 1000, bytes: 50000 },
+            previewUrl: 'data:image/png;base64,cover',
+          },
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          token: 'token_interior_art_xyz',
+          fileName: 'interior-page.png',
+          info: { mime: 'image/png', width: 1000, height: 1000, bytes: 60000 },
+          previewUrl: 'data:image/png;base64,artwork',
+        },
+      };
+    });
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Switch category to Desk Calendar
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Product Category/i)).toBeDefined();
+    });
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 'desk-calendar' } });
+
+    // Verify two labelled dropzones are displayed
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Upload front cover image dropzone/i)).toBeDefined();
+      expect(screen.getByLabelText(/Upload interior artwork image dropzone/i)).toBeDefined();
+    });
+
+    // Enter SKU
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'CAL-001' } });
+
+    // Stage Front Cover only
+    const frontDropzone = screen.getByLabelText(/Upload front cover image dropzone/i);
+    fireEvent.click(frontDropzone);
+    await waitFor(() => expect(screen.getByText(/front-cover\.png/i)).toBeDefined());
+
+    // Generate must still be DISABLED because interior artwork is not staged!
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    expect(generateBtn.hasAttribute('disabled')).toBe(true);
+
+    // Stage Interior Artwork
+    const artworkDropzone = screen.getByLabelText(/Upload interior artwork image dropzone/i);
+    fireEvent.click(artworkDropzone);
+    await waitFor(() => expect(screen.getByText(/interior-page\.png/i)).toBeDefined());
+
+    // Now Generate should be enabled
+    await waitFor(() => expect(generateBtn.hasAttribute('disabled')).toBe(false));
+
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sku: 'CAL-001',
+          sourceToken: 'token_front_cover_abc',
+          interiorArtworkToken: 'token_interior_art_xyz',
+          templateId: 'calendar-review',
+        }),
+      );
+    });
+  });
+
+  it('Switching calendar → T-shirt with artwork staged: payload omits interiorArtworkToken', async () => {
+    let pickCount = 0;
+    mockApi.images.pick = vi.fn().mockImplementation(async () => {
+      pickCount += 1;
+      return {
+        ok: true,
+        data: {
+          token: `token_${pickCount}`,
+          fileName: `file_${pickCount}.png`,
+          info: { mime: 'image/png', width: 1000, height: 1000, bytes: 50000 },
+          previewUrl: `data:image/png;base64,${pickCount}`,
+        },
+      };
+    });
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Wait for categories to load
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: /Desk Calendar \(calendar\)/i })).toBeDefined();
+    });
+
+    // Switch to Calendar
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 'desk-calendar' } });
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Upload front cover image dropzone/i)).toBeDefined();
+    });
+
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'SW-001' } });
+
+    // Stage both images
+    fireEvent.click(screen.getByLabelText(/Upload front cover image dropzone/i));
+    await waitFor(() => expect(screen.getByText(/file_1\.png/i)).toBeDefined());
+
+    fireEvent.click(screen.getByLabelText(/Upload interior artwork image dropzone/i));
+    await waitFor(() => expect(screen.getByText(/file_2\.png/i)).toBeDefined());
+
+    // Now switch back to T-shirt (apparel)
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 't-shirt' } });
+
+    // Single dropzone should be back: "Product Mockup" title exists, and Interior Artwork dropzone is gone
+    await waitFor(() => {
+      expect(screen.getByText('Product Mockup')).toBeDefined();
+      expect(screen.queryByText('Interior Artwork')).toBeNull();
+    });
+
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    await waitFor(() => expect(generateBtn.hasAttribute('disabled')).toBe(false));
+
+    fireEvent.click(generateBtn);
+    await waitFor(() => {
+      expect(mockJobCreate).toHaveBeenCalledTimes(1);
+    });
+
+    const payload = mockJobCreate.mock.calls[0]?.[0];
+    expect(payload?.interiorArtworkToken).toBeUndefined();
+  });
+
+  it('Selecting calendar picks calendar-review; selecting T-shirt keeps/restores product-review; manual choice not overridden without category change', async () => {
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // 1. Initial selection is product-review@@v2 (default non-calendar)
+    await waitFor(() => {
+      const templateSelect = screen.getByLabelText(/Prompt Template/i) as HTMLSelectElement;
+      expect(templateSelect.value).toBe('product-review@@v2');
+    });
+
+    // 2. Manual template choice without changing category
+    fireEvent.change(screen.getByLabelText(/Prompt Template/i), {
+      target: { value: 'product-review@@v1' },
+    });
+    const templateSelect = screen.getByLabelText(/Prompt Template/i) as HTMLSelectElement;
+    expect(templateSelect.value).toBe('product-review@@v1');
+
+    // Change SKU - manual template choice is NOT overridden
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'TS-888' } });
+    expect(templateSelect.value).toBe('product-review@@v1');
+
+    // 3. Select Calendar -> automatically selects calendar-review@@v1
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 'desk-calendar' } });
+    await waitFor(() => {
+      expect(templateSelect.value).toBe('calendar-review@@v1');
+    });
+
+    // 4. Select T-shirt -> restores previous non-calendar default (product-review@@v2)
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 't-shirt' } });
+    await waitFor(() => {
+      expect(templateSelect.value).toBe('product-review@@v2');
+    });
+  });
+
+  it('Aspect warning shown when artwork aspect ratio differs by > 15%', async () => {
+    let pickCount = 0;
+    mockApi.images.pick = vi.fn().mockImplementation(async () => {
+      pickCount += 1;
+      if (pickCount === 1) {
+        // Front cover: 1000x1000 (AR = 1.0)
+        return {
+          ok: true,
+          data: {
+            token: 'cover_square',
+            fileName: 'cover-sq.png',
+            info: { mime: 'image/png', width: 1000, height: 1000, bytes: 50000 },
+            previewUrl: 'data:image/png;base64,sq',
+          },
+        };
+      }
+      // Artwork: 1000x750 (AR = 1.333, diff = 33.3% > 15%)
+      return {
+        ok: true,
+        data: {
+          token: 'art_diff',
+          fileName: 'art-wide.png',
+          info: { mime: 'image/png', width: 1000, height: 750, bytes: 50000 },
+          previewUrl: 'data:image/png;base64,wide',
+        },
+      };
+    });
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Wait for categories to load
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: /Desk Calendar \(calendar\)/i })).toBeDefined();
+    });
+
+    // Switch to Calendar
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 'desk-calendar' } });
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Upload front cover image dropzone/i)).toBeDefined();
+    });
+
+    // Stage cover and artwork
+    fireEvent.click(screen.getByLabelText(/Upload front cover image dropzone/i));
+    await waitFor(() => expect(screen.getByText(/cover-sq\.png/i)).toBeDefined());
+
+    fireEvent.click(screen.getByLabelText(/Upload interior artwork image dropzone/i));
+    await waitFor(() => expect(screen.getByText(/art-wide\.png/i)).toBeDefined());
+
+    // Verify warning is displayed
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Artwork aspect ratio differs from front cover aspect ratio by more than 15%/i),
+      ).toBeDefined();
+    });
+
+    // Verify warning is soft / non-blocking: Generate button can still become enabled
+    fireEvent.change(screen.getByLabelText(/SKU/i), { target: { value: 'CAL-002' } });
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    await waitFor(() => expect(generateBtn.hasAttribute('disabled')).toBe(false));
+  });
+
+  it('When calendar template is missing, displays clear error message and Generate stays disabled', async () => {
+    // Template list with NO calendar-review template
+    mockApi.prompts.listTemplates = vi.fn().mockResolvedValue({
+      ok: true,
+      data: [
+        {
+          id: 'product-review',
+          version: 'v2',
+          title: 'Product Review',
+          isPlaceholder: false,
+          source: 'builtin',
+          isDefault: true,
+          createdAt: '2026-11-20',
+          note: null,
+        },
+      ],
+    });
+
+    render(<CreateVideo providerStatus={mockProviderStatus} onJobCreated={vi.fn()} />);
+
+    // Wait for categories to load
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: /Desk Calendar \(calendar\)/i })).toBeDefined();
+    });
+
+    // Switch to Calendar
+    fireEvent.change(screen.getByLabelText(/Product Category/i), { target: { value: 'desk-calendar' } });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Calendar template \(calendar-review\) was not found/i),
+      ).toBeDefined();
+    });
+
+    // Generate button must remain disabled
+    const generateBtn = screen.getByRole('button', { name: /Generate video/i });
+    expect(generateBtn.hasAttribute('disabled')).toBe(true);
   });
 });

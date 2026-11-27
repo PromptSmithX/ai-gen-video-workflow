@@ -65,6 +65,18 @@ export const en = {
       singleFileOnly: 'Only one file can be staged at a time.',
       imageInfo: '{mime} • {width}×{height} • {size}',
       clearImage: 'Remove image',
+      frontCoverTitle: 'Front Cover',
+      interiorArtworkTitle: 'Interior Artwork',
+      frontCoverPrompt: 'Drag & drop front cover image here, or click Browse',
+      interiorArtworkPrompt: 'Drag & drop interior artwork image here, or click Browse',
+      removeArtwork: 'Remove artwork',
+      replaceArtwork: 'Replace artwork',
+      replaceImage: 'Replace image',
+      artworkRequiredNotice: 'Interior artwork is required for Desk Calendar',
+      aspectRatioWarning:
+        'Warning: Artwork aspect ratio differs from front cover aspect ratio by more than 15%. This may affect alignment.',
+      calendarTemplateMissing:
+        'Calendar template (calendar-review) was not found. Please contact an administrator.',
     },
     form: {
       sku: 'SKU',
@@ -114,6 +126,7 @@ export const en = {
   },
   queue: {
     title: 'Generation Queue',
+    calendarBadge: 'Calendar',
     activeCount: '{count} active jobs',
     empty: 'No jobs in queue.',
     filterAll: 'All jobs',
@@ -136,6 +149,10 @@ export const en = {
       cancel: 'Cancel',
     },
     indeterminate: 'Generating…',
+    twoClip: {
+      clipA: 'Clip 1/2 — front cover',
+      clipB: 'Clip 2/2 — inside page',
+    },
     confirmRetry: {
       title: 'Confirm Retry',
       message: 'I understand this will submit again.',
@@ -180,6 +197,10 @@ export const en = {
       category: 'Category: {category}',
       created: 'Created: {date}',
       version: 'Template: {version}',
+      frontCoverLabel: 'Front Cover',
+      interiorArtworkLabel: 'Interior Artwork',
+      noImage: 'No image',
+      noVideo: 'No video',
       review: {
         pending: 'Pending Review',
         approved: 'Approved',
@@ -268,5 +289,9 @@ export const en = {
     skuRequired: 'A valid SKU is required.',
     categoryRequired: 'Please choose a category.',
     templateRequired: 'Please choose a prompt template.',
+    calendarCompositingFailed:
+      'The video was generated, but the interior artwork could not be placed reliably on the calendar page. Retry the download to process it again; no new generation will be submitted.',
+    interiorArtworkRequired: 'Interior artwork is required for Desk Calendar.',
+    calendarTemplateNotFound: 'Calendar review template is required for Desk Calendar.',
   },
 };

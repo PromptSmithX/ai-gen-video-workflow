@@ -6,19 +6,23 @@ import { safeStorage } from 'electron';
 import type { AdminSettings, AppConfig, BundledResources } from '@shared/config';
 import type { DiagnosticsPreview, PlatformCompatibility, ProviderStatus } from '@shared/ipc';
 import type { MuseProvider, ProviderCapabilities } from '@shared/provider';
-import type { Logger, MediaLibrary, PodDatabase, PromptService, SecretStore } from '@shared/services';
+import type { Logger, MediaLibrary, PodDatabase, PromptService, SecretStore, CalendarArtworkCompositor } from '@shared/services';
 import { nowIso } from '../domain/ids';
 import { isAdmin, loadConfig, readEffectiveEnv } from '../infra/config';
 import { openDatabase } from '../infra/db';
 import { buildDiagnostics } from '../infra/diagnostics';
 import { createLogger } from '../infra/logging';
 import { createMediaLibrary } from '../infra/media';
+import { createElectronBoardRenderer, createElectronImageEncoder } from '../infra/media/electron-image-encoder';
+import { createFfmpegStitcher, createUnavailableStitcher, type VideoStitcher } from '../infra/media/stitch';
+import { createCalendarCompositor } from '../infra/compositor';
 import { createPromptService } from '../prompts';
 import { createMuseProvider } from '../providers/muse';
 import { createSecretStore, getBridgeApiKey, type SafeStorageLike } from '../infra/secrets';
 import { Muse4aiSupervisor } from '../infra/muse4ai/supervisor';
 import { ImageStagingService } from './image-staging';
 import { JobOrchestrator } from './job-orchestrator';
+import { createUnavailableCompositor } from './unavailable-compositor';
 
 export interface CreateContainerOpts {
   appPath: string;
@@ -31,6 +35,8 @@ export interface CreateContainerOpts {
   envFilePath?: string;
   /** Override bundled-resource discovery (tests). */
   bundle?: BundledResources;
+  /** Override compositor (tests or custom factory). */
+  compositor?: CalendarArtworkCompositor & { dispose?(): void };
 }
 
 /** Installer-shipped Muse4AI + company Prompt Master (dev: vendor/muse4ai/dist when it was built). */
@@ -64,6 +70,7 @@ export class AppContainer {
   readonly media: MediaLibrary;
   readonly prompts: PromptService;
   readonly imageStaging: ImageStagingService;
+  readonly compositor: CalendarArtworkCompositor & { dispose?(): void };
   provider: MuseProvider;
   readonly orchestrator: JobOrchestrator;
   /** Present when POD starts and provisions the bundled Muse4AI itself. */
@@ -188,6 +195,10 @@ export class AppContainer {
           })
         : null;
 
+    // 9c. Calendar Compositor (bundled sidecar, ADR-004). Missing sidecar => calendar jobs fail safely at
+    // post-process with CALENDAR_COMPOSITING_FAILED; apparel is unaffected.
+    this.compositor = opts.compositor ?? this.createCompositor(tempDir);
+
     // 10. Job Orchestrator
     this.orchestrator = new JobOrchestrator({
       db: this.db,
@@ -197,6 +208,10 @@ export class AppContainer {
       config: this.config,
       logger: this.logger,
       imageStaging: this.imageStaging,
+      compositor: this.compositor,
+      imageEncoder: createElectronImageEncoder(),
+      boardRenderer: createElectronBoardRenderer(),
+      stitcher: this.createStitcher(),
     });
   }
 
@@ -338,8 +353,44 @@ export class AppContainer {
     };
   }
 
+  /** ffmpeg/ffprobe bundled next to the compositor sidecar; joins the two clips of two-clip calendar jobs. */
+  private createStitcher(): VideoStitcher {
+    const dir = this.isPackaged
+      ? path.join((process as unknown as { resourcesPath?: string }).resourcesPath ?? this.appPath, 'calendar-compositor')
+      : path.join(this.appPath, 'vendor', 'calendar-compositor', 'dist', 'calendar-compositor');
+    const ffmpegExe = path.join(dir, 'ffmpeg.exe');
+    const ffprobeExe = path.join(dir, 'ffprobe.exe');
+    if (!fs.existsSync(ffmpegExe) || !fs.existsSync(ffprobeExe)) {
+      this.logger.warn('video_stitcher_unavailable');
+      return createUnavailableStitcher();
+    }
+    return createFfmpegStitcher({ ffmpegExe, ffprobeExe, logger: this.logger });
+  }
+
+  private createCompositor(tempDir: string): CalendarArtworkCompositor & { dispose?(): void } {
+    const resourcesDir = this.isPackaged
+      ? ((process as unknown as { resourcesPath?: string }).resourcesPath ?? this.appPath)
+      : path.join(this.appPath, 'vendor', 'calendar-compositor', 'dist');
+    const exe = path.join(resourcesDir, 'calendar-compositor', 'calendar-compositor.exe');
+    if (process.platform !== 'win32' || !fs.existsSync(exe)) {
+      this.logger.warn('calendar_compositor_unavailable');
+      return createUnavailableCompositor();
+    }
+    try {
+      return createCalendarCompositor({ resourcesDir, tempDir, logger: this.logger });
+    } catch {
+      this.logger.error('calendar_compositor_init_failed');
+      return createUnavailableCompositor();
+    }
+  }
+
   close(): void {
     this.orchestrator.stop();
+    try {
+      this.compositor.dispose?.();
+    } catch {
+      // ignore
+    }
     try {
       this.db.close();
     } catch {

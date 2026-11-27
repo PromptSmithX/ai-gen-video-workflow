@@ -47,3 +47,16 @@ SQLite `settings` table and the bridge API key in DPAPI-encrypted storage (`safe
 - Exact Muse origin and terms/automation approval — `docs/integration/platform-compatibility.md`.
 - Company-approved Prompt Master V2 text — currently a marked placeholder.
 - Code-signing certificate.
+- Calendar prompt `calendar-review` v1 is a marked placeholder — approve via Admin/Prompt Master.
+- Calendar compositor validated on synthetic fixtures only; must be validated on real Muse calendar videos
+  before production (brief §14). Bundled `ffmpeg.exe` must be an **LGPL** build for commercial release
+  (the dev machine's build is GPL v3) — see `docs/sbom/calendar-compositor.md`.
+
+## Desk Calendar (2026-11-25, `calendar-category-integration.md`)
+- Category `desk-calendar` (`promptGroup: 'calendar'`): two uploads — front cover (only image sent to Muse) and
+  interior artwork (local-only, byte-identical `interior_artwork` asset, SHA-256, DB migration v2).
+- After download, `JobOrchestrator.handleDownloading` runs the bundled sidecar compositor
+  (`src/main/infra/compositor`, `tools/calendar-compositor`, ADR-004) before `storeVideo`; failure ⇒
+  `DOWNLOAD_FAILED` + `CALENDAR_COMPOSITING_FAILED`, `retry_download` re-processes without a new submit.
+- Build the sidecar with `npm run build:compositor` (Python + PyInstaller venv in `tools/calendar-compositor/.venv`)
+  before `dist`; without it calendar jobs fail safely, apparel is unaffected.

@@ -34,6 +34,8 @@ describe('Queue Screen', () => {
       attempt: 1,
       regeneratedFromJobId: null,
       reviewStatus: 'pending',
+      segment: 0,
+      segmentAPath: null,
       submitIntentAt: '2026-11-20T10:00:00.000Z',
       acceptedAt: '2026-11-20T10:00:05.000Z',
       completedAt: null,
@@ -75,6 +77,8 @@ describe('Queue Screen', () => {
       attempt: 1,
       regeneratedFromJobId: null,
       reviewStatus: 'pending',
+      segment: 0,
+      segmentAPath: null,
       submitIntentAt: '2026-11-20T10:00:00.000Z',
       acceptedAt: null,
       completedAt: null,
@@ -221,6 +225,33 @@ describe('Queue Screen', () => {
 
     // CRITICAL: jobs.retry must NEVER be called
     expect(mockRetry).not.toHaveBeenCalled();
+  });
+
+  it('renders small "Calendar" badge when job has interiorArtworkUrl or category is calendar', async () => {
+    const calendarJob: JobView = {
+      ...activeJobNoProgress,
+      job: {
+        ...activeJobNoProgress.job,
+        id: 'job-cal-1',
+        skuSnapshot: 'CAL-001',
+      },
+      category: 'Desk Calendar',
+      interiorArtworkUrl: 'pod-media://asset/art-1',
+    };
+
+    mockList.mockResolvedValueOnce({
+      ok: true,
+      data: [calendarJob],
+    });
+
+    render(<Queue />);
+
+    await waitFor(() => {
+      expect(screen.getByText('CAL-001')).toBeDefined();
+    });
+
+    // Calendar badge is rendered
+    expect(screen.getByText('Calendar')).toBeDefined();
   });
 });
 
