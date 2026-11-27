@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { PodError } from '@shared/errors';
 import { DEFAULT_CATEGORIES, type Category } from '@shared/domain';
+import { PROMPT_TEXT_MAX_CHARS } from '@shared/prompt';
 import type { AdminSettings, AppConfig, BundledResources, MuseSubmitMode, ProviderMode } from '@shared/config';
 
 /** Port the bundled Muse4AI serves its agent API on (its default, "this machine only"). */
@@ -315,7 +316,7 @@ export function loadConfig(args: {
   assertDataDir(dataDir);
 
   // Numbers & Bounds validation (empty values fall back to defaults)
-  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? 20000;
+  const promptMaxCharsRaw = effectiveEnv['PROMPT_MAX_CHARS'] ?? PROMPT_TEXT_MAX_CHARS;
   const pollIntervalMsRaw = effectiveEnv['POLL_INTERVAL_MS'] ?? 3000;
   const pollMaxIntervalMsRaw = effectiveEnv['POLL_MAX_INTERVAL_MS'] ?? 15000;
 

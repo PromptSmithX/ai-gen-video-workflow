@@ -1,5 +1,11 @@
 /** Prompt Master / template contracts (brief §6). */
 
+/**
+ * Longest prompt text the app handles: the Muse4AI chat message limit (`CHAT_PROMPT_MAX`, also muse.ai's own).
+ * Default for PROMPT_MAX_CHARS and the size cap of every IPC field that carries prompt text.
+ */
+export const PROMPT_TEXT_MAX_CHARS = 32000;
+
 /** Allowed template variables. Unknown `{{x}}` placeholders are a validation error. */
 export const PROMPT_VARIABLES = [
   'sku',

@@ -183,7 +183,7 @@ describe('Config Infrastructure', () => {
       expect(config.museSubmitMode).toBe('chat');
       expect(config.bridgeBaseUrl).toBeNull();
       expect(config.musePlatformOrigin).toBeNull();
-      expect(config.promptMaxChars).toBe(20000);
+      expect(config.promptMaxChars).toBe(32000);
       expect(config.pollIntervalMs).toBe(3000);
       expect(config.pollMaxIntervalMs).toBe(15000);
       expect(config.maxSourceBytes).toBe(15 * 1024 * 1024);
@@ -228,7 +228,7 @@ CSC_KEY_PASSWORD=
       expect(config.bridgeBaseUrl).toBeNull();
       expect(config.musePlatformOrigin).toBeNull();
       expect(config.promptMasterPath).toBeNull();
-      expect(config.promptMaxChars).toBe(20000);
+      expect(config.promptMaxChars).toBe(32000);
       expect(config.pollIntervalMs).toBe(3000);
       expect(config.pollMaxIntervalMs).toBe(15000);
       expect(config.maxSourceBytes).toBe(15 * 1024 * 1024);

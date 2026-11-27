@@ -6,6 +6,7 @@ import type { AppConfig } from '@shared/config';
 import type { Job } from '@shared/domain';
 import { PodError } from '@shared/errors';
 import { ProviderError } from '@shared/provider';
+import { PROMPT_TEXT_MAX_CHARS } from '@shared/prompt';
 import type { JobState } from '@shared/job-state';
 import type { CalendarArtworkCompositor, Logger, LogFields, MediaLibrary, PodDatabase, PromptService } from '@shared/services';
 import { createAppContainer } from '../../src/main/app/container';
@@ -201,11 +202,14 @@ describe('JobOrchestrator E2E', () => {
 
   // 1. Happy path: create -> QUEUED -> SUBMITTING -> RUNNING -> DOWNLOADING -> SUCCEEDED
   // The company Prompt Master is not in the public repo: this runs only where prompts/company/ exists locally.
-  it.skipIf(!fs.existsSync(path.resolve('prompts/company/tshirt-review-v2.md')))('company T-shirt Master V2 (~10k chars) goes verbatim through Muse4AI chat with the mockup attached -> SUCCEEDED', async () => {
+  it.skipIf(!fs.existsSync(path.resolve('prompts/company/tshirt-review-v2.md')))('company T-shirt Prompt Master goes verbatim through Muse4AI chat with the mockup attached -> SUCCEEDED', async () => {
     server.setBehavior('healthy');
     server.clearRequests();
     const masterPath = path.resolve('prompts/company/tshirt-review-v2.md');
-    const stack = await createTestStack({ companyMasterPath: masterPath, promptMaxChars: 20000 });
+    const stack = await createTestStack({ companyMasterPath: masterPath, promptMaxChars: PROMPT_TEXT_MAX_CHARS });
+    // Whatever version the local company file carries (the file name stays tshirt-review-v2.md).
+    const master = stack.prompts.getTemplate('tshirt-review');
+    expect(master.source).toBe('company');
     const token = await stack.stageImage('TS-MASTER.png');
 
     const view = await stack.orchestrator.createJob(
@@ -213,7 +217,7 @@ describe('JobOrchestrator E2E', () => {
         clientRequestId: newId(),
         sourceToken: token,
         templateId: 'tshirt-review',
-        templateVersion: 'v2',
+        templateVersion: master.version,
         sku: 'TS-MASTER',
         categoryId: 't-shirt',
       },
@@ -229,9 +233,12 @@ describe('JobOrchestrator E2E', () => {
     expect(body['kind']).toBe('chat');
     expect(Array.isArray(body['attachments'])).toBe(true);
     const sent = String(body['prompt']);
+    // Verbatim: the whole company text first, only the category notes appended after it.
+    expect(sent.startsWith(master.body.trim())).toBe(true);
     expect(sent.length).toBeGreaterThan(10000);
+    // Must fit in one Muse chat message, or Muse4AI rejects it.
+    expect(sent.length).toBeLessThanOrEqual(PROMPT_TEXT_MAX_CHARS);
     expect(sent).toContain('AUTHENTIC UGC T-SHIRT PRODUCT REVIEW');
-    expect(sent).toContain('## 15. FINAL VIDEO OBJECTIVE');
     expect(sent).not.toContain('PLACEHOLDER');
     stack.orchestrator.stop();
   });

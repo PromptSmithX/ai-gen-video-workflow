@@ -9,7 +9,7 @@ import type { Category, ImageInfo, Job, ReviewStatus } from './domain';
 import type { IpcResult } from './errors';
 import type { JobState } from './job-state';
 import type { AspectRatio, ProviderCapabilities, ProviderConnectionState } from './provider';
-import type { PromptTemplate, PromptTemplateSummary, RenderedPrompt } from './prompt';
+import { PROMPT_TEXT_MAX_CHARS, type PromptTemplate, type PromptTemplateSummary, type RenderedPrompt } from './prompt';
 import { ASPECT_RATIOS } from './provider';
 
 export { IPC, MEDIA_PROTOCOL, type IpcChannel } from './ipc-channels';
@@ -120,7 +120,7 @@ export const CreateJobInput = PromptPreviewInput.extend({
   interiorArtworkToken: z.string().min(1).max(100).optional(),
   templateVersion: z.string().min(1).max(50),
   /** Employee-edited prompt; validated by main. Omit = rendered template. */
-  promptOverride: z.string().max(20000).optional(),
+  promptOverride: z.string().max(PROMPT_TEXT_MAX_CHARS).optional(),
 });
 export type CreateJobInput = z.infer<typeof CreateJobInput>;
 
@@ -152,11 +152,11 @@ export const GetTemplateInput = z.object({ id: z.string().min(1).max(100), versi
 export const SaveTemplateVersionInput = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
   title: z.string().max(200).optional(),
-  body: z.string().min(1).max(20000),
+  body: z.string().min(1).max(PROMPT_TEXT_MAX_CHARS),
   note: z.string().max(500).optional(),
 });
 export const SetDefaultTemplateInput = z.object({ id: z.string().min(1).max(100), version: z.string().min(1).max(50) });
-export const ValidatePromptInput = z.object({ text: z.string().max(20000) });
+export const ValidatePromptInput = z.object({ text: z.string().max(PROMPT_TEXT_MAX_CHARS) });
 
 export const CategorySchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),

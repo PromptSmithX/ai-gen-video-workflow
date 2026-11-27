@@ -145,7 +145,7 @@ describe('Calendar Job Orchestrator E2E', () => {
       promptMasterPath: null,
       libraryRoot,
       dataDir: tempRoot,
-      promptMaxChars: 20000, // app default (calendar prompts are ~6k chars)
+      promptMaxChars: 32000, // app default (calendar prompts are ~6k chars)
       pollIntervalMs: 80,
       pollMaxIntervalMs: 200,
       maxSourceBytes: 15 * 1024 * 1024,
